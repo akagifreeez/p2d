@@ -9,6 +9,7 @@ import { useWebRTC } from '../hooks/useWebRTC';
 import { useConnectionStore } from '../stores/connectionStore';
 import { ChatPanel } from './ChatPanel';
 import { StatsOverlay } from './StatsOverlay';
+import { VoiceChatPanel } from './VoiceChatPanel';
 
 interface ViewerViewProps {
     onBack: () => void;
@@ -30,6 +31,13 @@ export function ViewerView({ onBack }: ViewerViewProps) {
         isDataChannelOpen,
         stats,
         setPlayoutDelay,
+        // ボイスチャット
+        isMicEnabled,
+        remoteAudioStream,
+        startMicrophone,
+        stopMicrophone,
+        toggleMute,
+        isMuted,
     } = useWebRTC({ isHost: false });
 
     const { connectionState } = useConnectionStore();
@@ -273,9 +281,17 @@ export function ViewerView({ onBack }: ViewerViewProps) {
                 </div>
             )}
 
-            {/* チャット（フローティング） */}
+            {/* ボイスチャット + チャット（フローティング） */}
             {isWatching && (
-                <div className="fixed bottom-4 right-4 w-80 z-50">
+                <div className="fixed bottom-4 right-4 w-80 z-50 space-y-2">
+                    <VoiceChatPanel
+                        isMicEnabled={isMicEnabled}
+                        isMuted={isMuted}
+                        remoteAudioStream={remoteAudioStream}
+                        onStartMic={startMicrophone}
+                        onStopMic={stopMicrophone}
+                        onToggleMute={toggleMute}
+                    />
                     <ChatPanel
                         messages={chatMessages}
                         onSendMessage={sendChatMessage}

@@ -85,6 +85,14 @@ export interface UseWebRTCReturn {
     selectedMonitorName: string | null;
     setSelectedMonitorName: (name: string | null) => void;
     refreshMonitors: () => Promise<MonitorInfo[]>;
+
+    // ボイスチャット (NEW)
+    isMicEnabled: boolean;
+    remoteAudioStream: MediaStream | null;
+    startMicrophone: () => Promise<void>;
+    stopMicrophone: () => void;
+    toggleMute: () => void;
+    isMuted: boolean;
 }
 
 export interface MonitorInfo {
@@ -167,6 +175,13 @@ export function useWebRTC({ isHost }: UseWebRTCOptions): UseWebRTCReturn {
     // ビューアからホストID（ビューア用）取得
     const hostIdRef = useRef<string | null>(null);
 
+    // ボイスチャット (NEW)
+    const [isMicEnabled, setIsMicEnabled] = useState(false);
+    const [isMuted, setIsMuted] = useState(false);
+    const [remoteAudioStream, setRemoteAudioStream] = useState<MediaStream | null>(null);
+    const audioTrackRef = useRef<MediaStreamTrack | null>(null);
+    const localAudioStreamRef = useRef<MediaStream | null>(null);
+
     /**
      * DataChannelでデータを送信
      */
@@ -242,9 +257,11 @@ export function useWebRTC({ isHost }: UseWebRTCOptions): UseWebRTCReturn {
         // リモートストリーム受信（ビューア側）
         if (!isHost) {
             pc.ontrack = (event) => {
-                // console.log('[WebRTC] リモートトラック受信:', event.streams);
-                if (event.streams[0]) {
+                // console.log('[WebRTC] リモートトラック受信:', event.track.kind);
+                if (event.track.kind === 'video' && event.streams[0]) {
                     setRemoteStream(event.streams[0]);
+                } else if (event.track.kind === 'audio' && event.streams[0]) {
+                    setRemoteAudioStream(event.streams[0]);
                 }
             };
 
@@ -844,6 +861,60 @@ export function useWebRTC({ isHost }: UseWebRTCOptions): UseWebRTCReturn {
         });
     }, []);
 
+    /**
+     * マイクを開始
+     */
+    const startMicrophone = useCallback(async () => {
+        try {
+            const stream = await navigator.mediaDevices.getUserMedia({
+                audio: {
+                    echoCancellation: true,
+                    noiseSuppression: true,
+                    autoGainControl: true
+                }
+            });
+            const audioTrack = stream.getAudioTracks()[0];
+
+            // 既存のPeerConnectionに音声トラックを追加
+            peerConnectionsRef.current.forEach(pc => {
+                pc.addTrack(audioTrack, stream);
+            });
+
+            audioTrackRef.current = audioTrack;
+            localAudioStreamRef.current = stream;
+            setIsMicEnabled(true);
+            setIsMuted(false);
+        } catch (error) {
+            console.error('[Voice] マイク取得失敗:', error);
+        }
+    }, []);
+
+    /**
+     * マイクを停止
+     */
+    const stopMicrophone = useCallback(() => {
+        if (audioTrackRef.current) {
+            audioTrackRef.current.stop();
+            audioTrackRef.current = null;
+        }
+        if (localAudioStreamRef.current) {
+            localAudioStreamRef.current.getTracks().forEach(t => t.stop());
+            localAudioStreamRef.current = null;
+        }
+        setIsMicEnabled(false);
+        setIsMuted(false);
+    }, []);
+
+    /**
+     * マイクのミュート切替
+     */
+    const toggleMute = useCallback(() => {
+        if (audioTrackRef.current) {
+            audioTrackRef.current.enabled = !audioTrackRef.current.enabled;
+            setIsMuted(!audioTrackRef.current.enabled);
+        }
+    }, []);
+
     return {
         localStream,
         remoteStream,
@@ -873,6 +944,13 @@ export function useWebRTC({ isHost }: UseWebRTCOptions): UseWebRTCReturn {
         monitors,
         selectedMonitorName,
         setSelectedMonitorName,
-        refreshMonitors
+        refreshMonitors,
+        // ボイスチャット
+        isMicEnabled,
+        remoteAudioStream,
+        startMicrophone,
+        stopMicrophone,
+        toggleMute,
+        isMuted
     };
 }

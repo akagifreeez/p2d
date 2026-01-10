@@ -9,6 +9,7 @@ import { useWebRTC } from '../hooks/useWebRTC';
 import { QualitySettings, QualityConfig, loadQualityConfig, saveQualityConfig } from './QualitySettings';
 import { ChatPanel } from './ChatPanel';
 import { StatsOverlay } from './StatsOverlay';
+import { VoiceChatPanel } from './VoiceChatPanel';
 
 interface HostViewProps {
     onBack: () => void;
@@ -36,6 +37,13 @@ export function HostView({ onBack }: HostViewProps) {
         monitors,
         selectedMonitorName,
         setSelectedMonitorName,
+        // ボイスチャット
+        isMicEnabled,
+        remoteAudioStream,
+        startMicrophone,
+        stopMicrophone,
+        toggleMute,
+        isMuted,
     } = useWebRTC({ isHost: true });
 
     const videoRef = useRef<HTMLVideoElement>(null);
@@ -289,6 +297,16 @@ export function HostView({ onBack }: HostViewProps) {
                             <p className="text-red-400">{error}</p>
                         </div>
                     )}
+
+                    {/* ボイスチャット */}
+                    <VoiceChatPanel
+                        isMicEnabled={isMicEnabled}
+                        isMuted={isMuted}
+                        remoteAudioStream={remoteAudioStream}
+                        onStartMic={startMicrophone}
+                        onStopMic={stopMicrophone}
+                        onToggleMute={toggleMute}
+                    />
 
                     {/* チャット */}
                     <ChatPanel
