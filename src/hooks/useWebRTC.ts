@@ -40,6 +40,7 @@ export interface UseWebRTCReturn {
     // ストリーム
     localStream: MediaStream | null;
     remoteStream: MediaStream | null;
+    remoteScreenStream: MediaStream | null; // 相手の画面共有 (NEW)
 
     // 接続操作
     connect: () => Promise<void>;
@@ -49,6 +50,7 @@ export interface UseWebRTCReturn {
     createRoom: (hostName?: string) => void;
     startScreenShare: (config?: QualityConfig) => Promise<void>;
     stopScreenShare: () => void;
+    isScreenSharing: boolean; // 自分が画面共有中か (NEW)
 
     // ビューア操作
     joinRoom: (roomCode: string, viewerName?: string) => void;
@@ -93,6 +95,14 @@ export interface UseWebRTCReturn {
     stopMicrophone: () => void;
     toggleMute: () => void;
     isMuted: boolean;
+    // マイクデバイス選択 (NEW)
+    audioDevices: MediaDeviceInfo[];
+    selectedDeviceId: string | null;
+    setSelectedDeviceId: (deviceId: string | null) => void;
+    refreshAudioDevices: () => Promise<void>;
+    // 発話インジケーター (NEW)
+    isSpeaking: boolean;
+    isRemoteSpeaking: boolean;
 }
 
 export interface MonitorInfo {
@@ -122,6 +132,9 @@ export function useWebRTC({ isHost }: UseWebRTCOptions): UseWebRTCReturn {
     const localStreamRef = useRef<MediaStream | null>(null);
     const [localStream, setLocalStream] = useState<MediaStream | null>(null);
     const [remoteStream, setRemoteStream] = useState<MediaStream | null>(null);
+    const [remoteScreenStream, setRemoteScreenStream] = useState<MediaStream | null>(null); // 相手の画面共有 (NEW)
+    const [isScreenSharing, setIsScreenSharing] = useState(false); // 自分が画面共有中か (NEW)
+    const pendingRemoteScreenShareRef = useRef(false); // 相手が画面共有開始を通知したか (NEW)
 
     // 品質設定（refで保持）
     const qualityConfigRef = useRef<QualityConfig | null>(null);
@@ -181,6 +194,98 @@ export function useWebRTC({ isHost }: UseWebRTCOptions): UseWebRTCReturn {
     const [remoteAudioStream, setRemoteAudioStream] = useState<MediaStream | null>(null);
     const audioTrackRef = useRef<MediaStreamTrack | null>(null);
     const localAudioStreamRef = useRef<MediaStream | null>(null);
+
+    // マイクデバイス選択 (NEW)
+    const [audioDevices, setAudioDevices] = useState<MediaDeviceInfo[]>([]);
+    const [selectedDeviceId, setSelectedDeviceId] = useState<string | null>(null);
+
+    const refreshAudioDevices = useCallback(async () => {
+        try {
+            // マイク権限を取得してからデバイス一覧を取得
+            await navigator.mediaDevices.getUserMedia({ audio: true }).then(s => s.getTracks().forEach(t => t.stop()));
+            const devices = await navigator.mediaDevices.enumerateDevices();
+            const audioInputs = devices.filter(d => d.kind === 'audioinput');
+            setAudioDevices(audioInputs);
+            // 選択されていない場合はデフォルトを選択
+            if (!selectedDeviceId && audioInputs.length > 0) {
+                setSelectedDeviceId(audioInputs[0].deviceId);
+            }
+        } catch (e) {
+            console.error('[Voice] デバイス一覧取得失敗:', e);
+        }
+    }, [selectedDeviceId]);
+
+    // 発話インジケーター (NEW)
+    const [isSpeaking, setIsSpeaking] = useState(false);
+    const [isRemoteSpeaking, setIsRemoteSpeaking] = useState(false);
+    const localAnalyserRef = useRef<AnalyserNode | null>(null);
+    const remoteAnalyserRef = useRef<AnalyserNode | null>(null);
+    const audioContextRef = useRef<AudioContext | null>(null);
+
+    // ローカル音声の発話検出
+    useEffect(() => {
+        if (!isMicEnabled || !localAudioStreamRef.current) {
+            setIsSpeaking(false);
+            return;
+        }
+
+        const audioContext = new AudioContext();
+        audioContextRef.current = audioContext;
+        const analyser = audioContext.createAnalyser();
+        analyser.fftSize = 256;
+        localAnalyserRef.current = analyser;
+
+        const source = audioContext.createMediaStreamSource(localAudioStreamRef.current);
+        source.connect(analyser);
+
+        const dataArray = new Uint8Array(analyser.frequencyBinCount);
+        let animationId: number;
+
+        const checkVolume = () => {
+            analyser.getByteFrequencyData(dataArray);
+            const average = dataArray.reduce((a, b) => a + b, 0) / dataArray.length;
+            setIsSpeaking(average > 20); // 閾値
+            animationId = requestAnimationFrame(checkVolume);
+        };
+        checkVolume();
+
+        return () => {
+            cancelAnimationFrame(animationId);
+            audioContext.close();
+        };
+    }, [isMicEnabled]);
+
+    // リモート音声の発話検出
+    useEffect(() => {
+        if (!remoteAudioStream) {
+            setIsRemoteSpeaking(false);
+            return;
+        }
+
+        const audioContext = new AudioContext();
+        const analyser = audioContext.createAnalyser();
+        analyser.fftSize = 256;
+        remoteAnalyserRef.current = analyser;
+
+        const source = audioContext.createMediaStreamSource(remoteAudioStream);
+        source.connect(analyser);
+
+        const dataArray = new Uint8Array(analyser.frequencyBinCount);
+        let animationId: number;
+
+        const checkVolume = () => {
+            analyser.getByteFrequencyData(dataArray);
+            const average = dataArray.reduce((a, b) => a + b, 0) / dataArray.length;
+            setIsRemoteSpeaking(average > 20); // 閾値
+            animationId = requestAnimationFrame(checkVolume);
+        };
+        checkVolume();
+
+        return () => {
+            cancelAnimationFrame(animationId);
+            audioContext.close();
+        };
+    }, [remoteAudioStream]);
 
     /**
      * DataChannelでデータを送信
@@ -254,18 +359,25 @@ export function useWebRTC({ isHost }: UseWebRTCOptions): UseWebRTCReturn {
             }
         };
 
-        // リモートストリーム受信（ビューア側）
-        if (!isHost) {
-            pc.ontrack = (event) => {
-                // console.log('[WebRTC] リモートトラック受信:', event.track.kind);
-                if (event.track.kind === 'video' && event.streams[0]) {
+        // リモートストリーム受信（ホスト・ビューア両方）
+        pc.ontrack = (event) => {
+            console.log('[WebRTC] リモートトラック受信:', event.track.kind, 'pending:', pendingRemoteScreenShareRef.current);
+            if (event.track.kind === 'video' && event.streams[0]) {
+                // ホストの場合：相手（ビューア）からの画面共有は remoteScreenStream にセット
+                // ビューアの場合：相手（ホスト）からの画面共有は remoteStream（メイン）にセット
+                if (isHost && pendingRemoteScreenShareRef.current) {
+                    setRemoteScreenStream(event.streams[0]);
+                    pendingRemoteScreenShareRef.current = false;
+                } else {
                     setRemoteStream(event.streams[0]);
-                } else if (event.track.kind === 'audio' && event.streams[0]) {
-                    setRemoteAudioStream(event.streams[0]);
                 }
-            };
+            } else if (event.track.kind === 'audio' && event.streams[0]) {
+                setRemoteAudioStream(event.streams[0]);
+            }
+        };
 
-            // DataChannel受信（ビューア側）
+        // DataChannel受信（ビューア側）
+        if (!isHost) {
             pc.ondatachannel = (event) => {
                 // console.log('[WebRTC] DataChannel受信:', event.channel.label);
                 setupDataChannel(event.channel);
@@ -303,6 +415,12 @@ export function useWebRTC({ isHost }: UseWebRTCOptions): UseWebRTCReturn {
 
                 if (message.type === 'chat:message') {
                     setChatMessages((prev) => [...prev, message.data as ChatMessageData]);
+                } else if (message.type === 'screen:start') {
+                    // 相手が画面共有を開始した
+                    pendingRemoteScreenShareRef.current = true;
+                } else if (message.type === 'screen:stop') {
+                    // 相手が画面共有を停止した
+                    setRemoteScreenStream(null);
                 } else if (message.type === 'clipboard:update') {
                     // クリップボード更新: ビューアは常に、ホストは操作許可時のみ処理
                     if (!isHost || isRemoteControlEnabledRef.current) {
@@ -598,24 +716,26 @@ export function useWebRTC({ isHost }: UseWebRTCOptions): UseWebRTCReturn {
         signaling.on('onPeerJoined', async (peerId) => {
             // console.log('[WebRTC] ピア参加:', peerId);
 
-            if (isHost && localStreamRef.current) {
-                // ホスト: 新しいビューアにOfferを送信
+            if (isHost) {
+                // ホスト: 新しいビューアにOfferを送信（画面共有前でも接続確立）
                 const pc = createPeerConnection(peerId);
 
                 // DataChannelを作成（ホスト側）
                 const dataChannel = pc.createDataChannel('p2d-control', { ordered: true });
                 setupDataChannel(dataChannel);
 
-                // ローカルストリームのトラックを追加
-                localStreamRef.current.getTracks().forEach(track => {
-                    pc.addTrack(track, localStreamRef.current!);
-                });
+                // ローカルストリームがあればトラックを追加
+                if (localStreamRef.current) {
+                    localStreamRef.current.getTracks().forEach(track => {
+                        pc.addTrack(track, localStreamRef.current!);
+                    });
 
-                // コーデック優先順位設定
-                setCodecPreferences(pc);
+                    // コーデック優先順位設定
+                    setCodecPreferences(pc);
 
-                // ビットレート制限を適用
-                await applyBitrateLimit(pc);
+                    // ビットレート制限を適用
+                    await applyBitrateLimit(pc);
+                }
 
                 // Offer作成・送信
                 const offer = await pc.createOffer();
@@ -635,24 +755,50 @@ export function useWebRTC({ isHost }: UseWebRTCOptions): UseWebRTCReturn {
         });
 
         signaling.on('onOffer', async (senderId, sdp) => {
-            // console.log('[WebRTC] Offer受信:', senderId);
+            console.log('[WebRTC] Offer受信:', senderId, 'type:', sdp.type);
 
-            // ビューア: Offerを受けてAnswerを返す
-            const pc = createPeerConnection(senderId);
+            // 既存のPeerConnectionがあれば再利用（再ネゴシエーション対応）
+            let pc = peerConnectionsRef.current.get(senderId);
+            if (!pc) {
+                // 初回接続: 新規作成
+                pc = createPeerConnection(senderId);
+            }
 
-            await pc.setRemoteDescription(new RTCSessionDescription(sdp));
-            const answer = await pc.createAnswer();
-            await pc.setLocalDescription(answer);
+            // シグナリング状態チェックと競合回避
+            if (pc.signalingState !== 'stable') {
+                console.warn(`[WebRTC] シグナリング状態非安定: ${pc.signalingState} - Offer処理を試みます`);
+                // 自分がOfferを出した直後に相手からもOfferが来た場合（Glare）
+                if (pc.signalingState === 'have-local-offer') {
+                    try {
+                        console.log('[WebRTC] 競合検知: ロールバックを実行します');
+                        await pc.setLocalDescription({ type: 'rollback' });
+                    } catch (e) {
+                        console.error('[WebRTC] ロールバック失敗:', e);
+                    }
+                }
+            }
 
-            signaling.sendAnswer(senderId, answer);
+            try {
+                await pc.setRemoteDescription(new RTCSessionDescription(sdp));
+                const answer = await pc.createAnswer();
+                await pc.setLocalDescription(answer);
+
+                signaling.sendAnswer(senderId, answer);
+            } catch (error) {
+                console.error('[WebRTC] Offer処理エラー:', error);
+            }
         });
 
         signaling.on('onAnswer', async (senderId, sdp) => {
-            // console.log('[WebRTC] Answer受信:', senderId);
+            console.log('[WebRTC] Answer受信:', senderId);
 
             const pc = peerConnectionsRef.current.get(senderId);
             if (pc) {
-                await pc.setRemoteDescription(new RTCSessionDescription(sdp));
+                try {
+                    await pc.setRemoteDescription(new RTCSessionDescription(sdp));
+                } catch (error) {
+                    console.error('[WebRTC] Answer処理エラー:', error);
+                }
             }
         });
 
@@ -763,7 +909,7 @@ export function useWebRTC({ isHost }: UseWebRTCOptions): UseWebRTCReturn {
                 }
             }
 
-            peerConnectionsRef.current.forEach(async (pc) => {
+            peerConnectionsRef.current.forEach(async (pc, peerId) => {
                 const senders = pc.getSenders();
                 const videoSender = senders.find(s => s.track?.kind === 'video');
 
@@ -781,8 +927,25 @@ export function useWebRTC({ isHost }: UseWebRTCOptions): UseWebRTCReturn {
                         console.error('[WebRTC] トラック置換失敗:', e);
                     }
                 } else {
-                    // 送信トラックがない場合はストリームを追加（稀なケース）
+                    // 送信トラックがない場合はストリームを追加して再ネゴシエーション
                     stream.getTracks().forEach(track => pc.addTrack(track, stream));
+
+                    // コーデック優先順位設定
+                    setCodecPreferences(pc);
+
+                    // ビットレート制限を適用
+                    await applyBitrateLimit(pc);
+
+                    // 再ネゴシエーション（Offerを送信）
+                    try {
+                        const offer = await pc.createOffer();
+                        await pc.setLocalDescription(offer);
+                        if (signalingRef.current) {
+                            signalingRef.current.sendOffer(peerId, offer);
+                        }
+                    } catch (e) {
+                        console.error('[WebRTC] 再ネゴシエーション失敗:', e);
+                    }
                 }
             });
 
@@ -807,11 +970,14 @@ export function useWebRTC({ isHost }: UseWebRTCOptions): UseWebRTCReturn {
                     setSelectedMonitorName(target.name);
                 }
             }
+            // 画面共有開始通知をDataChannelで送信
+            setIsScreenSharing(true);
+            sendData('screen:start', { label: videoTrack.label });
         } catch (error) {
             console.error('[WebRTC] 画面共有失敗:', error);
             setError('画面共有の開始に失敗しました');
         }
-    }, [setError]);
+    }, [sendData, setError]);
 
     /**
      * 画面共有を停止
@@ -820,7 +986,9 @@ export function useWebRTC({ isHost }: UseWebRTCOptions): UseWebRTCReturn {
         localStreamRef.current?.getTracks().forEach(track => track.stop());
         setLocalStream(null);
         localStreamRef.current = null;
-    }, []);
+        setIsScreenSharing(false);
+        sendData('screen:stop', {});
+    }, [sendData]);
 
     // クリーンアップ（コンポーネントアンマウント時のみ）
     useEffect(() => {
@@ -866,12 +1034,17 @@ export function useWebRTC({ isHost }: UseWebRTCOptions): UseWebRTCReturn {
      */
     const startMicrophone = useCallback(async () => {
         try {
+            const audioConstraints: MediaTrackConstraints = {
+                echoCancellation: true,
+                noiseSuppression: true,
+                autoGainControl: true
+            };
+            // 選択されたデバイスIDがあれば指定
+            if (selectedDeviceId) {
+                audioConstraints.deviceId = { exact: selectedDeviceId };
+            }
             const stream = await navigator.mediaDevices.getUserMedia({
-                audio: {
-                    echoCancellation: true,
-                    noiseSuppression: true,
-                    autoGainControl: true
-                }
+                audio: audioConstraints
             });
             const audioTrack = stream.getAudioTracks()[0];
 
@@ -884,10 +1057,24 @@ export function useWebRTC({ isHost }: UseWebRTCOptions): UseWebRTCReturn {
             localAudioStreamRef.current = stream;
             setIsMicEnabled(true);
             setIsMuted(false);
+
+            // 再ネゴシエーション（Offerを再送信）
+            peerConnectionsRef.current.forEach(async (pc, peerId) => {
+                try {
+                    // onnegotiationneededが発火しない場合のため、手動でOfferを作成
+                    const offer = await pc.createOffer();
+                    await pc.setLocalDescription(offer);
+                    if (signalingRef.current) {
+                        signalingRef.current.sendOffer(peerId, offer);
+                    }
+                } catch (e) {
+                    console.error('[Voice] 再ネゴシエーション失敗:', e);
+                }
+            });
         } catch (error) {
             console.error('[Voice] マイク取得失敗:', error);
         }
-    }, []);
+    }, [selectedDeviceId]);
 
     /**
      * マイクを停止
@@ -951,6 +1138,17 @@ export function useWebRTC({ isHost }: UseWebRTCOptions): UseWebRTCReturn {
         startMicrophone,
         stopMicrophone,
         toggleMute,
-        isMuted
+        isMuted,
+        // マイクデバイス選択
+        audioDevices,
+        selectedDeviceId,
+        setSelectedDeviceId,
+        refreshAudioDevices,
+        // 発話インジケーター
+        isSpeaking,
+        isRemoteSpeaking,
+        // 双方向画面共有
+        remoteScreenStream,
+        isScreenSharing
     };
 }

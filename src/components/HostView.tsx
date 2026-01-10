@@ -44,9 +44,18 @@ export function HostView({ onBack }: HostViewProps) {
         stopMicrophone,
         toggleMute,
         isMuted,
+        audioDevices,
+        selectedDeviceId,
+        setSelectedDeviceId,
+        refreshAudioDevices,
+        isSpeaking,
+        isRemoteSpeaking,
+        // 双方向画面共有
+        remoteScreenStream,
     } = useWebRTC({ isHost: true });
 
     const videoRef = useRef<HTMLVideoElement>(null);
+    const remoteVideoRef = useRef<HTMLVideoElement>(null);
     const [isSharing, setIsSharing] = useState(false);
     const [copied, setCopied] = useState(false);
     const [qualityConfig, setQualityConfig] = useState<QualityConfig>(loadQualityConfig);
@@ -77,6 +86,13 @@ export function HostView({ onBack }: HostViewProps) {
             videoRef.current.srcObject = localStream;
         }
     }, [localStream]);
+
+    // 相手の画面共有ストリームをビデオ要素にセット
+    useEffect(() => {
+        if (remoteVideoRef.current && remoteScreenStream) {
+            remoteVideoRef.current.srcObject = remoteScreenStream;
+        }
+    }, [remoteScreenStream]);
 
     // 品質設定変更時にlocalStorageに保存
     const handleQualityChange = (config: QualityConfig) => {
@@ -152,6 +168,21 @@ export function HostView({ onBack }: HostViewProps) {
                                         </svg>
                                         <p>画面共有を開始してください</p>
                                     </div>
+                                </div>
+                            )}
+
+                            {remoteScreenStream && (
+                                <div className="absolute bottom-4 right-4 w-64 aspect-video bg-dark-800 rounded-lg overflow-hidden border-2 border-blue-500 shadow-lg z-10">
+                                    <video
+                                        ref={remoteVideoRef}
+                                        autoPlay
+                                        playsInline
+                                        muted
+                                        className="w-full h-full object-contain"
+                                    />
+                                    <span className="absolute top-1 left-1 text-xs bg-blue-600/80 px-2 py-0.5 rounded">
+                                        📺 相手の画面
+                                    </span>
                                 </div>
                             )}
                         </div>
@@ -306,6 +337,12 @@ export function HostView({ onBack }: HostViewProps) {
                         onStartMic={startMicrophone}
                         onStopMic={stopMicrophone}
                         onToggleMute={toggleMute}
+                        audioDevices={audioDevices}
+                        selectedDeviceId={selectedDeviceId}
+                        onSelectDevice={setSelectedDeviceId}
+                        onRefreshDevices={refreshAudioDevices}
+                        isSpeaking={isSpeaking}
+                        isRemoteSpeaking={isRemoteSpeaking}
                     />
 
                     {/* チャット */}
@@ -319,6 +356,6 @@ export function HostView({ onBack }: HostViewProps) {
             </div>
 
             <StatsOverlay stats={stats} />
-        </div>
+        </div >
     );
 }

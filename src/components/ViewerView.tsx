@@ -38,11 +38,23 @@ export function ViewerView({ onBack }: ViewerViewProps) {
         stopMicrophone,
         toggleMute,
         isMuted,
+        audioDevices,
+        selectedDeviceId,
+        setSelectedDeviceId,
+        refreshAudioDevices,
+        isSpeaking,
+        isRemoteSpeaking,
+        // 双方向画面共有
+        localStream,
+        startScreenShare,
+        stopScreenShare,
+        isScreenSharing,
     } = useWebRTC({ isHost: false });
 
     const { connectionState } = useConnectionStore();
 
     const videoRef = useRef<HTMLVideoElement>(null);
+    const localVideoRef = useRef<HTMLVideoElement>(null);
     const [roomCodeInput, setRoomCodeInput] = useState(['', '', '', '', '', '']);
     const [isJoining, setIsJoining] = useState(false);
     const [isFullscreen, setIsFullscreen] = useState(false);
@@ -62,6 +74,13 @@ export function ViewerView({ onBack }: ViewerViewProps) {
             videoRef.current.srcObject = remoteStream;
         }
     }, [remoteStream]);
+
+    // ローカルストリームをプレビュー用ビデオ要素にセット
+    useEffect(() => {
+        if (localVideoRef.current && localStream) {
+            localVideoRef.current.srcObject = localStream;
+        }
+    }, [localStream]);
 
     // ルームコード入力ハンドラ
     const handleCodeInput = (index: number, value: string) => {
@@ -151,8 +170,8 @@ export function ViewerView({ onBack }: ViewerViewProps) {
         }
     };
 
-    // 視聴中かどうか
-    const isWatching = remoteStream !== null;
+    // 視聴中かどうか（DataChannel接続時も視聴画面に遷移）
+    const isWatching = remoteStream !== null || isDataChannelOpen;
     const codeComplete = roomCodeInput.every(c => c !== '');
 
     return (
@@ -243,6 +262,22 @@ export function ViewerView({ onBack }: ViewerViewProps) {
                             style={{ outline: 'none' }}
                         />
 
+                        {/* 自分の画面共有プレビュー（ピクチャー・イン・ピクチャー） */}
+                        {localStream && (
+                            <div className="absolute top-4 right-4 w-48 aspect-video bg-dark-800 rounded-lg overflow-hidden border-2 border-green-500 shadow-lg z-30">
+                                <video
+                                    ref={localVideoRef}
+                                    autoPlay
+                                    playsInline
+                                    muted
+                                    className="w-full h-full object-contain"
+                                />
+                                <span className="absolute top-1 left-1 text-xs bg-green-600/80 px-2 py-0.5 rounded">
+                                    🖥️ 自分の画面
+                                </span>
+                            </div>
+                        )}
+
                         {/* オーバーレイコントロール */}
                         <div className="absolute bottom-0 left-0 right-0 p-4 bg-gradient-to-t from-black/80 to-transparent z-20 pointer-events-none">
                             <div className="flex items-center justify-between pointer-events-auto">
@@ -267,6 +302,18 @@ export function ViewerView({ onBack }: ViewerViewProps) {
                                         {isStableMode ? '🐢 安定' : '⚡ 低遅延'}
                                     </button>
 
+                                    {/* 画面共有ボタン */}
+                                    <button
+                                        onClick={() => isScreenSharing ? stopScreenShare() : startScreenShare()}
+                                        className={`px-3 py-1 rounded-lg text-sm transition-colors flex items-center gap-2 ${isScreenSharing
+                                            ? 'bg-green-500/80 text-white'
+                                            : 'bg-white/10 hover:bg-white/20 text-white/90'
+                                            }`}
+                                        title={isScreenSharing ? '自分の画面共有を停止' : '自分の画面を共有'}
+                                    >
+                                        {isScreenSharing ? '⏹️ 共有中' : '🖥️ 画面共有'}
+                                    </button>
+
                                     <button
                                         onClick={toggleFullscreen}
                                         className="p-2 bg-white/20 hover:bg-white/30 rounded-lg transition-colors"
@@ -281,9 +328,9 @@ export function ViewerView({ onBack }: ViewerViewProps) {
                 </div>
             )}
 
-            {/* ボイスチャット + チャット（フローティング） */}
+            {/* ボイスチャット + チャット（フローティング: 左上に配置して重なり回避） */}
             {isWatching && (
-                <div className="fixed bottom-4 right-4 w-80 z-50 space-y-2">
+                <div className="fixed top-20 left-4 w-80 z-50 space-y-2 max-h-[calc(100vh-120px)] overflow-y-auto">
                     <VoiceChatPanel
                         isMicEnabled={isMicEnabled}
                         isMuted={isMuted}
@@ -291,6 +338,12 @@ export function ViewerView({ onBack }: ViewerViewProps) {
                         onStartMic={startMicrophone}
                         onStopMic={stopMicrophone}
                         onToggleMute={toggleMute}
+                        audioDevices={audioDevices}
+                        selectedDeviceId={selectedDeviceId}
+                        onSelectDevice={setSelectedDeviceId}
+                        onRefreshDevices={refreshAudioDevices}
+                        isSpeaking={isSpeaking}
+                        isRemoteSpeaking={isRemoteSpeaking}
                     />
                     <ChatPanel
                         messages={chatMessages}

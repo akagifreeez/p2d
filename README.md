@@ -68,6 +68,25 @@ npm run tauri build
 
 ビルド成果物は `src-tauri/target/release/bundle/` に生成されます。
 
+### 🐳 Docker でシグナリングサーバーを起動
+
+シグナリングサーバーをDockerで起動することもできます。
+
+```bash
+cd signaling-server
+
+# ビルド＆起動
+docker-compose up -d
+
+# ログ確認
+docker-compose logs -f
+
+# 停止
+docker-compose down
+```
+
+サーバーは `ws://localhost:8080` で起動します。
+
 ## 📖 使い方
 
 ### ホスト（画面共有側）

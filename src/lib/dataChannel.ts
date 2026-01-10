@@ -16,7 +16,9 @@ export type DataChannelMessageType =
     | 'input:click'        // クリック
     | 'input:scroll'       // スクロール
     | 'input:key'          // キー入力
-    | 'clipboard:update';  // クリップボード更新
+    | 'clipboard:update'   // クリップボード更新
+    | 'screen:start'       // 画面共有開始 (NEW)
+    | 'screen:stop';       // 画面共有停止 (NEW)
 
 // メッセージ基本構造
 export interface DataChannelMessage<T = unknown> {
