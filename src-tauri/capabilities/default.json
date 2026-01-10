@@ -1,0 +1,13 @@
+{
+    "identifier": "default",
+    "description": "Default capability for the app",
+    "windows": [
+        "*"
+    ],
+    "permissions": [
+        "core:default",
+        "core:event:default",
+        "core:event:allow-listen",
+        "shell:default"
+    ]
+}
