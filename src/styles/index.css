@@ -99,18 +99,15 @@
   }
 
   /* ガラスカード */
-  .glass-card {
+  .glass-card,
+  .card {
     @apply bg-white/5 backdrop-blur-xl border border-white/10 rounded-2xl shadow-xl;
     @apply transition-all duration-300;
   }
 
-  .glass-card:hover {
+  .glass-card:hover,
+  .card:hover {
     @apply bg-white/10 border-white/20 shadow-2xl shadow-cyan-500/5;
-  }
-
-  /* 互換性のためのエイリアス */
-  .card {
-    @apply glass-card;
   }
 
   /* 入力フィールド */
