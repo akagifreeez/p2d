@@ -1,6 +1,9 @@
 # P2D Signaling Server
 FROM node:20-alpine
 
+# ヘルスチェック用にnetcat追加
+RUN apk add --no-cache netcat-openbsd
+
 WORKDIR /app
 
 # 依存関係をコピー＆インストール

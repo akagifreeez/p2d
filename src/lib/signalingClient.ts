@@ -1,5 +1,5 @@
 /**
- * P2D - シグナリングクライアント
+ * P2D - シグナリングクライアント (Full Mesh P2P Update)
  * 
  * WebSocketを使用してシグナリングサーバーと通信する。
  */
@@ -27,12 +27,20 @@ export interface SignalingMessage {
     payload?: unknown;
 }
 
+// 参加者情報
+export interface ParticipantInfo {
+    id: string;
+    name?: string;
+    joinedAt: number;
+}
+
 // シグナリングクライアントのイベント
 export interface SignalingEvents {
     onConnected: () => void;
     onDisconnected: () => void;
-    onRoomCreated: (roomCode: string) => void;
-    onRoomJoined: (roomId: string, hostId: string, peers: string[]) => void;
+    onRoomCreated: (roomCode: string, roomId: string) => void;
+    // 更新: peersリストではなくParticipantInfo[]を受け取る
+    onRoomJoined: (roomId: string, roomCode: string, myId: string, participants: ParticipantInfo[]) => void;
     onPeerJoined: (peerId: string, peerName?: string) => void;
     onPeerLeft: (peerId: string) => void;
     onOffer: (senderId: string, sdp: RTCSessionDescriptionInit) => void;
@@ -111,26 +119,29 @@ export class SignalingClient {
      * メッセージをハンドル
      */
     private handleMessage(message: SignalingMessage): void {
-        console.log('[Signaling] 受信:', message.type);
+        if (message.type !== 'peer:ice') {
+            console.log('[Signaling] 受信:', message.type);
+        }
 
         switch (message.type) {
             case 'room:created': {
-                const payload = message.payload as { roomCode: string };
-                this.events.onRoomCreated?.(payload.roomCode);
+                const payload = message.payload as { roomCode: string, roomId: string };
+                this.events.onRoomCreated?.(payload.roomCode, payload.roomId);
                 break;
             }
 
             case 'room:joined': {
-                const payload = message.payload as { roomId: string; hostId: string; peers: string[] };
+                const payload = message.payload as { roomId: string; roomCode: string; myId: string; participants: ParticipantInfo[] };
                 if (payload.roomId) { // 空でない場合のみ
-                    this.events.onRoomJoined?.(payload.roomId, payload.hostId, payload.peers);
+                    this.events.onRoomJoined?.(payload.roomId, payload.roomCode, payload.myId, payload.participants);
                 }
                 break;
             }
 
             case 'peer:joined': {
-                const payload = message.payload as { peerId: string; peerName?: string };
-                this.events.onPeerJoined?.(payload.peerId, payload.peerName);
+                const payload = message.payload as { peerId: string; name?: string };
+                // peerName プロパティで来るか name プロパティで来るか要確認。サーバー側は name で送っている。
+                this.events.onPeerJoined?.(payload.peerId, payload.name);
                 break;
             }
 
@@ -182,20 +193,20 @@ export class SignalingClient {
     /**
      * ルームを作成
      */
-    createRoom(hostName?: string): void {
+    createRoom(name?: string): void {
         this.send({
             type: 'room:create',
-            payload: { hostName },
+            payload: { name },
         });
     }
 
     /**
      * ルームに参加
      */
-    joinRoom(roomCode: string, viewerName?: string): void {
+    joinRoom(roomCode: string, name?: string): void {
         this.send({
             type: 'room:join',
-            payload: { roomCode, viewerName },
+            payload: { roomCode, name },
         });
     }
 

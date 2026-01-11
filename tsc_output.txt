@@ -1,0 +1,6 @@
+src/hooks/useWebRTC.ts(9,1): error TS6133: 'invoke' is declared but its value is never read.
+src/hooks/useWebRTC.ts(151,22): error TS6133: 'setMonitors' is declared but its value is never read.
+src/hooks/useWebRTC.ts(158,19): error TS6133: 'setStats' is declared but its value is never read.
+src/hooks/useWebRTC.ts(329,39): error TS6133: 'roomId' is declared but its value is never read.
+src/hooks/useWebRTC.ts(462,49): error TS6133: 'config' is declared but its value is never read.
+src/hooks/useWebRTC.ts(465,26): error TS2353: Object literal may only specify known properties, and 'cursor' does not exist in type 'MediaTrackConstraints'.

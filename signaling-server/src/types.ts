@@ -1,16 +1,16 @@
 /**
- * P2D シグナリングサーバー - 型定義
+ * P2D シグナリングサーバー - 型定義 (Full Mesh P2P Update)
  */
 
 // メッセージタイプ
 export type MessageType =
-    | 'room:create'      // ルーム作成
+    | 'room:create'      // ルーム作成 (実質joinと同じ)
     | 'room:join'        // ルーム参加
     | 'room:leave'       // ルーム退出
-    | 'room:created'     // ルーム作成完了
-    | 'room:joined'      // ルーム参加完了
-    | 'peer:joined'      // 新しいピアが参加
-    | 'peer:left'        // ピアが退出
+    | 'room:created'     // ルーム作成完了 (createへの応答)
+    | 'room:joined'      // ルーム参加完了 (joinへの応答)
+    | 'peer:joined'      // 他のピアが参加
+    | 'peer:left'        // 他のピアが退出
     | 'peer:offer'       // SDP Offer
     | 'peer:answer'      // SDP Answer
     | 'peer:ice'         // ICE候補
@@ -30,7 +30,7 @@ export interface SignalingMessage {
 export interface RoomCreateMessage extends SignalingMessage {
     type: 'room:create';
     payload: {
-        hostName?: string;
+        name?: string; // 作成者の名前
     };
 }
 
@@ -39,6 +39,7 @@ export interface RoomCreatedMessage extends SignalingMessage {
     type: 'room:created';
     payload: {
         roomCode: string;
+        roomId: string;
     };
 }
 
@@ -47,26 +48,29 @@ export interface RoomJoinMessage extends SignalingMessage {
     type: 'room:join';
     payload: {
         roomCode: string;
-        viewerName?: string;
+        name?: string; // 参加者の名前
     };
 }
 
 // ルーム参加完了メッセージ
+// 自分が参加した時に、既存の参加者一覧を受け取る
 export interface RoomJoinedMessage extends SignalingMessage {
     type: 'room:joined';
     payload: {
         roomId: string;
-        hostId: string;
-        peers: string[];
+        roomCode: string;
+        myId: string;
+        participants: ParticipantInfo[]; // 既存参加者リスト (自分以外)
     };
 }
 
 // ピア参加通知メッセージ
+// 他の誰かが参加してきた時
 export interface PeerJoinedMessage extends SignalingMessage {
     type: 'peer:joined';
     payload: {
         peerId: string;
-        peerName?: string;
+        name?: string;
     };
 }
 
@@ -107,14 +111,12 @@ export interface ErrorMessage extends SignalingMessage {
 export interface Room {
     id: string;
     code: string;
-    hostId: string;
-    hostName?: string;
-    viewers: Map<string, ViewerInfo>;
+    participants: Map<string, ParticipantInfo>;
     createdAt: number;
 }
 
-// ビューア情報
-export interface ViewerInfo {
+// 参加者情報
+export interface ParticipantInfo {
     id: string;
     name?: string;
     joinedAt: number;

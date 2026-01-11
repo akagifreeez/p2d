@@ -1,8 +1,7 @@
 /**
- * P2D - DataChannel管理
+ * P2D - DataChannel管理 (Full Mesh P2P Update)
  * 
- * WebRTC DataChannelを使用したピア間通信を管理する。
- * チャットメッセージ、統計情報交換などに使用。
+ * 型定義のみを中心に使用。DataChannelManagerクラスはレガシーサポートまたは削除予定。
  */
 
 // メッセージタイプ
@@ -17,8 +16,9 @@ export type DataChannelMessageType =
     | 'input:scroll'       // スクロール
     | 'input:key'          // キー入力
     | 'clipboard:update'   // クリップボード更新
-    | 'screen:start'       // 画面共有開始 (NEW)
-    | 'screen:stop';       // 画面共有停止 (NEW)
+    | 'screen:start'       // 画面共有開始
+    | 'screen:stop'        // 画面共有停止
+    | 'chat';              // 簡易チャット (useWebRTCで使用)
 
 // メッセージ基本構造
 export interface DataChannelMessage<T = unknown> {
@@ -30,9 +30,11 @@ export interface DataChannelMessage<T = unknown> {
 // チャットメッセージデータ
 export interface ChatMessageData {
     id: string;
-    sender: 'host' | 'viewer';
+    senderId: string;
     senderName?: string;
-    text: string;
+    content: string; // 統一 (text -> content)
+    timestamp: number;
+    isHost?: boolean; // Legacy support
 }
 
 // 入力データ型定義
@@ -58,146 +60,7 @@ export interface ClipboardData {
     text: string;
 }
 
-// チャットメッセージ
+// チャットメッセージ（互換用）
 export interface ChatMessage extends DataChannelMessage<ChatMessageData> {
     type: 'chat:message';
-}
-
-// DataChannelイベントハンドラ
-export interface DataChannelHandlers {
-    onMessage?: (message: DataChannelMessage) => void;
-    onChatMessage?: (message: ChatMessage) => void;
-    onOpen?: () => void;
-    onClose?: () => void;
-    onError?: (error: Event) => void;
-}
-
-/**
- * DataChannelを作成・管理するクラス
- */
-export class DataChannelManager {
-    private channel: RTCDataChannel | null = null;
-    private handlers: DataChannelHandlers = {};
-    private isHost: boolean;
-
-    constructor(isHost: boolean, handlers: DataChannelHandlers = {}) {
-        this.isHost = isHost;
-        this.handlers = handlers;
-    }
-
-    /**
-     * ホスト側: DataChannelを作成
-     */
-    createChannel(peerConnection: RTCPeerConnection): RTCDataChannel {
-        const channel = peerConnection.createDataChannel('p2d-control', {
-            ordered: true,  // メッセージ順序保証
-        });
-
-        this.setupChannel(channel);
-        return channel;
-    }
-
-    /**
-     * ビューア側: DataChannelを受信
-     */
-    setupOnDataChannel(peerConnection: RTCPeerConnection): void {
-        peerConnection.ondatachannel = (event) => {
-            console.log('[DataChannel] チャンネル受信:', event.channel.label);
-            this.setupChannel(event.channel);
-        };
-    }
-
-    /**
-     * チャンネルの共通セットアップ
-     */
-    private setupChannel(channel: RTCDataChannel): void {
-        this.channel = channel;
-
-        channel.onopen = () => {
-            console.log('[DataChannel] 接続開始');
-            this.handlers.onOpen?.();
-        };
-
-        channel.onclose = () => {
-            console.log('[DataChannel] 接続終了');
-            this.handlers.onClose?.();
-        };
-
-        channel.onerror = (event) => {
-            console.error('[DataChannel] エラー:', event);
-            this.handlers.onError?.(event);
-        };
-
-        channel.onmessage = (event) => {
-            try {
-                const message = JSON.parse(event.data) as DataChannelMessage;
-                console.log('[DataChannel] メッセージ受信:', message.type);
-
-                // 汎用ハンドラ
-                this.handlers.onMessage?.(message);
-
-                // タイプ別ハンドラ
-                if (message.type === 'chat:message') {
-                    this.handlers.onChatMessage?.(message as ChatMessage);
-                }
-            } catch (error) {
-                console.error('[DataChannel] メッセージパースエラー:', error);
-            }
-        };
-    }
-
-    /**
-     * メッセージを送信
-     */
-    send<T>(type: DataChannelMessageType, data: T): boolean {
-        if (!this.channel || this.channel.readyState !== 'open') {
-            console.warn('[DataChannel] チャンネルが開いていません');
-            return false;
-        }
-
-        const message: DataChannelMessage<T> = {
-            type,
-            timestamp: Date.now(),
-            data,
-        };
-
-        try {
-            this.channel.send(JSON.stringify(message));
-            return true;
-        } catch (error) {
-            console.error('[DataChannel] 送信エラー:', error);
-            return false;
-        }
-    }
-
-    /**
-     * チャットメッセージを送信
-     */
-    sendChatMessage(text: string, senderName?: string): boolean {
-        const data: ChatMessageData = {
-            id: `${Date.now()}-${Math.random().toString(36).substr(2, 9)}`,
-            sender: this.isHost ? 'host' : 'viewer',
-            senderName,
-            text,
-        };
-
-        return this.send('chat:message', data);
-    }
-
-    /**
-     * チャンネルの状態を取得
-     */
-    get isOpen(): boolean {
-        return this.channel?.readyState === 'open';
-    }
-
-    /**
-     * クリーンアップ
-     */
-    close(): void {
-        if (this.channel) {
-            this.channel.close();
-            this.channel = null;
-        }
-    }
 }

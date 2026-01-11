@@ -1,0 +1,73 @@
+# P2D Infrastructure - Signaling Server + TURN Server
+#
+# 使い方:
+#   docker-compose up -d
+#
+# 設定:
+#   - TURN_USER, TURN_PASSで認証情報を変更
+#   - TURN_REALMでドメインを設定
+#   - 本番環境ではTURN_EXTERNAL_IPを実際のIPに変更
+
+version: '3.8'
+
+services:
+  # ========================================
+  # Signaling Server (WebSocket)
+  # ========================================
+  signaling:
+    build:
+      context: ./signaling-server
+      dockerfile: Dockerfile
+    container_name: p2d-signaling
+    ports:
+      - "8080:8080"
+    restart: unless-stopped
+    environment:
+      - NODE_ENV=production
+    networks:
+      - p2d-network
+    healthcheck:
+      test: [ "CMD-SHELL", "nc -z localhost 8080 || exit 1" ]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # ========================================
+  # TURN Server (Coturn)
+  # ========================================
+  turn:
+    image: coturn/coturn:latest
+    container_name: p2d-turn
+    ports:
+      # TURN/STUN
+      - "3478:3478/tcp"
+      - "3478:3478/udp"
+      # TURNS (TLS)
+      - "5349:5349/tcp"
+      - "5349:5349/udp"
+      # Relay ports (UDP)
+      - "49152-49200:49152-49200/udp"
+    restart: unless-stopped
+    environment:
+      - TURN_USER=${TURN_USER:-p2d}
+      - TURN_PASS=${TURN_PASS:-p2d_secret_password}
+      - TURN_REALM=${TURN_REALM:-p2d.local}
+      - TURN_EXTERNAL_IP=${TURN_EXTERNAL_IP:-}
+    command:
+      - -n
+      - --log-file=stdout
+      - --min-port=49152
+      - --max-port=49200
+      - --realm=${TURN_REALM:-p2d.local}
+      - --user=${TURN_USER:-p2d}:${TURN_PASS:-p2d_secret_password}
+      - --lt-cred-mech
+      - --fingerprint
+      - --listening-port=3478
+      - --tls-listening-port=5349
+      - --verbose
+    networks:
+      - p2d-network
+
+networks:
+  p2d-network:
+    driver: bridge

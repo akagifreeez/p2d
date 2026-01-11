@@ -1,5 +1,5 @@
 /**
- * P2D シグナリングサーバー - メインエントリー
+ * P2D シグナリングサーバー - メインエントリー (Full Mesh P2P Update)
  * 
  * WebSocketを使用してWebRTC接続のシグナリングを中継する。
  */
@@ -13,6 +13,8 @@ import type {
     OfferMessage,
     AnswerMessage,
     IceCandidateMessage,
+    ParticipantInfo,
+    Room,
 } from './types.js';
 
 // サーバー設定
@@ -63,12 +65,13 @@ wss.on('connection', (ws: WebSocket) => {
 
     // 接続確認メッセージを送信
     sendMessage(ws, {
-        type: 'room:joined', // 接続確認用に再利用
+        type: 'room:joined', // 接続確認用に再利用(ダミー)
         timestamp: Date.now(),
         payload: {
             roomId: '',
-            hostId: '',
-            peers: [],
+            roomCode: '',
+            myId: clientId,
+            participants: [],
         },
     });
 });
@@ -80,7 +83,9 @@ function handleMessage(clientId: string, message: SignalingMessage): void {
     const ws = clients.get(clientId);
     if (!ws) return;
 
-    console.log(`[Server] メッセージ受信 (${clientId}): ${message.type}`);
+    if (message.type !== 'peer:ice') { // ICEは大量に来るのでログ除外
+        console.log(`[Server] メッセージ受信 (${clientId}): ${message.type}`);
+    }
 
     switch (message.type) {
         case 'room:create':
@@ -116,8 +121,8 @@ function handleMessage(clientId: string, message: SignalingMessage): void {
  * ルーム作成ハンドラ
  */
 function handleRoomCreate(clientId: string, ws: WebSocket, message: RoomCreateMessage): void {
-    const hostName = message.payload?.hostName;
-    const room = roomManager.createRoom(clientId, hostName);
+    const name = message.payload?.name;
+    const room = roomManager.createRoom(clientId, name);
 
     sendMessage(ws, {
         type: 'room:created',
@@ -126,6 +131,22 @@ function handleRoomCreate(clientId: string, ws: WebSocket, message: RoomCreateMe
         timestamp: Date.now(),
         payload: {
             roomCode: room.code,
+            roomId: room.id,
+        },
+    });
+
+    // 暗黙的にJoin済みとして扱うため、RoomJoinedを送る
+    // (createRoom内部ですでにparticipantとして登録されている)
+    sendMessage(ws, {
+        type: 'room:joined',
+        roomId: room.id,
+        senderId: clientId,
+        timestamp: Date.now(),
+        payload: {
+            roomId: room.id,
+            roomCode: room.code,
+            myId: clientId,
+            participants: [], // 作成直後は自分だけなので空
         },
     });
 }
@@ -140,73 +161,67 @@ function handleRoomJoin(clientId: string, ws: WebSocket, message: RoomJoinMessag
         return;
     }
 
-    const viewerName = message.payload?.viewerName;
-    const room = roomManager.joinRoom(roomCode, clientId, viewerName);
+    const name = message.payload?.name;
+    const room = roomManager.joinRoom(roomCode, clientId, name);
 
     if (!room) {
         sendError(ws, 'ROOM_NOT_FOUND', 'ルームが見つかりません');
         return;
     }
 
-    // 参加者に通知
+    // 1. 新しい参加者に「既存の参加者リスト」を送る
+    const participants: ParticipantInfo[] = [];
+    room.participants.forEach((info, id) => {
+        if (id !== clientId) { // 自分以外
+            participants.push(info);
+        }
+    });
+
     sendMessage(ws, {
         type: 'room:joined',
         roomId: room.id,
-        senderId: clientId,
+        senderId: clientId, // System
         timestamp: Date.now(),
         payload: {
             roomId: room.id,
-            hostId: room.hostId,
-            peers: [room.hostId, ...Array.from(room.viewers.keys())],
+            roomCode: room.code,
+            myId: clientId,
+            participants: participants,
         },
     });
 
-    // ホストに新しいビューアを通知
-    const hostWs = clients.get(room.hostId);
-    if (hostWs) {
-        sendMessage(hostWs, {
-            type: 'peer:joined',
-            roomId: room.id,
-            senderId: clientId,
-            timestamp: Date.now(),
-            payload: {
-                peerId: clientId,
-                peerName: viewerName,
-            },
-        });
-    }
+    // 2. 既存の参加者全員に「新しい参加者」を通知
+    room.participants.forEach((_, peerId) => {
+        if (peerId !== clientId) {
+            const peerWs = clients.get(peerId);
+            if (peerWs) {
+                sendMessage(peerWs, {
+                    type: 'peer:joined',
+                    roomId: room.id,
+                    senderId: clientId,
+                    timestamp: Date.now(),
+                    payload: {
+                        peerId: clientId,
+                        name: name,
+                    },
+                });
+            }
+        }
+    });
 }
 
 /**
  * ルーム退出ハンドラ
  */
 function handleRoomLeave(clientId: string): void {
-    const result = roomManager.leaveRoom(clientId);
-    if (!result) return;
+    const { room } = roomManager.leaveRoom(clientId);
+    if (!room) return; // 既に削除されたか、参加していなかった
 
-    const { room, wasHost } = result;
-
-    if (wasHost) {
-        // 全ビューアに通知
-        for (const [viewerId] of room.viewers) {
-            const viewerWs = clients.get(viewerId);
-            if (viewerWs) {
-                sendMessage(viewerWs, {
-                    type: 'peer:left',
-                    roomId: room.id,
-                    senderId: room.hostId,
-                    timestamp: Date.now(),
-                    payload: {
-                        peerId: room.hostId,
-                    },
-                });
-            }
-        }
-    } else {
-        // ホストと他のビューアに通知
-        const hostWs = clients.get(room.hostId);
-        if (hostWs) {
-            sendMessage(hostWs, {
+    // 残っている参加者全員に通知
+    room.participants.forEach((_, peerId) => {
+        const peerWs = clients.get(peerId);
+        if (peerWs) {
+            sendMessage(peerWs, {
                 type: 'peer:left',
                 roomId: room.id,
                 senderId: clientId,
@@ -216,7 +231,7 @@ function handleRoomLeave(clientId: string): void {
                 },
             });
         }
-    }
+    });
 }
 
 /**
@@ -265,7 +280,7 @@ function handleAnswer(clientId: string, message: AnswerMessage): void {
 function handleIceCandidate(clientId: string, message: IceCandidateMessage): void {
     const targetId = message.targetId;
     if (!targetId) {
-        console.error(`[Server] ICE: targetIdがありません`);
+        // console.error(`[Server] ICE: targetIdがありません`);
         return;
     }
 

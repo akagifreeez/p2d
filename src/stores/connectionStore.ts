@@ -13,10 +13,9 @@ interface ConnectionStore {
     // 状態
     connectionState: ConnectionState;
     roomCode: string | null;
-    isHost: boolean;
     error: string | null;
 
-    // 統計情報
+    // 統計情報 (現状維持、必要なら後でMulti-Peer対応)
     stats: {
         latency: number;
         bitrate: number;
@@ -26,7 +25,6 @@ interface ConnectionStore {
     // アクション
     setConnectionState: (state: ConnectionState) => void;
     setRoomCode: (code: string | null) => void;
-    setIsHost: (isHost: boolean) => void;
     setError: (error: string | null) => void;
     setStats: (stats: ConnectionStore['stats']) => void;
     reset: () => void;
@@ -36,7 +34,6 @@ interface ConnectionStore {
 const initialState = {
     connectionState: 'disconnected' as ConnectionState,
     roomCode: null,
-    isHost: false,
     error: null,
     stats: null,
 };
@@ -47,7 +44,6 @@ export const useConnectionStore = create<ConnectionStore>((set) => ({
 
     setConnectionState: (state) => set({ connectionState: state }),
     setRoomCode: (code) => set({ roomCode: code }),
-    setIsHost: (isHost) => set({ isHost }),
     setError: (error) => set({ error }),
     setStats: (stats) => set({ stats }),
 

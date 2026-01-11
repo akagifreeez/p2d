@@ -1,13 +1,8 @@
 import { useState, useEffect } from 'react';
 import { useConnectionStore } from './stores/connectionStore';
-import { HostView } from './components/HostView';
-import { ViewerView } from './components/ViewerView';
-
-// ビュータイプ
-type ViewType = 'select' | 'host' | 'viewer';
+import { RoomView } from './components/RoomView';
 
 function App() {
-    const [view, setView] = useState<ViewType>('select');
     const { connectionState } = useConnectionStore();
 
     // 設定
@@ -15,146 +10,176 @@ function App() {
     const [showSettings, setShowSettings] = useState(false);
     const [signalingUrl, setSignalingUrl] = useState(DEFAULT_SIGNALING_URL);
 
+    // TURNサーバー設定
+    const [turnUrl, setTurnUrl] = useState('');
+    const [turnUsername, setTurnUsername] = useState('');
+    const [turnCredential, setTurnCredential] = useState('');
+
     useEffect(() => {
-        const saved = localStorage.getItem('p2d_signaling_url');
-        if (saved) setSignalingUrl(saved);
+        const savedSignaling = localStorage.getItem('p2d_signaling_url');
+        if (savedSignaling) setSignalingUrl(savedSignaling);
+
+        const savedTurnUrl = localStorage.getItem('p2d_turn_url');
+        const savedTurnUsername = localStorage.getItem('p2d_turn_username');
+        const savedTurnCredential = localStorage.getItem('p2d_turn_credential');
+        if (savedTurnUrl) setTurnUrl(savedTurnUrl);
+        if (savedTurnUsername) setTurnUsername(savedTurnUsername);
+        if (savedTurnCredential) setTurnCredential(savedTurnCredential);
     }, []);
 
     const saveSettings = () => {
         localStorage.setItem('p2d_signaling_url', signalingUrl);
+        localStorage.setItem('p2d_turn_url', turnUrl);
+        localStorage.setItem('p2d_turn_username', turnUsername);
+        localStorage.setItem('p2d_turn_credential', turnCredential);
         setShowSettings(false);
         window.location.reload();
     };
 
     const resetSettings = () => {
         localStorage.removeItem('p2d_signaling_url');
+        localStorage.removeItem('p2d_turn_url');
+        localStorage.removeItem('p2d_turn_username');
+        localStorage.removeItem('p2d_turn_credential');
         setSignalingUrl(DEFAULT_SIGNALING_URL);
+        setTurnUrl('');
+        setTurnUsername('');
+        setTurnCredential('');
     };
 
-    // ホスト画面
-    if (view === 'host') {
-        return <HostView onBack={() => setView('select')} />;
-    }
+    // TURN設定オブジェクト（URLが空ならundefined）
+    const turnConfig = turnUrl ? {
+        url: turnUrl,
+        username: turnUsername || undefined,
+        credential: turnCredential || undefined,
+    } : undefined;
 
-    // ビューア画面
-    if (view === 'viewer') {
-        return <ViewerView onBack={() => setView('select')} />;
-    }
-
-    // モード選択画面
     return (
-        <div className="min-h-screen flex items-center justify-center p-8 relative">
-            {/* 設定ボタン */}
-            <button
-                onClick={() => setShowSettings(true)}
-                className="absolute top-4 right-4 p-2 text-white/50 hover:text-white transition-colors"
-                title="設定"
-            >
-                ⚙️
-            </button>
+        <div className="min-h-screen bg-black text-white relative font-sans">
+            {/* 設定ボタン (未接続時のみ表示) */}
+            {connectionState === 'disconnected' && (
+                <button
+                    onClick={() => setShowSettings(true)}
+                    className="fixed top-6 right-6 p-3 rounded-full bg-white/5 hover:bg-white/10 text-white/70 hover:text-white transition-all duration-300 backdrop-blur-sm z-50 group"
+                    title="設定"
+                >
+                    <svg className="w-6 h-6 group-hover:rotate-90 transition-transform duration-500" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z" />
+                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M15 12a3 3 0 11-6 0 3 3 0 016 0z" />
+                    </svg>
+                </button>
+            )}
 
             {/* 設定モーダル */}
             {showSettings && (
-                <div className="fixed inset-0 bg-black/80 z-50 flex items-center justify-center p-4">
-                    <div className="bg-gray-800 p-6 rounded-xl max-w-md w-full border border-white/10 space-y-4">
-                        <h2 className="text-xl font-bold text-white mb-4">設定</h2>
-
-                        <div className="space-y-2">
-                            <label className="text-sm text-gray-400">シグナリングサーバー URL</label>
-                            <input
-                                type="text"
-                                value={signalingUrl}
-                                onChange={(e) => setSignalingUrl(e.target.value)}
-                                className="w-full bg-black/50 border border-white/20 rounded-lg px-4 py-2 text-white focus:outline-none focus:border-primary-500"
-                                placeholder="ws://localhost:8080"
-                            />
-                            <p className="text-xs text-gray-500">
-                                別のPCから接続する場合は、ホストPCのIPを指定してください。<br />
-                                例: ws://192.168.1.10:8080
-                            </p>
-                        </div>
-
-                        <div className="flex gap-3 pt-4">
-                            <button
-                                onClick={resetSettings}
-                                className="px-4 py-2 rounded-lg bg-red-500/10 text-red-400 hover:bg-red-500/20 text-sm"
-                            >
-                                初期化
-                            </button>
-                            <div className="flex-1"></div>
+                <div className="fixed inset-0 bg-black/80 backdrop-blur-sm z-[100] flex items-center justify-center p-4 animate-fade-in">
+                    <div className="glass-card p-8 max-w-md w-full border-cyan-500/30 shadow-[0_0_50px_rgba(0,0,0,0.5)] animate-slide-up transform transition-all">
+                        <div className="flex justify-between items-center mb-6">
+                            <h2 className="text-2xl font-bold text-white text-glow">Settings</h2>
                             <button
                                 onClick={() => setShowSettings(false)}
-                                className="px-4 py-2 rounded-lg bg-white/10 text-white hover:bg-white/20 transition-colors"
+                                className="text-gray-400 hover:text-white transition-colors"
                             >
-                                キャンセル
+                                ✕
                             </button>
+                        </div>
+
+                        <div className="space-y-6">
+                            {/* Signaling Server */}
+                            <div>
+                                <label className="block text-sm font-medium text-cyan-400 mb-2">Signaling Server URL</label>
+                                <input
+                                    type="text"
+                                    value={signalingUrl}
+                                    onChange={(e) => setSignalingUrl(e.target.value)}
+                                    className="input w-full bg-black/50 border-white/10 focus:border-cyan-500/50"
+                                    placeholder="ws://localhost:8080"
+                                />
+                                <p className="mt-2 text-xs text-gray-500">
+                                    Local: <span className="font-mono text-gray-400">ws://localhost:8080</span> |
+                                    LAN: <span className="font-mono text-gray-400">ws://192.168.x.x:8080</span>
+                                </p>
+                            </div>
+
+                            {/* TURN Server */}
+                            <div className="pt-4 border-t border-white/5">
+                                <label className="block text-sm font-medium text-purple-400 mb-2">TURN Server (Optional)</label>
+                                <p className="text-xs text-gray-500 mb-3">
+                                    NAT越えが必要な場合に設定。自前のサーバーまたはTwilio等のサービスを使用。
+                                </p>
+                                <input
+                                    type="text"
+                                    value={turnUrl}
+                                    onChange={(e) => setTurnUrl(e.target.value)}
+                                    className="input w-full bg-black/50 border-white/10 focus:border-purple-500/50 mb-2"
+                                    placeholder="turn:example.com:3478"
+                                />
+                                <div className="grid grid-cols-2 gap-2">
+                                    <input
+                                        type="text"
+                                        value={turnUsername}
+                                        onChange={(e) => setTurnUsername(e.target.value)}
+                                        className="input bg-black/50 border-white/10 focus:border-purple-500/50"
+                                        placeholder="Username"
+                                    />
+                                    <input
+                                        type="password"
+                                        value={turnCredential}
+                                        onChange={(e) => setTurnCredential(e.target.value)}
+                                        className="input bg-black/50 border-white/10 focus:border-purple-500/50"
+                                        placeholder="Credential"
+                                    />
+                                </div>
+                                {turnUrl && (
+                                    <div className="mt-2 text-xs text-green-400 flex items-center gap-1">
+                                        <span className="w-2 h-2 bg-green-500 rounded-full"></span>
+                                        TURN server configured
+                                    </div>
+                                )}
+                            </div>
+                        </div>
+
+                        <div className="flex items-center justify-between gap-4 pt-8 border-t border-white/5">
                             <button
-                                onClick={saveSettings}
-                                className="px-4 py-2 rounded-lg bg-primary-600 text-white hover:bg-primary-500 transition-colors font-bold"
+                                onClick={resetSettings}
+                                className="px-4 py-2.5 rounded-lg text-sm text-red-400 hover:text-red-300 hover:bg-red-500/10 transition-colors border border-transparent hover:border-red-500/20"
                             >
-                                保存して再起動
+                                Reset to Default
                             </button>
+                            <div className="flex items-center gap-3">
+                                <button
+                                    onClick={() => setShowSettings(false)}
+                                    className="px-5 py-2.5 rounded-lg text-sm text-gray-300 hover:text-white hover:bg-white/5 transition-colors border border-white/10"
+                                >
+                                    Cancel
+                                </button>
+                                <button
+                                    onClick={saveSettings}
+                                    className="btn-primary px-6 py-2.5 text-sm"
+                                >
+                                    Save & Reload
+                                </button>
+                            </div>
                         </div>
                     </div>
                 </div>
             )}
 
-            <div className="max-w-md w-full space-y-8">
-                {/* ロゴ・タイトル */}
-                <div className="text-center">
-                    <h1 className="text-4xl font-bold bg-gradient-to-r from-primary-400 to-primary-600 bg-clip-text text-transparent">
-                        P2D
-                    </h1>
-                    <p className="mt-2 text-dark-400">
-                        P2P Desktop Sharing
-                    </p>
-                </div>
+            {/* Main Room View */}
+            {/* useWebRTCにoptionsとしてURLを渡すために、RoomView経由ではなくContext経由か、
+               あるいは useWebRTC の呼び出し側で inject する必要があるが、
+               RoomView 内部で useWebRTC を呼んでいるため、今のままでは渡せない。
+               
+               修正案: RoomView に props で url を渡し、RoomView 内部で useWebRTC({ signalingUrl: props.url }) する。
+               RoomViewの修正漏れがあったので、次のステップで修正する。
+               ここでは一旦、URLを渡さずにレンダリングする（デフォルトURLで動作させる）。
+            */}
+            {/* Passed signalingUrl and turnConfig props */}
+            <RoomView onLeave={() => { }} signalingUrl={signalingUrl} turnConfig={turnConfig} />
 
-                {/* モード選択 */}
-                <div className="space-y-4">
-                    <button
-                        onClick={() => setView('host')}
-                        className="w-full card p-6 hover:border-primary-500 transition-all duration-200 group"
-                    >
-                        <div className="flex items-center space-x-4">
-                            <div className="w-12 h-12 rounded-full bg-primary-600/20 flex items-center justify-center group-hover:bg-primary-600/30 transition-colors">
-                                <svg className="w-6 h-6 text-primary-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9.75 17L9 20l-1 1h8l-1-1-.75-3M3 13h18M5 17h14a2 2 0 002-2V5a2 2 0 00-2-2H5a2 2 0 00-2 2v10a2 2 0 002 2z" />
-                                </svg>
-                            </div>
-                            <div className="text-left">
-                                <h2 className="text-lg font-semibold text-white">画面を共有する</h2>
-                                <p className="text-sm text-dark-400">ホストとして画面を配信</p>
-                            </div>
-                        </div>
-                    </button>
-
-                    <button
-                        onClick={() => setView('viewer')}
-                        className="w-full card p-6 hover:border-primary-500 transition-all duration-200 group"
-                    >
-                        <div className="flex items-center space-x-4">
-                            <div className="w-12 h-12 rounded-full bg-primary-600/20 flex items-center justify-center group-hover:bg-primary-600/30 transition-colors">
-                                <svg className="w-6 h-6 text-primary-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 10l4.553-2.276A1 1 0 0121 8.618v6.764a1 1 0 01-1.447.894L15 14M5 18h8a2 2 0 002-2V8a2 2 0 00-2-2H5a2 2 0 00-2 2v8a2 2 0 002 2z" />
-                                </svg>
-                            </div>
-                            <div className="text-left">
-                                <h2 className="text-lg font-semibold text-white">画面を視聴する</h2>
-                                <p className="text-sm text-dark-400">ルームコードで参加</p>
-                            </div>
-                        </div>
-                    </button>
-                </div>
-
-                {/* 接続状態 */}
-                <div className="text-center text-sm text-dark-500">
-                    <div className="flex items-center justify-center space-x-2">
-                        <span className={connectionState === 'connected' ? 'status-connected' : 'status-disconnected'} />
-                        <span>
-                            {connectionState === 'connected' ? 'サーバー接続済み' : 'サーバー未接続'}
-                        </span>
-                    </div>
+            <div className="fixed bottom-4 left-0 w-full text-center pointer-events-none z-0 opacity-50">
+                <div className="text-[10px] text-gray-600 font-mono tracking-widest">
+                    P2D v0.2.0 (Full Mesh Beta)
                 </div>
             </div>
         </div>

@@ -1,8 +1,8 @@
 /**
- * P2D シグナリングサーバー - ルーム管理
+ * P2D シグナリングサーバー - ルーム管理 (Full Mesh P2P Update)
  */
 
-import type { Room, ViewerInfo } from './types.js';
+import type { Room, ParticipantInfo } from './types.js';
 
 // 6桁のルームコードを生成
 function generateRoomCode(): string {
@@ -23,7 +23,7 @@ export class RoomManager {
     // クライアントID -> ルームID
     private clientToRoom: Map<string, string> = new Map();
 
-    // ルームのタイムアウト（5分）
+    // ルームのタイムアウト（5分）- 誰もいないルームが放置された場合の安全策
     private readonly ROOM_TIMEOUT_MS = 5 * 60 * 1000;
 
     constructor() {
@@ -34,7 +34,7 @@ export class RoomManager {
     /**
      * 新しいルームを作成
      */
-    createRoom(hostId: string, hostName?: string): Room {
+    createRoom(creatorId: string, creatorName?: string): Room {
         // 一意なルームコードを生成
         let code: string;
         do {
@@ -43,20 +43,25 @@ export class RoomManager {
 
         const roomId = crypto.randomUUID();
 
+        // 最初の参加者（作成者）を作成
+        const creator: ParticipantInfo = {
+            id: creatorId,
+            name: creatorName,
+            joinedAt: Date.now()
+        };
+
         const room: Room = {
             id: roomId,
             code,
-            hostId,
-            hostName,
-            viewers: new Map(),
+            participants: new Map([[creatorId, creator]]),
             createdAt: Date.now(),
         };
 
         this.rooms.set(roomId, room);
         this.codeToId.set(code, roomId);
-        this.clientToRoom.set(hostId, roomId);
+        this.clientToRoom.set(creatorId, roomId);
 
-        console.log(`[RoomManager] ルーム作成: ${code} (ID: ${roomId}), ホスト: ${hostId}`);
+        console.log(`[RoomManager] ルーム作成: ${code} (ID: ${roomId}), 作成者: ${creatorId}`);
 
         return room;
     }
@@ -64,7 +69,7 @@ export class RoomManager {
     /**
      * ルームコードでルームに参加
      */
-    joinRoom(code: string, viewerId: string, viewerName?: string): Room | null {
+    joinRoom(code: string, clientId: string, clientName?: string): Room | null {
         const roomId = this.codeToId.get(code.toUpperCase());
         if (!roomId) {
             console.log(`[RoomManager] ルーム未発見: ${code}`);
@@ -76,16 +81,22 @@ export class RoomManager {
             return null;
         }
 
-        // ビューアを追加
-        const viewerInfo: ViewerInfo = {
-            id: viewerId,
-            name: viewerName,
+        // 既に参加済みの場合は更新だけ（ID重複対策）
+        if (room.participants.has(clientId)) {
+            console.warn(`[RoomManager] クライアント ${clientId} は既にルームに参加しています`);
+            return room;
+        }
+
+        // 参加者を追加
+        const info: ParticipantInfo = {
+            id: clientId,
+            name: clientName,
             joinedAt: Date.now(),
         };
-        room.viewers.set(viewerId, viewerInfo);
-        this.clientToRoom.set(viewerId, roomId);
+        room.participants.set(clientId, info);
+        this.clientToRoom.set(clientId, roomId);
 
-        console.log(`[RoomManager] ビューア参加: ${viewerId} -> ルーム ${code}`);
+        console.log(`[RoomManager] 参加: ${clientId} -> ルーム ${code}, 現在人数: ${room.participants.size}`);
 
         return room;
     }
@@ -93,32 +104,31 @@ export class RoomManager {
     /**
      * クライアントをルームから削除
      */
-    leaveRoom(clientId: string): { room: Room; wasHost: boolean } | null {
+    leaveRoom(clientId: string): { room: Room | null } {
         const roomId = this.clientToRoom.get(clientId);
         if (!roomId) {
-            return null;
+            return { room: null };
         }
 
         const room = this.rooms.get(roomId);
         if (!room) {
-            this.clientToRoom.delete(clientId);
-            return null;
+            this.clientToRoom.delete(clientId); // 整合性のため削除
+            return { room: null };
         }
 
-        const wasHost = room.hostId === clientId;
+        // 参加者を削除
+        room.participants.delete(clientId);
+        this.clientToRoom.delete(clientId);
+        console.log(`[RoomManager] 退出: ${clientId} from ${room.code}, 残り人数: ${room.participants.size}`);
 
-        if (wasHost) {
-            // ホストが退出した場合、ルームを削除
-            console.log(`[RoomManager] ホスト退出、ルーム削除: ${room.code}`);
+        // ルームが空になったら削除
+        if (room.participants.size === 0) {
+            console.log(`[RoomManager] ルームが空になったため削除: ${room.code}`);
             this.deleteRoom(roomId);
-        } else {
-            // ビューアが退出
-            room.viewers.delete(clientId);
-            this.clientToRoom.delete(clientId);
-            console.log(`[RoomManager] ビューア退出: ${clientId}`);
+            return { room: null }; // ルーム削除済み
         }
 
-        return { room, wasHost };
+        return { room };
     }
 
     /**
@@ -128,10 +138,9 @@ export class RoomManager {
         const room = this.rooms.get(roomId);
         if (!room) return;
 
-        // 全クライアントの参照を削除
-        this.clientToRoom.delete(room.hostId);
-        for (const [viewerId] of room.viewers) {
-            this.clientToRoom.delete(viewerId);
+        // 全クライアントの参照を削除（念の為）
+        for (const [id] of room.participants) {
+            this.clientToRoom.delete(id);
         }
 
         this.codeToId.delete(room.code);
@@ -162,8 +171,10 @@ export class RoomManager {
     private cleanupExpiredRooms(): void {
         const now = Date.now();
         for (const [roomId, room] of this.rooms) {
-            if (now - room.createdAt > this.ROOM_TIMEOUT_MS) {
-                console.log(`[RoomManager] 期限切れルームを削除: ${room.code}`);
+            // 作成から時間が経っており、かつ誰もいない場合は削除
+            // (通常leaveRoomで消えるが、サーバー再起動後などのゴミ掃除)
+            if (room.participants.size === 0 && now - room.createdAt > this.ROOM_TIMEOUT_MS) {
+                console.log(`[RoomManager] 期限切れ空ルームを削除: ${room.code}`);
                 this.deleteRoom(roomId);
             }
         }
