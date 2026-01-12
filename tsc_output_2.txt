@@ -1,3 +1,0 @@
-src/hooks/useWebRTC.ts(542,42): error TS2448: Block-scoped variable 'stopScreenShare' used before its declaration.
-src/hooks/useWebRTC.ts(542,42): error TS2454: Variable 'stopScreenShare' is used before being assigned.
-src/hooks/useWebRTC.ts(626,59): error TS6133: 'peerId' is declared but its value is never read.
