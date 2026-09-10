@@ -103,3 +103,15 @@ pub fn write_clipboard(text: String, state: State<'_, ClipboardState>) -> Result
     desktop::write_clipboard(text, state)
 }
 
+/// キーイベント適用 (down/up分離・特殊キー対応)
+#[tauri::command]
+pub fn simulate_key_event(key: String, direction: String) -> Result<(), String> {
+    desktop::simulate_key_event(key, direction)
+}
+
+/// マウスボタン Press/Release (ドラッグ対応)
+#[tauri::command]
+pub fn simulate_mouse_button(button: String, direction: String) -> Result<(), String> {
+    desktop::simulate_mouse_button(button, direction)
+}
+

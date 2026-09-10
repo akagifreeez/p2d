@@ -97,6 +97,12 @@ export interface UseWebRTCReturn {
     isScreenSharing: boolean;
     localStreams: Map<string, MediaStream>; // streamId -> Stream
 
+    // リモート操作 (F-022)
+    remoteControlAllowed: boolean;
+    setRemoteControlAllowed: (allowed: boolean) => void;
+    peerControlAllowed: Map<string, boolean>;
+    sendInputToPeer: (peerId: string, type: string, payload: unknown) => void;
+
     // マイク
     startMicrophone: () => Promise<void>;
     stopMicrophone: () => void;
@@ -204,6 +210,11 @@ export function useWebRTC(options?: { signalingUrl?: string; turnConfig?: TurnCo
     const bandwidthMonitorRef = useRef<BandwidthMonitor | null>(null);
     const adaptiveControllerRef = useRef<AdaptiveController | null>(null);
 
+    // リモート操作 (F-022: ホスト側の許可ゲート。デフォルトOFF = 安全側)
+    const remoteControlAllowedRef = useRef(false);
+    const [remoteControlAllowed, setRemoteControlAllowedState] = useState(false);
+    const [peerControlAllowed, setPeerControlAllowed] = useState<Map<string, boolean>>(new Map());
+
     // 接続状態管理
     const isConnectedRef = useRef(false);
 
@@ -226,6 +237,8 @@ export function useWebRTC(options?: { signalingUrl?: string; turnConfig?: TurnCo
         channel.onopen = () => {
             console.log(`[DataChannel] Open: ${peerId}`);
             dataChannelsRef.current.set(peerId, channel);
+            // 自分がホスト側の場合、リモート操作の許可状態を即通知
+            channel.send(JSON.stringify({ type: 'control:remote_allowed', payload: { allowed: remoteControlAllowedRef.current }, timestamp: Date.now() }));
             if (connectionState !== 'peer-connected' && peerConnectionsRef.current.size > 0) {
                 setConnectionState('peer-connected');
             }
@@ -248,6 +261,18 @@ export function useWebRTC(options?: { signalingUrl?: string; turnConfig?: TurnCo
                         next.set(peerId, data.payload.isSpeaking);
                         return next;
                     });
+                } else if (data.type === 'control:remote_allowed') {
+                    // ピア(ホスト)からのリモート操作許可状態
+                    setPeerControlAllowed(prev => {
+                        const next = new Map(prev);
+                        next.set(peerId, !!data.payload?.allowed);
+                        return next;
+                    });
+                } else if (typeof data.type === 'string' && data.type.startsWith('input:')) {
+                    // ホスト側: 自分が共有している画面へのリモート操作を適用 (許可時のみ・F-022)
+                    if (remoteControlAllowedRef.current) {
+                        void applyInputEvent(data.type, data.payload);
+                    }
                 }
                 // 他のメッセージタイプ（controlなど）は必要に応じて追加
             } catch (e) {
@@ -255,6 +280,60 @@ export function useWebRTC(options?: { signalingUrl?: string; turnConfig?: TurnCo
             }
         };
     }, [connectionState, setConnectionState]);
+
+    /**
+     * 受信したリモート操作イベントをネイティブ入力として適用 (ホスト側)
+     */
+    const applyInputEvent = useCallback(async (type: string, payload: any) => {
+        if (!payload) return;
+        try {
+            switch (type) {
+                case 'input:mouse_move':
+                    await invoke('simulate_mouse_move', { x: payload.x, y: payload.y, monitorName: payload.monitor ?? null });
+                    break;
+                case 'input:mouse_button':
+                    await invoke('simulate_mouse_button', { button: payload.button, direction: payload.direction });
+                    break;
+                case 'input:click':
+                    await invoke('simulate_click', { button: payload.button });
+                    break;
+                case 'input:scroll':
+                    await invoke('simulate_scroll', { deltaX: Math.round(payload.deltaX ?? 0), deltaY: Math.round(payload.deltaY ?? 0) });
+                    break;
+                case 'input:key_event':
+                    await invoke('simulate_key_event', { key: payload.key, direction: payload.direction });
+                    break;
+                case 'input:key':
+                    // レガシー: テキスト入力
+                    await invoke('simulate_key', { key: payload.key });
+                    break;
+                default:
+                    break;
+            }
+        } catch (e) {
+            console.error('[RemoteControl] 入力適用失敗:', type, e);
+        }
+    }, []);
+
+    /**
+     * リモート操作の許可状態を切り替え、全ピアへ通知 (F-022)
+     */
+    const setRemoteControlAllowed = useCallback((allowed: boolean) => {
+        remoteControlAllowedRef.current = allowed;
+        setRemoteControlAllowedState(allowed);
+        broadcastData('control:remote_allowed', { allowed });
+        console.log('[RemoteControl] 許可状態:', allowed);
+    }, [broadcastData]);
+
+    /**
+     * 特定ピアへ入力イベントを送信 (ビューア側)
+     */
+    const sendInputToPeer = useCallback((peerId: string, type: string, payload: unknown) => {
+        const dc = dataChannelsRef.current.get(peerId);
+        if (dc && dc.readyState === 'open') {
+            dc.send(JSON.stringify({ type, payload, timestamp: Date.now() }));
+        }
+    }, []);
 
     /**
      * PeerConnection作成
@@ -1003,6 +1082,12 @@ export function useWebRTC(options?: { signalingUrl?: string; turnConfig?: TurnCo
 
         // リモートピア発話状態
         remoteSpeakingStates,
+
+        // リモート操作 (F-022)
+        remoteControlAllowed,
+        setRemoteControlAllowed,
+        peerControlAllowed,
+        sendInputToPeer,
 
         // Adaptive Bitrate Control
         connectionQuality,

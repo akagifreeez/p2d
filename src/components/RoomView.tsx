@@ -9,18 +9,29 @@ import { useState, useRef, useEffect } from 'react';
 import { useWebRTC } from '../hooks/useWebRTC';
 import { ChatPanel } from './ChatPanel';
 import { MonitorPicker } from './MonitorPicker';
+import { normalizeKeyName } from '../lib/dataChannel';
 
 // ビデオグリッドアイテム
+interface RemoteControlBinding {
+    peerId: string;
+    allowed: boolean;
+    send: (type: string, payload: unknown) => void;
+    onHoverChange: (peerId: string | null) => void;
+}
+
 function VideoGridItem({
     stream,
     label,
-    isLocal = false
+    isLocal = false,
+    control
 }: {
     stream?: MediaStream | null;
     label?: string;
     isLocal?: boolean;
+    control?: RemoteControlBinding;
 }) {
     const videoRef = useRef<HTMLVideoElement>(null);
+    const lastMoveSentRef = useRef(0);
 
     useEffect(() => {
         if (videoRef.current && stream) {
@@ -36,7 +47,36 @@ function VideoGridItem({
                     autoPlay
                     playsInline
                     muted={isLocal} // 自分の音声はミュート（ハウリング防止）
-                    className="w-full h-full object-cover"
+                    className={`w-full h-full object-cover ${control?.allowed ? 'cursor-crosshair' : ''}`}
+                    onMouseMove={(e) => {
+                        if (!control?.allowed || !videoRef.current) return;
+                        const now = Date.now();
+                        if (now - lastMoveSentRef.current < 16) return; // ~60イベント/sにスロットル
+                        lastMoveSentRef.current = now;
+                        const rect = videoRef.current.getBoundingClientRect();
+                        const x = Math.min(1, Math.max(0, (e.clientX - rect.left) / rect.width));
+                        const y = Math.min(1, Math.max(0, (e.clientY - rect.top) / rect.height));
+                        control.send('input:mouse_move', { x, y });
+                    }}
+                    onMouseDown={(e) => {
+                        if (!control?.allowed) return;
+                        const button = e.button === 2 ? 'right' : e.button === 1 ? 'middle' : 'left';
+                        control.send('input:mouse_button', { button, direction: 'down' });
+                    }}
+                    onMouseUp={(e) => {
+                        if (!control?.allowed) return;
+                        const button = e.button === 2 ? 'right' : e.button === 1 ? 'middle' : 'left';
+                        control.send('input:mouse_button', { button, direction: 'up' });
+                    }}
+                    onContextMenu={(e) => {
+                        if (control?.allowed) e.preventDefault();
+                    }}
+                    onWheel={(e) => {
+                        if (!control?.allowed) return;
+                        control.send('input:scroll', { deltaX: e.deltaX, deltaY: e.deltaY });
+                    }}
+                    onMouseEnter={() => control?.onHoverChange(control.peerId)}
+                    onMouseLeave={() => control?.onHoverChange(null)}
                 />
             ) : (
                 <div className="w-full h-full flex items-center justify-center bg-white/5 text-gray-500">
@@ -73,6 +113,11 @@ export function RoomView({ onLeave, signalingUrl, turnConfig }: { onLeave: () =>
         isScreenSharing,
         localStreams,
         chatMessages,
+        // リモート操作 (F-022)
+        remoteControlAllowed,
+        setRemoteControlAllowed,
+        peerControlAllowed,
+        sendInputToPeer,
         sendChatMessage,
         // Microphone
         startMicrophone,
@@ -100,11 +145,34 @@ export function RoomView({ onLeave, signalingUrl, turnConfig }: { onLeave: () =>
     const [mode, setMode] = useState<'menu' | 'join' | 'create'>('menu');
     const [showSettings, setShowSettings] = useState(false);
     const [showSourcePicker, setShowSourcePicker] = useState(false);
+    const [controlPeer, setControlPeer] = useState<string | null>(null);
 
     // Effect: 初回にオーディオデバイス取得
     useEffect(() => {
         refreshAudioDevices();
     }, [refreshAudioDevices]);
+
+    // リモート操作: ホバー中のリモート画面へのキーボード転送 (入力欄では無効)
+    useEffect(() => {
+        if (!controlPeer) return;
+        const handleKey = (direction: 'down' | 'up') => (e: KeyboardEvent) => {
+            const t = e.target as HTMLElement | null;
+            if (t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.isContentEditable)) return;
+            if (!peerControlAllowed.get(controlPeer)) return;
+            const key = normalizeKeyName(e);
+            if (!key) return;
+            e.preventDefault();
+            sendInputToPeer(controlPeer, 'input:key_event', { key, direction });
+        };
+        const onDown = handleKey('down');
+        const onUp = handleKey('up');
+        window.addEventListener('keydown', onDown);
+        window.addEventListener('keyup', onUp);
+        return () => {
+            window.removeEventListener('keydown', onDown);
+            window.removeEventListener('keyup', onUp);
+        };
+    }, [controlPeer, peerControlAllowed, sendInputToPeer]);
 
     // クリーンアップ
     useEffect(() => {
@@ -364,6 +432,9 @@ export function RoomView({ onLeave, signalingUrl, turnConfig }: { onLeave: () =>
                                         {remoteStreams.has(id) && (
                                             <div className="text-[10px] bg-cyan-500/20 text-cyan-400 px-1.5 py-0.5 rounded border border-cyan-500/30">VIDEO</div>
                                         )}
+                                        {peerControlAllowed.get(id) && (
+                                            <div className="text-[10px] bg-green-500/20 text-green-400 px-1.5 py-0.5 rounded border border-green-500/30" title="このピアがあなたの画面をリモート操作できます">CTRL</div>
+                                        )}
                                     </div>
                                 );
                             })}
@@ -405,12 +476,18 @@ export function RoomView({ onLeave, signalingUrl, turnConfig }: { onLeave: () =>
                             />
                         )}
 
-                        {/* Remote Streams */}
+                        {/* Remote Streams (リモート操作対応) */}
                         {Array.from(remoteStreams).map(([peerId, stream]) => (
                             <VideoGridItem
                                 key={peerId}
                                 stream={stream}
                                 label={participants.get(peerId)?.name || peerId}
+                                control={{
+                                    peerId,
+                                    allowed: peerControlAllowed.get(peerId) === true,
+                                    send: (type, payload) => sendInputToPeer(peerId, type, payload),
+                                    onHoverChange: setControlPeer,
+                                }}
                             />
                         ))}
 
@@ -586,6 +663,22 @@ export function RoomView({ onLeave, signalingUrl, turnConfig }: { onLeave: () =>
                                             }`}
                                     >
                                         <div className={`w-4 h-4 rounded-full transition-transform ${isAdaptiveModeEnabled ? 'translate-x-6 bg-cyan-400' : 'translate-x-0 bg-gray-500'
+                                            }`} />
+                                    </button>
+                                </div>
+
+                                {/* リモート操作許可 (F-022: デフォルトOFF) */}
+                                <div className="flex items-center justify-between mt-4">
+                                    <div>
+                                        <div className="text-sm font-medium text-cyan-400">リモート操作を許可</div>
+                                        <div className="text-xs text-gray-500">相手があなたのマウス/キーボードを操作できるようにする</div>
+                                    </div>
+                                    <button
+                                        onClick={() => setRemoteControlAllowed(!remoteControlAllowed)}
+                                        className={`w-12 h-6 rounded-full p-1 transition-colors ${remoteControlAllowed ? 'bg-red-500/20 border border-red-500/50' : 'bg-white/5 border border-white/10'
+                                            }`}
+                                    >
+                                        <div className={`w-4 h-4 rounded-full transition-transform ${remoteControlAllowed ? 'translate-x-6 bg-red-400' : 'translate-x-0 bg-gray-500'
                                             }`} />
                                     </button>
                                 </div>

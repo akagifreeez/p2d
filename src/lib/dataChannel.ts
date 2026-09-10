@@ -13,8 +13,11 @@ export type DataChannelMessageType =
     | 'control:resume'     // 再開
     | 'input:mouse_move'   // マウス移動
     | 'input:click'        // クリック
+    | 'input:mouse_button' // マウスボタン Press/Release (ドラッグ)
     | 'input:scroll'       // スクロール
-    | 'input:key'          // キー入力
+    | 'input:key'          // キー入力 (レガシー: テキスト)
+    | 'input:key_event'    // キーイベント (down/up分離・修飾キーは独立イベント)
+    | 'control:remote_allowed' // ホスト→ビューア: リモート操作の許可状態 (F-022)
     | 'clipboard:update'   // クリップボード更新
     | 'screen:start'       // 画面共有開始
     | 'screen:stop'        // 画面共有停止
@@ -54,6 +57,44 @@ export interface ScrollData {
 
 export interface KeyData {
     key: string;
+}
+
+export interface MouseButtonData {
+    button: 'left' | 'right' | 'middle';
+    direction: 'down' | 'up';
+}
+
+export interface KeyEventData {
+    key: string; // 正規化キー名 (ctrl, shift, enter, a, f5...)
+    direction: 'down' | 'up';
+}
+
+// KeyboardEvent.key をホスト側で解釈可能な正規化キー名に変換
+export function normalizeKeyName(e: KeyboardEvent): string {
+    switch (e.key) {
+        case 'Control': return 'ctrl';
+        case 'Shift': return 'shift';
+        case 'Alt': return 'alt';
+        case 'Meta': return 'meta';
+        case 'Enter': return 'enter';
+        case 'Tab': return 'tab';
+        case 'Escape': return 'escape';
+        case 'Backspace': return 'backspace';
+        case 'Delete': return 'delete';
+        case ' ': return 'space';
+        case 'ArrowUp': return 'up';
+        case 'ArrowDown': return 'down';
+        case 'ArrowLeft': return 'left';
+        case 'ArrowRight': return 'right';
+        case 'Home': return 'home';
+        case 'End': return 'end';
+        case 'PageUp': return 'pageup';
+        case 'PageDown': return 'pagedown';
+        default:
+            if (/^F\d{1,2}$/.test(e.key)) return e.key.toLowerCase();
+            if (e.key.length === 1) return e.key.toLowerCase();
+            return '';
+    }
 }
 
 export interface ClipboardData {

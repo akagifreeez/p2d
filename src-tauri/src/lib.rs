@@ -42,6 +42,8 @@ pub fn run() {
             bridge::system::simulate_click,
             bridge::system::simulate_scroll,
             bridge::system::simulate_key,
+            bridge::system::simulate_key_event,
+            bridge::system::simulate_mouse_button,
             bridge::system::write_clipboard,
             // Bridge: Capture (ネイティブキャプチャ)
             bridge::capture::get_capture_sources,
