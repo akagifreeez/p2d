@@ -8,6 +8,7 @@
 import { useState, useRef, useEffect } from 'react';
 import { useWebRTC } from '../hooks/useWebRTC';
 import { ChatPanel } from './ChatPanel';
+import { MonitorPicker } from './MonitorPicker';
 
 // ビデオグリッドアイテム
 function VideoGridItem({
@@ -67,8 +68,10 @@ export function RoomView({ onLeave, signalingUrl, turnConfig }: { onLeave: () =>
         isConnected,
         roomCode,
         startScreenShare,
+        startCustomScreenShare,
         stopScreenShare,
         isScreenSharing,
+        localStreams,
         chatMessages,
         sendChatMessage,
         // Microphone
@@ -96,6 +99,7 @@ export function RoomView({ onLeave, signalingUrl, turnConfig }: { onLeave: () =>
     const [displayName, setDisplayName] = useState('');
     const [mode, setMode] = useState<'menu' | 'join' | 'create'>('menu');
     const [showSettings, setShowSettings] = useState(false);
+    const [showSourcePicker, setShowSourcePicker] = useState(false);
 
     // Effect: 初回にオーディオデバイス取得
     useEffect(() => {
@@ -383,8 +387,17 @@ export function RoomView({ onLeave, signalingUrl, turnConfig }: { onLeave: () =>
                 {/* Video Grid Area */}
                 <div className="flex-1 p-6 overflow-y-auto custom-scrollbar">
                     <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-4 auto-rows-fr">
-                        {/* My Stream */}
-                        {localStream && (
+                        {/* My Streams (マルチ共有対応) */}
+                        {localStreams.size > 0 ? (
+                            Array.from(localStreams).map(([streamId, stream], i) => (
+                                <VideoGridItem
+                                    key={streamId}
+                                    stream={stream}
+                                    label={`My Screen ${localStreams.size > 1 ? i + 1 : ''}`.trim()}
+                                    isLocal={true}
+                                />
+                            ))
+                        ) : localStream && (
                             <VideoGridItem
                                 stream={localStream}
                                 label={participants.get(myId || '')?.name || 'Me'}
@@ -402,7 +415,7 @@ export function RoomView({ onLeave, signalingUrl, turnConfig }: { onLeave: () =>
                         ))}
 
                         {/* Empty State if no streams */}
-                        {!localStream && remoteStreams.size === 0 && (
+                        {!localStream && localStreams.size === 0 && remoteStreams.size === 0 && (
                             <div className="col-span-full h-96 flex flex-col items-center justify-center text-gray-500 border-2 border-dashed border-white/5 rounded-2xl bg-black/10">
                                 <svg className="w-16 h-16 mb-4 opacity-20" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1} d="M15 10l4.553-2.276A1 1 0 0121 8.618v6.764a1 1 0 01-1.447.894L15 14M5 18h8a2 2 0 002-2V8a2 2 0 00-2-2H5a2 2 0 00-2 2v8a2 2 0 002 2z" /></svg>
                                 <p className="text-xl font-bold opacity-50">No Active Video Streams</p>
@@ -416,7 +429,7 @@ export function RoomView({ onLeave, signalingUrl, turnConfig }: { onLeave: () =>
             {/* Bottom Controls */}
             <div className="h-20 bg-black/40 backdrop-blur-md border-t border-white/10 px-8 flex items-center justify-center gap-4 z-20">
                 <button
-                    onClick={() => isScreenSharing ? stopScreenShare() : startScreenShare()}
+                    onClick={() => isScreenSharing ? stopScreenShare() : setShowSourcePicker(true)}
                     className={`h-12 px-6 rounded-full font-bold text-sm flex items-center gap-3 transition-all ${isScreenSharing
                         ? 'bg-red-500 text-white shadow-[0_0_20px_rgba(239,68,68,0.4)] hover:bg-red-600'
                         : 'bg-white/10 text-white hover:bg-white/20 border border-white/10 hover:border-white/30'
@@ -487,6 +500,21 @@ export function RoomView({ onLeave, signalingUrl, turnConfig }: { onLeave: () =>
                     </svg>
                 </button>
             </div>
+
+            {/* Source Picker (ネイティブ/カスタムキャプチャ選択) */}
+            {showSourcePicker && (
+                <MonitorPicker
+                    onSelect={(sourceId, isMonitor) => {
+                        setShowSourcePicker(false);
+                        startCustomScreenShare(sourceId, isMonitor);
+                    }}
+                    onNativeCapture={() => {
+                        setShowSourcePicker(false);
+                        startScreenShare();
+                    }}
+                    onCancel={() => setShowSourcePicker(false)}
+                />
+            )}
 
             {/* Settings Modal */}
             {showSettings && (

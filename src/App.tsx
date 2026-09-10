@@ -1,9 +1,13 @@
 import { useState, useEffect } from 'react';
 import { useConnectionStore } from './stores/connectionStore';
 import { RoomView } from './components/RoomView';
+import { useWindowPosition } from './hooks/useWindowPosition';
 
 function App() {
     const { connectionState } = useConnectionStore();
+
+    // ウィンドウ位置管理 (起動時復元・終了時保存・Ctrl+Shift+←/→でモニター間移動)
+    useWindowPosition();
 
     // 設定
     const DEFAULT_SIGNALING_URL = 'ws://localhost:8080';

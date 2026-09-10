@@ -7,7 +7,7 @@ import { useState } from 'react';
 // Setting Types
 export interface QualityConfig {
     resolution: '720p' | '1080p' | 'native';
-    frameRate: 15 | 30 | 60;
+    frameRate: 15 | 30 | 60 | 120;
     bitrate: number | 'auto';
     codec: 'auto' | 'av1' | 'vp9' | 'vp8' | 'h264';
     contentHint: 'detail' | 'motion';
@@ -15,10 +15,10 @@ export interface QualityConfig {
 
 export const defaultQualityConfig: QualityConfig = {
     resolution: '1080p',
-    frameRate: 30,
+    frameRate: 60,
     bitrate: 'auto',
     codec: 'auto',
-    contentHint: 'detail',
+    contentHint: 'motion',
 };
 
 const resolutionOptions = [
@@ -31,6 +31,7 @@ const frameRateOptions = [
     { value: 15, label: '15 FPS', sub: 'Slides', description: 'Low motion content' },
     { value: 30, label: '30 FPS', sub: 'Video', description: 'Standard video' },
     { value: 60, label: '60 FPS', sub: 'Game', description: 'High motion content' },
+    { value: 120, label: '120 FPS', sub: 'Ultra', description: 'Competetive Gaming' },
 ] as const;
 
 const bitrateOptions = [

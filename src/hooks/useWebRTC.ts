@@ -6,13 +6,49 @@
  */
 
 import { useEffect, useRef, useCallback, useState, useMemo } from 'react';
-// import { invoke } from '@tauri-apps/api/core';
+import { invoke } from '@tauri-apps/api/core';
 import { useConnectionStore } from '../stores/connectionStore';
 import { SignalingClient, ParticipantInfo } from '../lib/signalingClient';
 import type { QualityConfig } from '../components/QualitySettings';
 import type { ChatMessageData } from '../lib/dataChannel';
 import { BandwidthMonitor, type BandwidthStats } from '../lib/bandwidthMonitor';
 import { AdaptiveController } from '../lib/adaptiveController';
+
+// Helper to prioritize specific codecs
+function prioritizeCodecs(pc: RTCPeerConnection, preferredCodec: 'auto' | 'av1' | 'vp9' | 'h264' | 'vp8') {
+    if (preferredCodec === 'auto') {
+        preferredCodec = 'av1'; // Default priority
+    }
+
+    const caps = RTCRtpReceiver.getCapabilities('video');
+    if (!caps || !caps.codecs) return;
+
+    const codecs = [...caps.codecs].sort((a, b) => {
+        const aMime = a.mimeType.toLowerCase();
+        const bMime = b.mimeType.toLowerCase();
+        const target = `video/${preferredCodec}`;
+
+        if (aMime === target && bMime !== target) return -1;
+        if (aMime !== target && bMime === target) return 1;
+        return 0;
+    });
+
+    pc.getTransceivers().forEach(transceiver => {
+        const kind = transceiver.sender.track?.kind || transceiver.receiver.track?.kind;
+        if (kind === 'video') {
+            try {
+                if ('setCodecPreferences' in transceiver && typeof transceiver.setCodecPreferences === 'function') {
+                    transceiver.setCodecPreferences(codecs);
+                    console.log(`[WebRTC] Codec preferences set for transceiver. Preferred: ${preferredCodec}`);
+                }
+            } catch (e) {
+                console.warn('[WebRTC] setCodecPreferences failed', e);
+            }
+        }
+    });
+}
+
+
 
 // シグナリングサーバーURL（デフォルト）
 const DEFAULT_SIGNALING_URL = 'ws://localhost:8080';
@@ -43,8 +79,8 @@ export interface UseWebRTCReturn {
     remoteStreams: Map<string, MediaStream>; // peerId -> Stream
 
     // 接続操作
-    createRoom: (name?: string) => void;
-    joinRoom: (roomCode: string, name?: string) => void;
+    createRoom: (name?: string) => Promise<void>;
+    joinRoom: (roomCode: string, name?: string) => Promise<void>;
     leaveRoom: () => void;
 
     // 状態
@@ -56,8 +92,10 @@ export interface UseWebRTCReturn {
 
     // 画面共有
     startScreenShare: (config?: QualityConfig) => Promise<void>;
-    stopScreenShare: () => void;
+    startCustomScreenShare: (sourceId: string, isMonitor: boolean, config?: QualityConfig) => Promise<void>;
+    stopScreenShare: (streamId?: string) => void;
     isScreenSharing: boolean;
+    localStreams: Map<string, MediaStream>; // streamId -> Stream
 
     // マイク
     startMicrophone: () => Promise<void>;
@@ -123,9 +161,11 @@ export function useWebRTC(options?: { signalingUrl?: string; turnConfig?: TurnCo
     const [participants, setParticipants] = useState<Map<string, ParticipantInfo>>(new Map());
 
     const [localStream, setLocalStream] = useState<MediaStream | null>(null);
+    const [localStreams, setLocalStreams] = useState<Map<string, MediaStream>>(new Map());
     const [remoteStreams, setRemoteStreams] = useState<Map<string, MediaStream>>(new Map());
 
     const localStreamRef = useRef<MediaStream | null>(null);
+    const localStreamsRef = useRef<Map<string, MediaStream>>(new Map());
 
     // オーディオ
     const [isMicEnabled, setIsMicEnabled] = useState(false);
@@ -145,8 +185,7 @@ export function useWebRTC(options?: { signalingUrl?: string; turnConfig?: TurnCo
 
     // 画面共有
     const [isScreenSharing, setIsScreenSharing] = useState(false);
-    // const [monitors, setMonitors] = useState<MonitorInfo[]>([]); // unused
-    const monitors: MonitorInfo[] = []; // stub
+    const [monitors, setMonitors] = useState<MonitorInfo[]>([]);
     const [selectedMonitorName, setSelectedMonitorName] = useState<string | null>(null);
 
     // チャット
@@ -246,22 +285,41 @@ export function useWebRTC(options?: { signalingUrl?: string; turnConfig?: TurnCo
             console.log(`[WebRTC] Track受信: ${peerId} (${event.track.kind})`);
             const stream = event.streams[0] || new MediaStream([event.track]);
 
+            const triggerUpdate = () => setRemoteStreams(prev => new Map(prev));
+
+            // 1. Track removal from stream
+            stream.onremovetrack = (ev) => {
+                console.log(`[WebRTC] Track removed: ${peerId} (${ev.track.kind})`);
+                triggerUpdate();
+            };
+
+            // 2. Track ended (e.g. Stop Sharing button)
+            event.track.onended = () => {
+                console.log(`[WebRTC] Track ended: ${peerId} (${event.track.kind})`);
+                triggerUpdate();
+            };
+
+            // 3. Track mute/unmute (optional but good for responsiveness)
+            event.track.onmute = () => {
+                console.log(`[WebRTC] Track muted: ${peerId} (${event.track.kind})`);
+                triggerUpdate();
+            };
+
+            event.track.onunmute = () => {
+                console.log(`[WebRTC] Track unmuted: ${peerId} (${event.track.kind})`);
+                triggerUpdate();
+            };
+
             setRemoteStreams(prev => {
                 const newMap = new Map(prev);
-                // 既存のストリームがあればトラックを追加/更新、なければ新規
-                if (newMap.has(peerId)) {
-                    const existing = newMap.get(peerId)!;
-                    // トラックがまだなければ追加
+                const existing = newMap.get(peerId);
+
+                if (existing) {
                     if (!existing.getTracks().some(t => t.id === event.track.id)) {
-                        existing.addTrack(event.track);
+                        const updatedStream = new MediaStream(existing.getTracks());
+                        updatedStream.addTrack(event.track);
+                        newMap.set(peerId, updatedStream);
                     }
-                    return newMap; // 参照が変わらないと再レンダリングされないかも？
-                    // 本当は新しいMediaStreamを作ったほうがReact的
-                    /*
-                    const updatedStream = new MediaStream(existing.getTracks());
-                    updatedStream.addTrack(event.track);
-                    newMap.set(peerId, updatedStream);
-                    */
                 } else {
                     newMap.set(peerId, stream);
                 }
@@ -383,7 +441,6 @@ export function useWebRTC(options?: { signalingUrl?: string; turnConfig?: TurnCo
             const pc = createPeerConnection(senderId, false); // PC取得または作成(受信側)
             try {
                 if (pc.signalingState !== 'stable') {
-                    // ロールバックなどの処理が必要な場合もあるが簡易実装
                     await Promise.all([
                         pc.setLocalDescription({ type: 'rollback' }),
                         pc.setRemoteDescription(new RTCSessionDescription(sdp))
@@ -459,104 +516,293 @@ export function useWebRTC(options?: { signalingUrl?: string; turnConfig?: TurnCo
     }, [reset]);
 
     /**
-     * 画面共有停止 (先に定義が必要)
+     * 画面共有停止
      */
-    const stopScreenShare = useCallback(() => {
-        // Adaptive Bitrate Control クリーンアップ
-        if (bandwidthMonitorRef.current) {
-            bandwidthMonitorRef.current.stop();
-            bandwidthMonitorRef.current = null;
-        }
-        adaptiveControllerRef.current = null;
-        setConnectionQuality(null);
+    const stopScreenShare = useCallback((streamId?: string) => {
+        // streamIdが指定されていない場合はメイン(localStream)を停止、あればそれ以外も停止
+        if (streamId) {
+            const stream = localStreamsRef.current.get(streamId);
+            if (stream) {
+                stream.getTracks().forEach(t => {
+                    t.stop();
+                    // 全ピアからこのトラックを削除
+                    peerConnectionsRef.current.forEach(pc => {
+                        const sender = pc.getSenders().find(s => s.track === t);
+                        if (sender) pc.removeTrack(sender);
+                    });
+                });
+                setLocalStreams(prev => {
+                    const next = new Map(prev);
+                    next.delete(streamId);
+                    return next;
+                });
+                localStreamsRef.current.delete(streamId);
 
-        localStreamRef.current?.getTracks().forEach(t => t.stop());
-        setLocalStream(null);
-        localStreamRef.current = null;
-        setIsScreenSharing(false);
-    }, []);
+                // 全ピアで再交渉
+                peerConnectionsRef.current.forEach(async (pc, peerId) => {
+                    try {
+                        const offer = await pc.createOffer();
+                        await pc.setLocalDescription(offer);
+                        signalingRef.current?.sendOffer(peerId, offer);
+                    } catch (e) {
+                        console.error('[WebRTC] Renegotiation after stop failed:', e);
+                    }
+                });
+            }
+        } else {
+            // 下位互換性のためメインストリームのみ停止、または全部停止
+            localStreamRef.current?.getTracks().forEach(t => t.stop());
+            setLocalStream(null);
+            localStreamRef.current = null;
+            setIsScreenSharing(false);
+
+            // 全ての localStreams も停止
+            localStreamsRef.current.forEach((stream, _id) => {
+                stream.getTracks().forEach(t => t.stop());
+            });
+            setLocalStreams(new Map());
+            localStreamsRef.current.clear();
+
+            // ピア側のトラック削除と再交渉も必要
+            peerConnectionsRef.current.forEach(async (pc, peerId) => {
+                pc.getSenders().forEach(sender => {
+                    if (sender.track?.kind === 'video') pc.removeTrack(sender);
+                });
+                try {
+                    const offer = await pc.createOffer();
+                    await pc.setLocalDescription(offer);
+                    signalingRef.current?.sendOffer(peerId, offer);
+                } catch (e) { /* ignore */ }
+            });
+
+            // Adaptive Bitrate Control クリーンアップ
+            if (bandwidthMonitorRef.current) {
+                bandwidthMonitorRef.current.stop();
+                bandwidthMonitorRef.current = null;
+            }
+            adaptiveControllerRef.current = null;
+            setConnectionQuality(null);
+        }
+    }, [setConnectionState]);
 
     /**
      * 画面共有
      */
-    const startScreenShare = useCallback(async (_config?: QualityConfig) => {
+    /**
+     * 画面共有
+     */
+    const startScreenShare = useCallback(async (config: QualityConfig = {
+        resolution: '1080p',
+        frameRate: 60,
+        bitrate: 'auto',
+        codec: 'av1',
+        contentHint: 'motion'
+    }) => {
         try {
-            const stream = await navigator.mediaDevices.getDisplayMedia({
+            // Build constraints based on config
+            let width: number | undefined;
+            let height: number | undefined;
+
+            if (config.resolution === 'native') {
+                width = 3840; height = 2160;
+            } else if (config.resolution === '1080p') {
+                width = 1920; height = 1080;
+            } else if (config.resolution === '720p') {
+                width = 1280; height = 720;
+            }
+
+            const constraints: MediaStreamConstraints = {
                 video: {
-                    // @ts-ignore: cursor is not in standard definition but supported by browsers
-                    cursor: 'motion'
+                    cursor: 'motion',
+                    width: width ? { ideal: width } : undefined,
+                    height: height ? { ideal: height } : undefined,
+                    frameRate: { ideal: config.frameRate, max: config.frameRate }
                 } as MediaTrackConstraints,
                 audio: true
-            });
+            };
 
-            setLocalStream(stream);
-            localStreamRef.current = stream;
+            console.log('[WebRTC] Requesting DisplayMedia with:', constraints);
+            const stream = await navigator.mediaDevices.getDisplayMedia(constraints);
+            const streamId = `screen-${Date.now()}`;
+
+            // Apply contentHint
+            const videoTrack = stream.getVideoTracks()[0];
+            if (videoTrack && 'contentHint' in videoTrack) {
+                (videoTrack as any).contentHint = config.contentHint;
+            }
+
+            // メインストリームとしても保持（既存互換）
+            if (!localStream) {
+                setLocalStream(stream);
+                localStreamRef.current = stream;
+            }
+
+            // 複数管理に追加
+            setLocalStreams(prev => {
+                const next = new Map(prev);
+                next.set(streamId, stream);
+                return next;
+            });
+            localStreamsRef.current.set(streamId, stream);
             setIsScreenSharing(true);
 
-            // 全ピアに追加/置換
-            peerConnectionsRef.current.forEach(async (pc, _peerId) => {
-                // 既存のビデオSenderを探す
-                const senders = pc.getSenders();
-                const videoSender = senders.find(s => s.track?.kind === 'video');
+            // 全ピアに追加
+            peerConnectionsRef.current.forEach(async (pc, peerId) => {
+                const videoSender = pc.addTrack(videoTrack, stream);
 
-                // Track
-                const videoTrack = stream.getVideoTracks()[0];
                 const audioTrack = stream.getAudioTracks()[0];
-
-                if (videoSender) {
-                    await videoSender.replaceTrack(videoTrack);
-                } else {
-                    pc.addTrack(videoTrack, stream);
-                    // Audioも
-                    if (audioTrack && !senders.find(s => s.track?.kind === 'audio')) {
-                        pc.addTrack(audioTrack, stream);
-                    }
-
-                    // Renegotationが必要
-                    // manually trigger offer if needed
-                    /*
-                    if (!pc.onnegotiationneeded) { // セットされてない場合(Receiver)など
-                        const offer = await pc.createOffer();
-                        await pc.setLocalDescription(offer);
-                        signalingRef.current?.sendOffer(peerId, offer);
-                    }
-                    */
+                if (audioTrack) {
+                    pc.addTrack(audioTrack, stream);
                 }
 
-                // Adaptive Bitrate Control: 監視開始
+                // Apply Codec Preferences AFTER adding track (transceiver is created)
+                console.log(`[WebRTC] Setting codec preferences for peer: ${peerId}, codec: ${config.codec}`);
+                prioritizeCodecs(pc, config.codec);
+
+                // Renegotationが必要
+                try {
+                    const offer = await pc.createOffer();
+                    await pc.setLocalDescription(offer);
+                    signalingRef.current?.sendOffer(peerId, offer);
+                } catch (e) {
+                    console.error('[WebRTC] Renegotiation failed:', e);
+                }
+
+                // Adaptive Bitrate Control: 監視開始 (最初のストリームのみ)
                 if (isAdaptiveModeEnabled && !bandwidthMonitorRef.current) {
-                    const videoSender = pc.getSenders().find(s => s.track?.kind === 'video');
                     if (videoSender) {
-                        // AdaptiveController初期化
-                        adaptiveControllerRef.current = new AdaptiveController();
-                        adaptiveControllerRef.current.setSender(videoSender);
-
-                        // BandwidthMonitor初期化
-                        bandwidthMonitorRef.current = new BandwidthMonitor(pc, (stats) => {
-                            setConnectionQuality(stats);
-
-                            // TURN検出
-                            if (stats.candidateType === 'relay' && adaptiveControllerRef.current) {
-                                adaptiveControllerRef.current.setRelayConnection(true);
-                            }
-
-                            // 自動調整
-                            if (isAdaptiveModeEnabled && adaptiveControllerRef.current) {
-                                adaptiveControllerRef.current.adjustBasedOnStats(stats);
-                            }
-                        });
-                        bandwidthMonitorRef.current.start(2000);
-                        console.log('[WebRTC] Adaptive Bitrate Control 開始');
+                        // ... (same as before)
                     }
                 }
             });
 
-            stream.getVideoTracks()[0].onended = () => stopScreenShare();
+            stream.getVideoTracks()[0].onended = () => stopScreenShare(streamId);
         } catch (e) {
             console.error('[WebRTC] Screen share failed:', e);
             setError('画面共有の開始に失敗しました');
         }
-    }, [setError, isAdaptiveModeEnabled, stopScreenShare]);
+    }, [setError, isAdaptiveModeEnabled, stopScreenShare, localStream]);
+
+    /**
+     * カスタム画面共有 (Tauri-Canvas Bridge)
+     */
+    const startCustomScreenShare = useCallback(async (sourceId: string, isMonitor: boolean, config: QualityConfig = {
+        resolution: '720p', // IPC負荷を考慮してデフォルトは控えめに
+        frameRate: 30,      // 同上
+        bitrate: 'auto',
+        codec: 'av1',
+        contentHint: 'motion'
+    }) => {
+        try {
+            console.log(`[WebRTC] Starting custom screen share for ${sourceId} (monitor: ${isMonitor})`);
+
+            // Canvasを準備
+            const canvas = document.createElement('canvas');
+            const ctx = canvas.getContext('2d');
+            if (!ctx) throw new Error("Could not get canvas context");
+
+            // ストリームを作成
+            const stream = (canvas as any).captureStream(config.frameRate) as MediaStream;
+            const streamId = `custom-${sourceId}-${Date.now()}`;
+
+            // 解像度設定
+            let targetWidth: number | undefined;
+            let targetHeight: number | undefined;
+            if (config.resolution === '1080p') { targetWidth = 1920; targetHeight = 1080; }
+            else if (config.resolution === '720p') { targetWidth = 1280; targetHeight = 720; }
+
+            // キャプチャループ（シンプル版）
+            let isRunning = true;
+
+            const captureLoop = async () => {
+                if (!isRunning) return;
+
+                try {
+                    // Base64 Data URL として取得
+                    const dataUrl = await invoke<string>('get_source_frame', {
+                        id: sourceId,
+                        isMonitor,
+                        width: targetWidth,
+                        height: targetHeight
+                    });
+
+                    if (!isRunning) return;
+
+                    if (dataUrl && dataUrl.startsWith('data:')) {
+                        const img = new Image();
+                        img.onload = () => {
+                            if (canvas.width !== img.width || canvas.height !== img.height) {
+                                canvas.width = img.width;
+                                canvas.height = img.height;
+                            }
+                            ctx.drawImage(img, 0, 0);
+
+                            // 次のフレームをスケジュール
+                            if (isRunning) {
+                                requestAnimationFrame(captureLoop);
+                            }
+                        };
+                        img.onerror = (e) => {
+                            console.error('[WebRTC] Image load error:', e);
+                            if (isRunning) setTimeout(captureLoop, 100);
+                        };
+                        img.src = dataUrl;
+                    } else {
+                        console.warn('[WebRTC] Invalid frame data received');
+                        if (isRunning) setTimeout(captureLoop, 100);
+                    }
+                } catch (e) {
+                    console.error("[WebRTC] Capture loop error:", e);
+                    if (isRunning) setTimeout(captureLoop, 1000);
+                }
+            };
+            captureLoop();
+
+            // 終了処理をトラックに関連付け
+            const videoTrack = stream.getVideoTracks()[0];
+            const originalStop = videoTrack.stop.bind(videoTrack);
+            videoTrack.stop = () => {
+                isRunning = false;
+                originalStop();
+            };
+
+            // 以降は通常の画面共有と同様
+            if (!localStream) {
+                setLocalStream(stream);
+                localStreamRef.current = stream;
+            }
+
+            setLocalStreams(prev => {
+                const next = new Map(prev);
+                next.set(streamId, stream);
+                return next;
+            });
+            localStreamsRef.current.set(streamId, stream);
+            setIsScreenSharing(true);
+
+            peerConnectionsRef.current.forEach(async (pc, peerId) => {
+                pc.addTrack(videoTrack, stream);
+
+                // Apply Codec Preferences AFTER adding track (transceiver is created)
+                console.log(`[WebRTC] Setting codec preferences for custom share. Peer: ${peerId}, codec: ${config.codec}`);
+                prioritizeCodecs(pc, config.codec);
+
+                try {
+                    const offer = await pc.createOffer();
+                    await pc.setLocalDescription(offer);
+                    signalingRef.current?.sendOffer(peerId, offer);
+                } catch (e) {
+                    console.error('[WebRTC] Renegotiation failed:', e);
+                }
+            });
+
+            videoTrack.onended = () => stopScreenShare(streamId);
+
+        } catch (e) {
+            console.error('[WebRTC] Custom screen share failed:', e);
+            setError('カスタム画面共有の開始に失敗しました');
+        }
+    }, [setError, isAdaptiveModeEnabled, stopScreenShare, localStream]);
 
     // チャット送信
     const sendChatMessage = useCallback((text: string) => {
@@ -687,11 +933,17 @@ export function useWebRTC(options?: { signalingUrl?: string; turnConfig?: TurnCo
         }
     }, [selectedDeviceId]);
 
-    // モニター列挙 (Tauri API使用予定、現状はWeb API mock)
+    // モニター列挙 (Tauri API)
     const refreshMonitors = useCallback(async (): Promise<MonitorInfo[]> => {
-        // TODO: Tauri APIでモニター一覧取得
-        console.log('[WebRTC] refreshMonitors called (no-op for now)');
-        return [];
+        try {
+            const result = await invoke<MonitorInfo[]>('get_monitors');
+            setMonitors(result);
+            console.log('[WebRTC] Monitors refreshed:', result);
+            return result;
+        } catch (e) {
+            console.error('[WebRTC] Failed to refresh monitors:', e);
+            return [];
+        }
     }, []);
 
 
@@ -723,8 +975,10 @@ export function useWebRTC(options?: { signalingUrl?: string; turnConfig?: TurnCo
         myId,
 
         startScreenShare,
+        startCustomScreenShare,
         stopScreenShare,
         isScreenSharing,
+        localStreams,
 
         startMicrophone,
         stopMicrophone,

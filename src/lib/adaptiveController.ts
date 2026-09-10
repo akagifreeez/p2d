@@ -42,6 +42,16 @@ export class AdaptiveController {
     }
 
     /**
+     * 最大ビットレートを上書き設定
+     */
+    setMaxBitrate(kbps: number): void {
+        this.config.maxBitrate = kbps;
+        if (this.currentBitrate > kbps) {
+            this.setTargetBitrate(kbps);
+        }
+    }
+
+    /**
      * リレー接続かどうかを設定
      */
     setRelayConnection(isRelay: boolean): void {
