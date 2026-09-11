@@ -11,6 +11,7 @@ import { useConnectionStore } from '../stores/connectionStore';
 import { SignalingClient, ParticipantInfo } from '../lib/signalingClient';
 import type { QualityConfig } from '../components/QualitySettings';
 import type { ChatMessageData } from '../lib/dataChannel';
+import { startSystemAudioCapture, type SystemAudioSession } from '../lib/systemAudio';
 import { BandwidthMonitor, type BandwidthStats } from '../lib/bandwidthMonitor';
 import { AdaptiveController } from '../lib/adaptiveController';
 
@@ -111,6 +112,11 @@ export interface UseWebRTCReturn {
     isMuted: boolean;
     isSpeaking: boolean;
 
+    // システム音声 (F-031)
+    startSystemAudio: () => Promise<void>;
+    stopSystemAudio: () => Promise<void>;
+    isSystemAudioEnabled: boolean;
+
     // デバイス
     audioDevices: MediaDeviceInfo[];
     selectedDeviceId: string | null;
@@ -181,6 +187,10 @@ export function useWebRTC(options?: { signalingUrl?: string; turnConfig?: TurnCo
     const [audioDevices, setAudioDevices] = useState<MediaDeviceInfo[]>([]);
     const [selectedDeviceId, setSelectedDeviceId] = useState<string | null>(null);
     const [isSpeaking, setIsSpeaking] = useState(false);
+
+    // システム音声 (F-031)
+    const systemAudioSessionRef = useRef<SystemAudioSession | null>(null);
+    const [isSystemAudioEnabled, setIsSystemAudioEnabled] = useState(false);
 
     // 発話検出用 (Voice Activity Detection)
     const audioContextRef = useRef<AudioContext | null>(null);
@@ -427,6 +437,9 @@ export function useWebRTC(options?: { signalingUrl?: string; turnConfig?: TurnCo
                 pc.addTrack(track, localAudioStreamRef.current!); // Stream分けるべきか？
             });
         }
+        if (systemAudioSessionRef.current) {
+            pc.addTrack(systemAudioSessionRef.current.track, systemAudioSessionRef.current.stream);
+        }
 
         // InitiatorならOffer作成
         if (isInitiator) {
@@ -588,6 +601,14 @@ export function useWebRTC(options?: { signalingUrl?: string; turnConfig?: TurnCo
         localStreamRef.current?.getTracks().forEach(t => t.stop());
         setLocalStream(null);
         localStreamRef.current = null;
+
+        // システム音声の停止 (F-031)
+        const sa = systemAudioSessionRef.current;
+        if (sa) {
+            systemAudioSessionRef.current = null;
+            setIsSystemAudioEnabled(false);
+            void sa.stop();
+        }
 
         setParticipants(new Map());
         setRemoteStreams(new Map());
@@ -949,7 +970,10 @@ export function useWebRTC(options?: { signalingUrl?: string; turnConfig?: TurnCo
             // 全ピアに音声トラックを追加
             peerConnectionsRef.current.forEach(async (pc, _peerId) => { // peerId -> _peerId
                 const senders = pc.getSenders();
-                const audioSender = senders.find(s => s.track?.kind === 'audio');
+                // システム音声 (F-031) のセンダーは置き換えず、マイク専用のセンダーを探す
+                const audioSender = senders.find(s =>
+                    s.track?.kind === 'audio' && s.track !== systemAudioSessionRef.current?.track
+                );
 
                 if (audioSender) {
                     await audioSender.replaceTrack(audioTrack);
@@ -995,6 +1019,59 @@ export function useWebRTC(options?: { signalingUrl?: string; turnConfig?: TurnCo
             setIsMuted(!audioTrackRef.current.enabled);
             console.log('[WebRTC] Mute toggled:', !audioTrackRef.current.enabled);
         }
+    }, []);
+
+    /**
+     * システム音声の共有を開始 (F-031)
+     * Rust (WASAPI ループバック) が生成したトラックを全ピアへ追加する。
+     */
+    const startSystemAudio = useCallback(async () => {
+        if (systemAudioSessionRef.current) return;
+        try {
+            const session = await startSystemAudioCapture();
+            systemAudioSessionRef.current = session;
+
+            peerConnectionsRef.current.forEach(async (pc, peerId) => {
+                pc.addTrack(session.track, session.stream);
+                try {
+                    const offer = await pc.createOffer();
+                    await pc.setLocalDescription(offer);
+                    signalingRef.current?.sendOffer(peerId, offer);
+                } catch (e) {
+                    console.error('[WebRTC] SystemAudio renegotiation failed:', e);
+                }
+            });
+
+            setIsSystemAudioEnabled(true);
+        } catch (e) {
+            console.error('[WebRTC] System audio start failed:', e);
+            setError('システム音声の共有に失敗しました');
+        }
+    }, [setError]);
+
+    /**
+     * システム音声の共有を停止 (F-031)
+     */
+    const stopSystemAudio = useCallback(async () => {
+        const session = systemAudioSessionRef.current;
+        if (!session) return;
+        systemAudioSessionRef.current = null;
+        setIsSystemAudioEnabled(false);
+
+        peerConnectionsRef.current.forEach(async (pc, peerId) => {
+            const sender = pc.getSenders().find(s => s.track === session.track);
+            if (sender) pc.removeTrack(sender);
+            try {
+                const offer = await pc.createOffer();
+                await pc.setLocalDescription(offer);
+                signalingRef.current?.sendOffer(peerId, offer);
+            } catch (e) {
+                console.error('[WebRTC] SystemAudio stop renegotiation failed:', e);
+            }
+        });
+
+        await session.stop();
+        console.log('[WebRTC] System audio sharing stopped');
     }, []);
 
     // 音声デバイス列挙
@@ -1065,6 +1142,11 @@ export function useWebRTC(options?: { signalingUrl?: string; turnConfig?: TurnCo
         isMicEnabled,
         isMuted,
         isSpeaking,
+
+        // システム音声 (F-031)
+        startSystemAudio,
+        stopSystemAudio,
+        isSystemAudioEnabled,
 
         audioDevices,
         selectedDeviceId,

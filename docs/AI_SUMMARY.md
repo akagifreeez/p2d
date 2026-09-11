@@ -64,6 +64,13 @@ It features multi-peer screen sharing, voice chat (microphone), text chat, and a
 *   **権限管理 (F-022)**: ホスト側「リモート操作を許可」トグル (**デフォルトOFF=安全側**)。許可ピアにはCTRLバッジ表示。切替時は全ピアへ `control:remote_allowed` 通知
 *   **クリップボード**: arboard によるホスト側監視 + `write_clipboard` コマンド
 
+### 6. System Audio Pipeline (`src-tauri/src/services/audio_capture.rs` + `src/lib/systemAudio.ts`, F-031)
+*   **経路**: Rust (WASAPI ループバック / cpal 0.15) → Int16 PCM を 20ms ごとに base64 化 → Tauri Channel → AudioWorklet のリングバッファ (50ms プリバッファ) → `MediaStreamAudioDestinationNode` → トラックを全ピアへ addTrack
+*   **重要制約**: `cpal::Stream` は WASAPI では `!Send` のため、生成と保持を専用スレッドに閉じ、停止は `mpsc` シグナルで行う (state 間で移動させない)
+*   **ループバックの正しい開き方**: `default_input_config()` はレンダーデバイスで `StreamTypeNotSupported` になる。`default_output_config()` の設定を `build_input_stream()` に渡す (eRender デバイスに LOOPBACK フラグが自動付与される)
+*   **ローカル再生なし**: ハウリング防止のため AudioContext はスピーカーへ出力せず送信専用
+*   単体テスト: `cargo test --lib services::audio_capture` (設定解決 + ストリーム構築/再生の実走確認)
+
 ---
 
 
@@ -104,6 +111,7 @@ signaling-server/
 *   **Remote Control (p2cordから移植・成熟)**: マウス/キーボード/スクロールの完全な入力パイプライン (VNCモデルの修飾キー、ドラッグ対応)
 *   **操作権限管理 (F-022)**: 「リモート操作を許可」トグル (デフォルトOFF) + CTRLバッジ表示
 *   **Clipboard Sync**: arboardによるホスト側監視 + `write_clipboard`
+*   **System Audio Sharing (F-031)**: WASAPIループバックでPCのシステム音声をキャプチャし、独立した音声トラックとして全ピアへ送信。コントロールバーのスピーカートグルで切替
 *   **TURN Server Configuration**: 設定画面でTURN URL/Username/Credentialを指定可能（localStorage永続化）
 *   **Adaptive Bitrate Control**: 接続品質（RTT/パケットロス）に応じてビットレート自動調整、TURN検出時は帯域制限
 *   **Unified RoomView UI**: ビデオグリッド、参加者リスト、チャット統合、接続品質表示
@@ -112,14 +120,14 @@ signaling-server/
 *   **Signaling再接続**: `signalingClient.ts` にWebSocket再接続を実装
 
 ### 🔄 In Progress / TODO
-*   **feat/remote-desktop → main マージ** (2コミット先行、push済み)
-*   F-031 システム音声共有 (仕様優先度「高」で未実装の最大の穴)
 *   Discord連携 (F-050 Rich Presence / F-051 参加ボタン — 仕様では優先度「高」)
 *   F-012 QRコード接続、F-013 接続履歴 (中/低)
 *   パッケージング・クロスプラットフォームテスト (仕様§9 Phase 3)
 
 ### ⚠️ Known Issues
 *   WebRTCピアレベルの自動再接続は未検証 (シグナリングWSの再接続のみ実装済み)
+*   複数音声トラック (マイク+システム音声) のリモート再生はChromiumのメディア要素ミキシング挙動に依存
+*   システム音声共有はスピーカー出力を丸ごと拾うため、相手の音声もループする (エコー防止はヘッドホン推奨・UIのツールチップに記載済み)
 
 ---
 

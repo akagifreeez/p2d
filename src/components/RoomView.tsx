@@ -125,6 +125,10 @@ export function RoomView({ onLeave, signalingUrl, turnConfig }: { onLeave: () =>
         toggleMute,
         isMicEnabled,
         isMuted,
+        // System Audio (F-031)
+        startSystemAudio,
+        stopSystemAudio,
+        isSystemAudioEnabled,
         // Audio devices
         audioDevices,
         selectedDeviceId,
@@ -564,6 +568,21 @@ export function RoomView({ onLeave, signalingUrl, turnConfig }: { onLeave: () =>
                         )}
                     </button>
                 )}
+
+                {/* System Audio Toggle (F-031) */}
+                <button
+                    onClick={() => isSystemAudioEnabled ? stopSystemAudio() : startSystemAudio()}
+                    className={`w-12 h-12 rounded-full flex items-center justify-center transition-all ${isSystemAudioEnabled
+                        ? 'bg-cyan-500/20 text-cyan-300 border border-cyan-500/40 hover:bg-cyan-500/30 shadow-[0_0_16px_rgba(34,211,238,0.25)]'
+                        : 'bg-white/5 border border-white/10 text-gray-400 hover:text-white hover:bg-white/10'
+                        }`}
+                    title="システム音声を共有 — スピーカーから出ている音がそのまま相手に流れます。エコー防止のためヘッドホン推奨"
+                >
+                    <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M11 5L6 9H2v6h4l5 4V5z" />
+                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15.536 8.464a5 5 0 010 7.072M18.364 5.636a9 9 0 010 12.728" />
+                    </svg>
+                </button>
 
                 {/* Settings Button */}
                 <button

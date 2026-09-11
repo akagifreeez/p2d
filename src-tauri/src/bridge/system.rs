@@ -1,5 +1,6 @@
-use tauri::{Window, State, PhysicalPosition, PhysicalSize};
+use tauri::{Window, State, PhysicalPosition, PhysicalSize, ipc::Channel};
 use crate::services::desktop::{self, MonitorInfo, ClipboardState};
+use crate::services::audio_capture::{self, AudioCaptureState, SystemAudioConfig};
 use serde::{Deserialize, Serialize};
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -113,5 +114,26 @@ pub fn simulate_key_event(key: String, direction: String) -> Result<(), String> 
 #[tauri::command]
 pub fn simulate_mouse_button(button: String, direction: String) -> Result<(), String> {
     desktop::simulate_mouse_button(button, direction)
+}
+
+/// システム音声のループバック設定を取得 (F-031)
+#[tauri::command]
+pub fn get_system_audio_config() -> Result<SystemAudioConfig, String> {
+    audio_capture::get_config()
+}
+
+/// システム音声キャプチャを開始し、PCM チャンクを Channel へ流す (F-031)
+#[tauri::command]
+pub fn start_system_audio_capture(
+    on_data: Channel<String>,
+    state: State<'_, AudioCaptureState>,
+) -> Result<SystemAudioConfig, String> {
+    audio_capture::start(on_data, state)
+}
+
+/// システム音声キャプチャを停止 (F-031)
+#[tauri::command]
+pub fn stop_system_audio_capture(state: State<'_, AudioCaptureState>) -> Result<(), String> {
+    audio_capture::stop(state)
 }
 

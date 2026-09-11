@@ -45,6 +45,9 @@ pub fn run() {
             bridge::system::simulate_key_event,
             bridge::system::simulate_mouse_button,
             bridge::system::write_clipboard,
+            bridge::system::get_system_audio_config,
+            bridge::system::start_system_audio_capture,
+            bridge::system::stop_system_audio_capture,
             // Bridge: Capture (ネイティブキャプチャ)
             bridge::capture::get_capture_sources,
             bridge::capture::get_source_frame,
@@ -56,6 +59,9 @@ pub fn run() {
 
             // クリップボード監視開始
             services::desktop::init_clipboard(app.handle(), clipboard_state);
+
+            // システム音声キャプチャ状態の初期化 (F-031)
+            app.manage(services::audio_capture::AudioCaptureState(Mutex::new(None)));
 
             // 開発時にDevToolsを開く
             #[cfg(debug_assertions)]
