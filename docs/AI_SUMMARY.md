@@ -12,7 +12,7 @@ It features multi-peer screen sharing, voice chat (microphone), text chat, and a
 
 ---
 
-## Architecture (Full Mesh P2P - Updated 2026-01-12)
+## Architecture (Full Mesh P2P - Updated 2026-09-12)
 
 ### 1. Signaling Server (`signaling-server/`)
 *   **Server**: Node.js WebSocket server.
@@ -57,7 +57,15 @@ It features multi-peer screen sharing, voice chat (microphone), text chat, and a
 | **Settings**     | -                   | 設定モーダル表示               |
 | **Leave**        | -                   | ルーム退出                     |
 
+### 5. Remote Control Pipeline (`src-tauri/src/services/desktop.rs` + `src/hooks/useWebRTC.ts`)
+*   **経路**: ビューア入力 → DataChannel (`input:*` メッセージ) → ホスト → Rust (enigo) 適用
+*   **マウス**: 動画タイル上の移動 (60/s スロットル) / ボタン Press・Release 分離 (ドラッグ対応) / スクロール
+*   **キーボード**: ホバー中のみ転送 (入力欄フォーカス時は無効)。修飾キーは独立イベントで流すVNCモデル (Ctrl+C = ctrl down, c down, c up, ctrl up)
+*   **権限管理 (F-022)**: ホスト側「リモート操作を許可」トグル (**デフォルトOFF=安全側**)。許可ピアにはCTRLバッジ表示。切替時は全ピアへ `control:remote_allowed` 通知
+*   **クリップボード**: arboard によるホスト側監視 + `write_clipboard` コマンド
+
 ---
+
 
 ## Key Directories & Files
 ```
@@ -85,24 +93,33 @@ signaling-server/
 
 ---
 
-## Current Status (2026-01-12)
+## Current Status (2026-09-12)
 
 ### ✅ Completed
 *   **Full Mesh P2P Architecture**: Host/Viewer区別を廃止、対等なピア接続
 *   **Multi-Peer Screen Sharing**: 複数人の画面を同時表示可能
+*   **Monitor / Window Selection**: `startCustomScreenShare(sourceId, isMonitor)` による共有対象選択、`QualityConfig` による解像度/FPS設定
 *   **Microphone Support**: マイクON/OFF、ミュート、デバイス選択
 *   **Voice Activity Detection (VAD)**: 発話検出でアバターがハイライト、DataChannel経由でリモート共有
+*   **Remote Control (p2cordから移植・成熟)**: マウス/キーボード/スクロールの完全な入力パイプライン (VNCモデルの修飾キー、ドラッグ対応)
+*   **操作権限管理 (F-022)**: 「リモート操作を許可」トグル (デフォルトOFF) + CTRLバッジ表示
+*   **Clipboard Sync**: arboardによるホスト側監視 + `write_clipboard`
 *   **TURN Server Configuration**: 設定画面でTURN URL/Username/Credentialを指定可能（localStorage永続化）
 *   **Adaptive Bitrate Control**: 接続品質（RTT/パケットロス）に応じてビットレート自動調整、TURN検出時は帯域制限
 *   **Unified RoomView UI**: ビデオグリッド、参加者リスト、チャット統合、接続品質表示
 *   **Settings Modal**: マイクデバイス選択、TURNサーバー設定、Adaptive Mode設定
 *   **Refactoring & Cleanup**: TypeScriptエラーの一括修正、不要ファイル（HostView.tsx等）の削除
+*   **Signaling再接続**: `signalingClient.ts` にWebSocket再接続を実装
 
 ### 🔄 In Progress / TODO
-*   リモートコントロール（マウス/キーボード）のFull Mesh対応
+*   **feat/remote-desktop → main マージ** (2コミット先行、push済み)
+*   F-031 システム音声共有 (仕様優先度「高」で未実装の最大の穴)
+*   Discord連携 (F-050 Rich Presence / F-051 参加ボタン — 仕様では優先度「高」)
+*   F-012 QRコード接続、F-013 接続履歴 (中/低)
+*   パッケージング・クロスプラットフォームテスト (仕様§9 Phase 3)
 
 ### ⚠️ Known Issues
-*   特になし
+*   WebRTCピアレベルの自動再接続は未検証 (シグナリングWSの再接続のみ実装済み)
 
 ---
 
