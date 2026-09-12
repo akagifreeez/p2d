@@ -1,13 +1,10 @@
 import { useState, useEffect } from 'react';
 import { invoke } from '@tauri-apps/api/core';
-import { useConnectionStore } from './stores/connectionStore';
 import { RoomView } from './components/RoomView';
 import { useWindowPosition } from './hooks/useWindowPosition';
 import type { E2eConfig } from './lib/e2eRunner';
 
 function App() {
-    const { connectionState } = useConnectionStore();
-
     // ウィンドウ位置管理 (起動時復元・終了時保存・Ctrl+Shift+←/→でモニター間移動)
     useWindowPosition();
 
@@ -71,30 +68,16 @@ function App() {
     } : undefined;
 
     return (
-        <div className="min-h-screen bg-black text-white relative font-sans">
-            {/* 設定ボタン (未接続時のみ表示) */}
-            {connectionState === 'disconnected' && (
-                <button
-                    onClick={() => setShowSettings(true)}
-                    className="fixed top-6 right-6 p-3 rounded-full bg-white/5 hover:bg-white/10 text-white/70 hover:text-white transition-all duration-300 backdrop-blur-sm z-50 group"
-                    title="設定"
-                >
-                    <svg className="w-6 h-6 group-hover:rotate-90 transition-transform duration-500" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z" />
-                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M15 12a3 3 0 11-6 0 3 3 0 016 0z" />
-                    </svg>
-                </button>
-            )}
-
+        <div className="min-h-screen bg-[var(--md-surface)] text-[var(--md-on-surface)] relative">
             {/* 設定モーダル */}
             {showSettings && (
-                <div className="fixed inset-0 bg-black/80 backdrop-blur-sm z-[100] flex items-center justify-center p-4 animate-fade-in">
-                    <div className="glass-card p-8 max-w-md w-full border-cyan-500/30 shadow-[0_0_50px_rgba(0,0,0,0.5)] animate-slide-up transform transition-all">
+                <div className="md-scrim">
+                    <div className="md-dialog p-6 max-w-md w-full animate-slide-up max-h-[85vh] overflow-y-auto">
                         <div className="flex justify-between items-center mb-6">
-                            <h2 className="text-2xl font-bold text-white text-glow">Settings</h2>
+                            <h2 className="text-xl font-semibold">設定</h2>
                             <button
                                 onClick={() => setShowSettings(false)}
-                                className="text-gray-400 hover:text-white transition-colors"
+                                className="md-icon-btn"
                             >
                                 ✕
                             </button>
@@ -103,31 +86,31 @@ function App() {
                         <div className="space-y-6">
                             {/* Signaling Server */}
                             <div>
-                                <label className="block text-sm font-medium text-cyan-400 mb-2">Signaling Server URL</label>
+                                <label className="block text-[13px] font-medium text-[var(--md-on-surface-variant)] mb-2">シグナリングサーバーURL</label>
                                 <input
                                     type="text"
                                     value={signalingUrl}
                                     onChange={(e) => setSignalingUrl(e.target.value)}
-                                    className="input w-full bg-black/50 border-white/10 focus:border-cyan-500/50"
+                                    className="input w-full"
                                     placeholder="ws://localhost:8080"
                                 />
-                                <p className="mt-2 text-xs text-gray-500">
-                                    Local: <span className="font-mono text-gray-400">ws://localhost:8080</span> |
-                                    LAN: <span className="font-mono text-gray-400">ws://192.168.x.x:8080</span>
+                                <p className="mt-2 text-xs text-[var(--md-on-surface-variant)]">
+                                    ローカル: <span className="font-mono">ws://localhost:8080</span> /
+                                    LAN: <span className="font-mono">ws://192.168.x.x:8080</span>
                                 </p>
                             </div>
 
                             {/* TURN Server */}
-                            <div className="pt-4 border-t border-white/5">
-                                <label className="block text-sm font-medium text-purple-400 mb-2">TURN Server (Optional)</label>
-                                <p className="text-xs text-gray-500 mb-3">
-                                    NAT越えが必要な場合に設定。自前のサーバーまたはTwilio等のサービスを使用。
+                            <div className="pt-4 border-t border-[var(--md-outline-variant)]/60">
+                                <label className="block text-[13px] font-medium text-[var(--md-on-surface-variant)] mb-2">TURNサーバー (任意)</label>
+                                <p className="text-xs text-[var(--md-on-surface-variant)] mb-3">
+                                    NAT越えが必要な場合に設定します。
                                 </p>
                                 <input
                                     type="text"
                                     value={turnUrl}
                                     onChange={(e) => setTurnUrl(e.target.value)}
-                                    className="input w-full bg-black/50 border-white/10 focus:border-purple-500/50 mb-2"
+                                    className="input w-full mb-2"
                                     placeholder="turn:example.com:3478"
                                 />
                                 <div className="grid grid-cols-2 gap-2">
@@ -135,45 +118,45 @@ function App() {
                                         type="text"
                                         value={turnUsername}
                                         onChange={(e) => setTurnUsername(e.target.value)}
-                                        className="input bg-black/50 border-white/10 focus:border-purple-500/50"
+                                        className="input"
                                         placeholder="Username"
                                     />
                                     <input
                                         type="password"
                                         value={turnCredential}
                                         onChange={(e) => setTurnCredential(e.target.value)}
-                                        className="input bg-black/50 border-white/10 focus:border-purple-500/50"
+                                        className="input"
                                         placeholder="Credential"
                                     />
                                 </div>
                                 {turnUrl && (
-                                    <div className="mt-2 text-xs text-green-400 flex items-center gap-1">
-                                        <span className="w-2 h-2 bg-green-500 rounded-full"></span>
-                                        TURN server configured
+                                    <div className="mt-2 text-xs text-[var(--md-primary)] flex items-center gap-1.5">
+                                        <span className="w-1.5 h-1.5 bg-[var(--md-primary)] rounded-full"></span>
+                                        TURNサーバー設定済み
                                     </div>
                                 )}
                             </div>
                         </div>
 
-                        <div className="flex items-center justify-between gap-4 pt-8 border-t border-white/5">
+                        <div className="flex items-center justify-between gap-4 pt-6 mt-6 border-t border-[var(--md-outline-variant)]/60">
                             <button
                                 onClick={resetSettings}
-                                className="px-4 py-2.5 rounded-lg text-sm text-red-400 hover:text-red-300 hover:bg-red-500/10 transition-colors border border-transparent hover:border-red-500/20"
+                                className="btn-text text-sm"
                             >
-                                Reset to Default
+                                デフォルトに戻す
                             </button>
                             <div className="flex items-center gap-3">
                                 <button
                                     onClick={() => setShowSettings(false)}
-                                    className="px-5 py-2.5 rounded-lg text-sm text-gray-300 hover:text-white hover:bg-white/5 transition-colors border border-white/10"
+                                    className="btn-secondary text-sm"
                                 >
-                                    Cancel
+                                    キャンセル
                                 </button>
                                 <button
                                     onClick={saveSettings}
-                                    className="btn-primary px-6 py-2.5 text-sm"
+                                    className="btn-primary text-sm"
                                 >
-                                    Save & Reload
+                                    保存して再起動
                                 </button>
                             </div>
                         </div>
@@ -182,19 +165,10 @@ function App() {
             )}
 
             {/* Main Room View */}
-            {/* useWebRTCにoptionsとしてURLを渡すために、RoomView経由ではなくContext経由か、
-               あるいは useWebRTC の呼び出し側で inject する必要があるが、
-               RoomView 内部で useWebRTC を呼んでいるため、今のままでは渡せない。
-               
-               修正案: RoomView に props で url を渡し、RoomView 内部で useWebRTC({ signalingUrl: props.url }) する。
-               RoomViewの修正漏れがあったので、次のステップで修正する。
-               ここでは一旦、URLを渡さずにレンダリングする（デフォルトURLで動作させる）。
-            */}
-            {/* Passed signalingUrl and turnConfig props */}
-            <RoomView onLeave={() => { }} signalingUrl={signalingUrl} turnConfig={turnConfig} e2eConfig={e2eConfig} />
+            <RoomView onLeave={() => { }} signalingUrl={signalingUrl} turnConfig={turnConfig} e2eConfig={e2eConfig} onOpenSettings={() => setShowSettings(true)} />
 
             <div className="fixed bottom-4 left-0 w-full text-center pointer-events-none z-0 opacity-50">
-                <div className="text-[10px] text-gray-600 font-mono tracking-widest">
+                <div className="text-[10px] text-[var(--md-on-surface-variant)] font-mono tracking-widest">
                     P2D v0.2.0 (Full Mesh Beta)
                 </div>
             </div>

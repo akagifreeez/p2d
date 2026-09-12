@@ -113,7 +113,7 @@ src/
 ├── stores/
 │   └── connectionStore.ts  # Zustand state
 └── styles/
-    └── index.css        # Cyberpunk Glass theme
+    └── index.css        # Material Design 3 (dark, teal seed) トークン+コンポーネントクラス
 
 signaling-server/
 ├── src/

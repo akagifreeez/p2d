@@ -2,205 +2,211 @@
 @tailwind components;
 @tailwind utilities;
 
-/* カスタムスタイル: Cyberpunk Glass Theme */
+/* Material Design 3 (dark) — teal seed
+ * トークン: 色はM3カラー_roles、角丸・状態レイヤーはM3仕様に準拠。
+ * グラデーション/ガラスblur/発光は使用しない。
+ */
 @layer base {
   :root {
-    --bg-dark: #050510;
-    --primary-glow: rgba(0, 240, 255, 0.6);
-    --secondary-glow: rgba(188, 19, 254, 0.6);
+    --md-primary: #4edbc9;
+    --md-on-primary: #003730;
+    --md-primary-container: #00504a;
+    --md-on-primary-container: #6ff7e7;
+    --md-secondary-container: #334b47;
+    --md-on-secondary-container: #cde8e2;
+    --md-error: #ffb4ab;
+    --md-error-container: #8c2c26;
+    --md-on-error-container: #ffdad6;
+    --md-surface: #0e1513;
+    --md-surface-low: #161d1b;
+    --md-surface-lowest: #090f0e;
+    --md-surface-container: #1a2220;
+    --md-surface-high: #242c2a;
+    --md-surface-highest: #2f3735;
+    --md-on-surface: #dde4e1;
+    --md-on-surface-variant: #bfc9c5;
+    --md-outline: #89938f;
+    --md-outline-variant: #3f4946;
   }
 
   html {
-    font-family: 'Inter', 'Noto Sans JP', system-ui, sans-serif;
-    @apply bg-[#050510] text-gray-100 overflow-x-hidden;
+    font-family: 'Segoe UI Variable Text', 'Segoe UI', 'Noto Sans JP', 'Meiryo', system-ui, sans-serif;
+    @apply overflow-x-hidden;
+    background: var(--md-surface);
+    color: var(--md-on-surface);
   }
 
   body {
-    @apply antialiased min-h-screen relative;
-    background:
-      radial-gradient(circle at 15% 50%, rgba(188, 19, 254, 0.05), transparent 25%),
-      radial-gradient(circle at 85% 30%, rgba(0, 240, 255, 0.05), transparent 25%);
+    @apply antialiased min-h-screen;
+    background: var(--md-surface);
   }
 
-  /* 背景の装飾メッシュ */
-  body::before {
-    content: '';
-    position: fixed;
-    top: 0;
-    left: 0;
-    width: 100%;
-    height: 100%;
-    background-image:
-      linear-gradient(rgba(255, 255, 255, 0.03) 1px, transparent 1px),
-      linear-gradient(90deg, rgba(255, 255, 255, 0.03) 1px, transparent 1px);
-    background-size: 50px 50px;
-    mask-image: linear-gradient(to bottom, transparent, black 10%, black 90%, transparent);
-    z-index: -1;
-    pointer-events: none;
-  }
-
-  /* カスタムスクロールバー */
-  ::-webkit-scrollbar {
-    width: 8px;
-    height: 8px;
-  }
-
-  ::-webkit-scrollbar-track {
-    background: rgba(0, 0, 0, 0.2);
-  }
-
+  ::-webkit-scrollbar { width: 10px; height: 10px; }
+  ::-webkit-scrollbar-track { background: transparent; }
   ::-webkit-scrollbar-thumb {
-    background: rgba(0, 240, 255, 0.2);
-    border-radius: 4px;
+    background: var(--md-surface-highest);
+    border-radius: 8px;
+    border: 2px solid var(--md-surface);
   }
-
-  ::-webkit-scrollbar-thumb:hover {
-    background: rgba(0, 240, 255, 0.4);
-  }
+  ::-webkit-scrollbar-thumb:hover { background: var(--md-outline); }
 }
 
 @layer components {
 
-  /* モダンボタン */
+  /* --- ボタン (M3: Filled / Tonal / Error / Text) --- */
   .btn {
-    @apply relative px-6 py-3 rounded-lg font-bold tracking-wide transition-all duration-300;
-    @apply flex items-center justify-center gap-2 overflow-hidden;
-    @apply focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-offset-[#050510];
+    @apply relative inline-flex items-center justify-center gap-2 h-10 px-6 rounded-full text-sm font-medium select-none transition-[background,box-shadow] duration-150;
+    @apply focus:outline-none disabled:opacity-40 disabled:pointer-events-none;
   }
-
   .btn-primary {
-    @apply bg-cyan-500/10 text-cyan-400 border border-cyan-500/50;
-    @apply hover:bg-cyan-500/20 hover:text-cyan-300 hover:border-cyan-400;
-    @apply active:scale-95;
+    background: var(--md-primary);
+    color: var(--md-on-primary);
   }
-
   .btn-primary:hover {
-    box-shadow: 0 0 20px rgba(0, 240, 255, 0.3);
+    background: color-mix(in srgb, var(--md-primary) 92%, #fff);
+    box-shadow: 0 1px 3px 1px rgba(0, 0, 0, 0.30);
   }
-
   .btn-secondary {
-    @apply bg-purple-500/10 text-purple-400 border border-purple-500/50;
-    @apply hover:bg-purple-500/20 hover:text-purple-300 hover:border-purple-400;
-    @apply active:scale-95;
+    background: var(--md-secondary-container);
+    color: var(--md-on-secondary-container);
   }
-
   .btn-secondary:hover {
-    box-shadow: 0 0 20px rgba(188, 19, 254, 0.3);
+    background: color-mix(in srgb, var(--md-secondary-container) 88%, #fff);
   }
-
   .btn-danger {
-    @apply bg-red-500/10 text-red-400 border border-red-500/50;
-    @apply hover:bg-red-500/20 hover:text-red-300 hover:border-red-400;
-    @apply active:scale-95;
+    background: var(--md-error-container);
+    color: var(--md-on-error-container);
   }
-
   .btn-danger:hover {
-    box-shadow: 0 0 20px rgba(239, 68, 68, 0.3);
+    background: color-mix(in srgb, var(--md-error-container) 86%, #fff);
+  }
+  .btn-text {
+    background: transparent;
+    color: var(--md-primary);
+    @apply px-4;
+  }
+  .btn-text:hover {
+    background: color-mix(in srgb, var(--md-primary) 10%, transparent);
   }
 
-  /* ガラスカード */
+  /* --- カード (M3 filled card) --- */
+  .md-card {
+    background: var(--md-surface-container);
+    border-radius: 12px;
+  }
+  /* 旧テーマの互換クラス → 同じ見た目にマップ */
   .glass-card,
   .card {
-    @apply bg-white/5 backdrop-blur-xl border border-white/10 rounded-2xl shadow-xl;
-    @apply transition-all duration-300;
+    background: var(--md-surface-container);
+    border-radius: 12px;
+    @apply transition-colors duration-150;
   }
-
   .glass-card:hover,
   .card:hover {
-    @apply bg-white/10 border-white/20 shadow-2xl shadow-cyan-500/5;
+    background: var(--md-surface-high);
   }
 
-  /* 入力フィールド */
+  /* --- ダイアログ (M3: surface-container-high / 28px角丸) --- */
+  .md-dialog {
+    background: var(--md-surface-high);
+    border-radius: 28px;
+  }
+  .md-scrim {
+    @apply fixed inset-0 z-[100] flex items-center justify-center p-4 animate-fade-in;
+    background: rgba(0, 0, 0, 0.55);
+  }
+
+  /* --- 入力フィールド (M3 outlined text field) --- */
   .input {
-    @apply w-full px-4 py-3 rounded-lg bg-black/30 border border-white/10 text-white font-mono;
-    @apply focus:outline-none focus:border-cyan-500/50;
-    @apply transition-all duration-200;
+    @apply w-full h-12 px-4 rounded-lg bg-transparent text-sm;
+    border: 1px solid var(--md-outline);
+    color: var(--md-on-surface);
+    @apply focus:outline-none transition-colors duration-150;
+    @apply placeholder:text-[var(--md-outline)];
   }
-
   .input:focus {
-    box-shadow: 0 0 15px rgba(0, 240, 255, 0.1);
+    border-color: var(--md-primary);
+    box-shadow: inset 0 0 0 1px var(--md-primary);
   }
 
-  /* ルームコード入力 */
-  .room-code-input {
-    @apply w-14 h-16 text-center text-3xl font-mono font-bold bg-black/40 border-2 border-white/10 rounded-xl text-cyan-400 shadow-inner;
-    @apply focus:outline-none focus:border-cyan-500;
-    @apply transition-all duration-200 transform hover:scale-105;
+  /* --- チップ (M3 assist chip) --- */
+  .chip {
+    @apply inline-flex items-center gap-1.5 h-8 px-3 rounded-lg text-[13px] cursor-default select-none;
+    border: 1px solid var(--md-outline-variant);
+    color: var(--md-on-surface-variant);
+    background: transparent;
+  }
+  .chip-interactive {
+    @apply cursor-pointer transition-colors duration-150;
+  }
+  .chip-interactive:hover {
+    background: color-mix(in srgb, var(--md-on-surface) 8%, transparent);
   }
 
-  .room-code-input:focus {
-    box-shadow: 0 0 20px rgba(0, 240, 255, 0.2);
+  /* --- アイコンボタン (M3 standard icon button / 40px) --- */
+  .md-icon-btn {
+    @apply w-10 h-10 rounded-full inline-flex items-center justify-center transition-colors duration-150;
+    color: var(--md-on-surface-variant);
+    @apply focus:outline-none;
+  }
+  .md-icon-btn:hover {
+    background: color-mix(in srgb, var(--md-on-surface) 8%, transparent);
+    color: var(--md-on-surface);
+  }
+  .md-icon-btn-active {
+    background: var(--md-secondary-container);
+    color: var(--md-on-secondary-container);
+  }
+  .md-icon-btn-active:hover {
+    background: color-mix(in srgb, var(--md-secondary-container) 88%, #fff);
+    color: var(--md-on-secondary-container);
+  }
+
+  /* --- スイッチ (M3 switch) --- */
+  .md-switch {
+    @apply relative w-[52px] h-8 rounded-full transition-colors duration-150 shrink-0;
+    background: var(--md-surface-highest);
+    border: 2px solid var(--md-outline);
+    @apply focus:outline-none;
+  }
+  .md-switch::after {
+    content: '';
+    @apply absolute top-1/2 -translate-y-1/2 left-1 w-4 h-4 rounded-full transition-all duration-150;
+    background: var(--md-outline);
+  }
+  .md-switch.on {
+    background: var(--md-primary);
+    border-color: var(--md-primary);
+  }
+  .md-switch.on::after {
+    @apply w-6 h-6 left-[20px];
+    background: var(--md-on-primary);
+  }
+
+  /* --- リスト項目 (M3 list item) --- */
+  .md-list-item {
+    @apply w-full flex items-center gap-4 px-4 py-3 rounded-xl text-left transition-colors duration-150;
+    @apply focus:outline-none;
+  }
+  .md-list-item:hover {
+    background: color-mix(in srgb, var(--md-on-surface) 8%, transparent);
   }
 }
 
 @layer utilities {
-  .text-glow {
-    text-shadow: 0 0 10px rgba(0, 240, 255, 0.5);
-  }
-
-  .text-glow-purple {
-    text-shadow: 0 0 10px rgba(188, 19, 254, 0.5);
-  }
-
-  .border-glow {
-    box-shadow: 0 0 10px rgba(0, 240, 255, 0.3) inset, 0 0 10px rgba(0, 240, 255, 0.3);
-  }
-
-  .bg-radial-gradient {
-    background-image: radial-gradient(circle at center, #11111e 0%, #050510 100%);
-  }
-
-  /* 接続状態ドット */
-  .status-dot {
-    @apply w-2.5 h-2.5 rounded-full relative;
-  }
-
-  .status-dot::after {
-    content: '';
-    @apply absolute inset-0 rounded-full animate-ping opacity-75;
-    background: inherit;
-  }
-
-  .status-connected {
-    @apply status-dot bg-green-500 shadow-[0_0_10px_#22c55e];
-  }
-
-  .status-connecting {
-    @apply status-dot bg-yellow-500 shadow-[0_0_10px_#eab308];
-  }
-
-  .status-disconnected {
-    @apply status-dot bg-red-500 shadow-[0_0_10px_#ef4444];
-  }
-
-  /* アニメーション */
+  /* アニメーション (控えめに維持) */
   .animate-fade-in {
-    animation: fadeIn 0.5s ease-out forwards;
+    animation: fadeIn 0.25s ease-out forwards;
   }
-
   .animate-slide-up {
-    animation: slideUp 0.6s cubic-bezier(0.16, 1, 0.3, 1) forwards;
+    animation: slideUp 0.3s cubic-bezier(0.16, 1, 0.3, 1) forwards;
   }
-
   @keyframes fadeIn {
-    from {
-      opacity: 0;
-    }
-
-    to {
-      opacity: 1;
-    }
+    from { opacity: 0; }
+    to { opacity: 1; }
   }
-
   @keyframes slideUp {
-    from {
-      opacity: 0;
-      transform: translateY(20px);
-    }
-
-    to {
-      opacity: 1;
-      transform: translateY(0);
-    }
+    from { opacity: 0; transform: translateY(12px); }
+    to { opacity: 1; transform: translateY(0); }
   }
 }

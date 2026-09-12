@@ -129,11 +129,6 @@ export const MonitorPicker = ({ onSelect, onCancel, onNativeCapture }: MonitorPi
                         </div>
                     )}
                 </div>
-
-                {/* Footer */}
-                <div className="p-4 bg-black/40 border-t border-white/10 flex justify-end gap-3 text-sm text-gray-400">
-                    <div>Hardware Acceleration: <span className="text-green-400 font-mono">ON (NVENC)</span></div>
-                </div>
             </div>
         </div>
     );

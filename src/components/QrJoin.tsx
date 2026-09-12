@@ -25,19 +25,19 @@ export function QrModal({ roomCode, onClose }: { roomCode: string; onClose: () =
     }, [roomCode]);
 
     return (
-        <div className="fixed inset-0 bg-black/80 backdrop-blur-sm z-[100] flex items-center justify-center p-4 animate-fade-in">
-            <div className="glass-card p-8 max-w-sm w-full border-cyan-500/30 animate-slide-up text-center">
+        <div className="md-scrim">
+            <div className="md-dialog p-6 max-w-sm w-full animate-slide-up text-center">
                 <div className="flex justify-between items-center mb-6">
-                    <h2 className="text-xl font-bold text-white">QRで招待</h2>
-                    <button onClick={onClose} className="text-gray-400 hover:text-white transition-colors">✕</button>
+                    <h2 className="text-xl font-semibold">QRで招待</h2>
+                    <button onClick={onClose} className="md-icon-btn">✕</button>
                 </div>
                 {dataUrl ? (
                     <img src={dataUrl} alt={`p2d://join/${roomCode}`} className="mx-auto rounded-xl" />
                 ) : (
-                    <div className="h-[280px] flex items-center justify-center text-gray-500">QR生成中…</div>
+                    <div className="h-[280px] flex items-center justify-center text-[var(--md-on-surface-variant)]">QR生成中…</div>
                 )}
-                <div className="mt-5 text-2xl font-mono font-bold tracking-[0.3em] text-cyan-300">{roomCode}</div>
-                <p className="text-xs text-gray-500 mt-2">
+                <div className="mt-5 text-2xl font-mono font-bold tracking-[0.3em] text-[var(--md-primary)]">{roomCode}</div>
+                <p className="text-xs text-[var(--md-on-surface-variant)] mt-2">
                     カメラで読み取ると <span className="font-mono">p2d://join/{roomCode}</span> が開き、P2Dが自動参加します。
                     読めない場合は上のコードを手入力してください。
                 </p>
@@ -121,22 +121,22 @@ export function QrScannerModal({ onScan, onClose }: { onScan: (code: string) => 
     }, []);
 
     return (
-        <div className="fixed inset-0 bg-black/80 backdrop-blur-sm z-[100] flex items-center justify-center p-4 animate-fade-in">
-            <div className="glass-card p-6 max-w-sm w-full border-purple-500/30 animate-slide-up">
+        <div className="md-scrim">
+            <div className="md-dialog p-6 max-w-sm w-full animate-slide-up">
                 <div className="flex justify-between items-center mb-4">
-                    <h2 className="text-xl font-bold text-white">QRスキャン</h2>
-                    <button onClick={onClose} className="text-gray-400 hover:text-white transition-colors">✕</button>
+                    <h2 className="text-xl font-semibold">QRスキャン</h2>
+                    <button onClick={onClose} className="md-icon-btn">✕</button>
                 </div>
                 {error ? (
-                    <div className="p-4 rounded-lg bg-red-500/10 border border-red-500/30 text-red-300 text-sm">{error}</div>
+                    <div className="p-4 rounded-xl bg-[var(--md-error-container)] text-[var(--md-on-error-container)] text-sm">{error}</div>
                 ) : (
-                    <div className="relative rounded-xl overflow-hidden bg-black/50 aspect-video">
+                    <div className="relative rounded-xl overflow-hidden bg-[var(--md-surface-lowest)] aspect-video">
                         <video ref={videoRef} className="w-full h-full object-cover" muted playsInline />
-                        <div className="absolute inset-8 border-2 border-cyan-400/60 rounded-lg pointer-events-none" />
+                        <div className="absolute inset-8 border-2 border-[var(--md-primary)]/70 rounded-lg pointer-events-none" />
                     </div>
                 )}
                 <canvas ref={canvasRef} className="hidden" />
-                <p className="text-xs text-gray-500 mt-3">ホスト側のQRコードをカメラにかざしてください</p>
+                <p className="text-xs text-[var(--md-on-surface-variant)] mt-3">ホスト側のQRコードをカメラにかざしてください</p>
             </div>
         </div>
     );
