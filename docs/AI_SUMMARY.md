@@ -78,6 +78,14 @@ It features multi-peer screen sharing, voice chat (microphone), text chat, and a
 *   **利点**: GUIフォーカス不要 (バックグラウンド完結)・リリースビルドのまま実行可能・結果はJSONレポート (`"passed": true/false`)
 *   **2026-09-12実績**: 2インスタンス (同一PC) で全12ステップ pass。システム音声のE2E受信を統計で証明
 *   ルームコードは数字6桁ではなく**英数字6文字** (例: CWH4K6)
+*   **実機2台検証 (2026-09-13)**: デスクトップ(host) ⇔ ノートPC(akagi-note, scheduled task経由で対話セッション起動) のクロスマシンE2Eで両側 `"passed": true`。注意: SSH直起動ではWebView2のページJSが動かない(セッション0)ためscheduled task必須。E2Eの `--p2d-e2e-log=` 等はCWD相対で解決される
+
+### 8. Discord Rich Presence (`src/lib/discord.ts` + `services/discord.rs` + `bridge/discord.rs`, F-050/F-051)
+*   **仕組み**: Discord本体のローカルIPCパイプ (`\\.\pipe\discord-ipc-0..9`) に `discord-rich-presence` クレートで接続。すべてのIOは専用ワーカースレッドで行い、失敗 (Discord未起動・ID無効) は握りつぶして本体に影響させない
+*   **表示内容**: details=「画面共有中/ルーム待機中」、state=「部屋 XXXXXX」、経過時間、partyサイズ、ボタン「参加する」→ `p2d://join/<コード>`
+*   **更新タイミング**: ルーム入室時・参加者数変更・共有ON/OFF時 (RoomView.tsxのuseEffect)。退出・アプリ終了でclear
+*   **クライアントID必須**: Discord Developer Portal でアプリを作成しApplication IDを取得する必要がある。解決順: 起動引数 `--p2d-discord-client-id=` / 環境変数 `P2D_DISCORD_CLIENT_ID` > 設定モーダルの入力欄 (localStorage)。未設定なら機能は無効 (無害)
+*   **ディープリンク (F-051)**: `tauri-plugin-deep-link` で `p2d` プロトコルをHKCU登録、`tauri-plugin-single-instance` で2インスタンス目のURLを1インスタンス目へ転送。コールド起動時はargvから復元 (`get_launch_join`)。**E2Eモードではsingle-instanceを無効化** (2インスタンス同時起動が前提のため)
 
 ---
 
@@ -93,7 +101,10 @@ src/
 │   └── useWebRTC.ts     # Core WebRTC logic (Full Mesh)
 ├── lib/
 │   ├── signalingClient.ts  # WS client wrapper
-│   └── dataChannel.ts      # Type definitions
+│   ├── dataChannel.ts      # Type definitions
+│   ├── systemAudio.ts      # F-031 システム音声 (AudioWorklet)
+│   ├── discord.ts          # F-050/F-051 Discord Rich Presence
+│   └── e2eRunner.ts        # E2E自己テストモード
 ├── stores/
 │   └── connectionStore.ts  # Zustand state
 └── styles/
@@ -108,7 +119,7 @@ signaling-server/
 
 ---
 
-## Current Status (2026-09-12)
+## Current Status (2026-09-13)
 
 ### ✅ Completed
 *   **Full Mesh P2P Architecture**: Host/Viewer区別を廃止、対等なピア接続
@@ -126,16 +137,18 @@ signaling-server/
 *   **Settings Modal**: マイクデバイス選択、TURNサーバー設定、Adaptive Mode設定
 *   **Refactoring & Cleanup**: TypeScriptエラーの一括修正、不要ファイル（HostView.tsx等）の削除
 *   **Signaling再接続**: `signalingClient.ts` にWebSocket再接続を実装
+*   **実機2台E2E (2026-09-13)**: デスクトップ⇔ノートPCのクロスマシンテストで両側passed。画面/音声受信バイト・CTRLバッジ・チャット往復を実証
+*   **Discord Rich Presence (F-050) / 参加ボタン (F-051)**: ルーム中のDiscordステータス表示 + `p2d://join/<code>` ディープリンク参加。要Discord Application ID (設定モーダルまたは起動引数)
 
 ### 🔄 In Progress / TODO
-*   Discord連携 (F-050 Rich Presence / F-051 参加ボタン — 仕様では優先度「高」)
-*   F-012 QRコード接続、F-013 接続履歴 (中/低)
+*   F-052 Discord招待 (中) / F-012 QRコード接続、F-013 接続履歴 (中/低)
 *   パッケージング・クロスプラットフォームテスト (仕様§9 Phase 3)
 
 ### ⚠️ Known Issues
 *   WebRTCピアレベルの自動再接続は未検証 (シグナリングWSの再接続のみ実装済み)
 *   複数音声トラック (マイク+システム音声) のリモート再生はChromiumのメディア要素ミキシング挙動に依存
 *   システム音声共有はスピーカー出力を丸ごと拾うため、相手の音声もループする (エコー防止はヘッドホン推奨・UIのツールチップに記載済み)
+*   Discord Rich Presenceは有効なApplication IDが無いと表示されない (偽IDではIPC接続後にActivity送信で切断される。動作自体は正常=ログ `[Discord] IPC接続成功`)
 
 ---
 

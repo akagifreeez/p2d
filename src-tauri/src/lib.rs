@@ -42,8 +42,34 @@ pub fn run() {
         }
     }
 
-    tauri::Builder::default()
-        .plugin(tauri_plugin_shell::init())
+    // E2E自己テストモードは同一exeの2インスタンス同時起動を前提とするため、
+    // single-instance (2インスタンス目を排除する) をこのときだけ無効化する
+    let e2e_mode = bridge::system::e2e_enabled();
+
+    let builder = tauri::Builder::default()
+        .plugin(tauri_plugin_deep_link::init())
+        .plugin(tauri_plugin_shell::init());
+
+    let builder = if e2e_mode {
+        builder
+    } else {
+        // single-instance は最初に登録する必要がある (2インスタンス目の起動をここで受け、
+        // p2d://join/CODE を実行中インスタンスへ転送する — F-051)
+        builder.plugin(tauri_plugin_single_instance::init(|app, args, _cwd| {
+            if let Some(code) = bridge::discord::find_join_url(args) {
+                {
+                    let state = app.state::<bridge::discord::JoinCodeState>();
+                    if let Ok(mut g) = state.0.lock() {
+                        *g = Some(code.clone());
+                    };
+                }
+                use tauri::Emitter;
+                let _ = app.emit("p2d-join-url", code);
+            }
+        }))
+    };
+
+    builder
         .invoke_handler(tauri::generate_handler![
             get_app_info,
             // Bridge: System/Desktop (入力注入・ウィンドウ管理)
@@ -69,6 +95,11 @@ pub fn run() {
             // Bridge: Capture (ネイティブキャプチャ)
             bridge::capture::get_capture_sources,
             bridge::capture::get_source_frame,
+            // Bridge: Discord Rich Presence (F-050/F-051)
+            bridge::discord::get_discord_config,
+            bridge::discord::get_launch_join,
+            bridge::discord::discord_set_presence,
+            bridge::discord::discord_clear_presence,
         ])
         .setup(|app| {
             // クリップボード状態の初期化
@@ -80,6 +111,23 @@ pub fn run() {
 
             // システム音声キャプチャ状態の初期化 (F-031)
             app.manage(services::audio_capture::AudioCaptureState(Mutex::new(None)));
+
+            // Discord Presenceワーカー起動 (F-050)
+            app.manage(services::discord::DiscordPresenceState(
+                Mutex::new(Some(services::discord::start_worker())),
+            ));
+
+            // ディープリンク (p2d://join/CODE) の処理 (F-051)
+            // プロトコルハンドラ登録 (Windows: HKCU\Software\Classes\p2d)。失敗しても致命傷にしない。
+            app.manage(bridge::discord::JoinCodeState(Mutex::new(
+                bridge::discord::find_join_url(env::args()),
+            )));
+            {
+                use tauri_plugin_deep_link::DeepLinkExt;
+                if let Err(e) = app.deep_link().register("p2d") {
+                    println!("[DeepLink] プロトコル登録スキップ: {}", e);
+                }
+            }
 
             // 開発時にDevToolsを開く
             #[cfg(debug_assertions)]

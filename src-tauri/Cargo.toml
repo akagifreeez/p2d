@@ -24,3 +24,6 @@ tokio = { version = "1", features = ["rt"] }
 xcap = "0.8.1"
 image = { version = "0.25.9", features = ["png", "jpeg", "webp"] }
 base64 = "0.22.1"
+discord-rich-presence = "1.1.0"
+tauri-plugin-deep-link = "2.4.10"
+tauri-plugin-single-instance = "2.4.4"

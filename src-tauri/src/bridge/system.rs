@@ -150,7 +150,7 @@ fn e2e_opt(flag: &str, env_key: &str) -> Option<String> {
     std::env::var(env_key).ok()
 }
 
-fn e2e_enabled() -> bool {
+pub(crate) fn e2e_enabled() -> bool {
     e2e_opt("--p2d-e2e-role=", "P2D_E2E_ROLE").is_some()
 }
 

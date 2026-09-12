@@ -6,10 +6,13 @@
  */
 
 import { useState, useRef, useEffect } from 'react';
+import { invoke } from '@tauri-apps/api/core';
+import { listen } from '@tauri-apps/api/event';
 import { useWebRTC } from '../hooks/useWebRTC';
 import { ChatPanel } from './ChatPanel';
 import { MonitorPicker } from './MonitorPicker';
 import { normalizeKeyName } from '../lib/dataChannel';
+import { clearPresence, getStoredDiscordClientId, resolveDiscordClientId, setStoredDiscordClientId, updatePresence } from '../lib/discord';
 
 // ビデオグリッドアイテム
 interface RemoteControlBinding {
@@ -206,11 +209,48 @@ export function RoomView({ onLeave, signalingUrl, turnConfig, e2eConfig }: { onL
         return () => {
             // コンポーネント破棄時に退出
             // leaveRoom(); // useWebRTC内でuseEffect cleanupしてるので不要かもだが念の為
+            void clearPresence(); // Discord Rich Presenceも掃除 (F-050)
         };
+    }, []);
+
+    // --- Discord Rich Presence (F-050): ルーム内の状態をDiscordステータスへ反映 ---
+    const [discordClientId, setDiscordClientId] = useState<string | null>(null);
+    const [discordIdInput, setDiscordIdInput] = useState(getStoredDiscordClientId());
+    useEffect(() => {
+        void resolveDiscordClientId().then(setDiscordClientId);
+    }, []);
+    useEffect(() => {
+        if (!isConnected || !roomCode || !discordClientId) return;
+        void updatePresence(discordClientId, {
+            roomCode,
+            details: isScreenSharing ? '画面共有中' : 'ルーム待機中',
+            viewers: participants.size,
+        });
+    }, [isConnected, roomCode, isScreenSharing, participants.size, discordClientId]);
+
+    // --- ディープリンク参加 (F-051): p2d://join/CODE ---
+    useEffect(() => {
+        // 冷却起動 (アプリが閉じた状態でURLを開いた場合) は起動引数から復元
+        void (async () => {
+            try {
+                const code = await invoke<string | null>('get_launch_join');
+                if (code && !isConnected) joinRoom(code).catch(() => { /* 部屋が無い等 */ });
+            } catch {
+                // ignore
+            }
+        })();
+        // 実行中インスタンスへの2インスタンス目転送はイベントで届く
+        const unlisten = listen<string>('p2d-join-url', (e) => {
+            if (e.payload && !isConnected) joinRoom(e.payload).catch(() => { /* 部屋が無い等 */ });
+        });
+        return () => { void unlisten.then((f) => f()); };
+        // joinRoom は安定したuseCallback、isConnected は起動直後 false 固定でハンドラ内のみ参照
+        // eslint-disable-next-line react-hooks/exhaustive-deps
     }, []);
 
     // 退出ハンドラ
     const handleLeave = () => {
+        void clearPresence();
         leaveRoom();
         onLeave();
     };
@@ -723,6 +763,32 @@ export function RoomView({ onLeave, signalingUrl, turnConfig, e2eConfig }: { onL
                                         <div className={`w-4 h-4 rounded-full transition-transform ${remoteControlAllowed ? 'translate-x-6 bg-red-400' : 'translate-x-0 bg-gray-500'
                                             }`} />
                                     </button>
+                                </div>
+
+                                {/* Discord Rich Presence (F-050) */}
+                                <div className="mt-4">
+                                    <label className="block text-sm font-medium text-cyan-400">Discord Application ID</label>
+                                    <div className="flex gap-2 mt-2">
+                                        <input
+                                            value={discordIdInput}
+                                            onChange={(e) => setDiscordIdInput(e.target.value)}
+                                            placeholder="例: 1234567890123456789"
+                                            className="input flex-1 bg-black/50 border-white/10 focus:border-cyan-500/50 text-sm font-mono"
+                                        />
+                                        <button
+                                            onClick={() => {
+                                                setStoredDiscordClientId(discordIdInput);
+                                                setDiscordClientId(discordIdInput.trim() || null);
+                                            }}
+                                            className="btn-secondary px-4 text-xs whitespace-nowrap"
+                                        >
+                                            保存
+                                        </button>
+                                    </div>
+                                    <div className="text-xs text-gray-500 mt-1">
+                                        discord.com/developers/applications で作成したApplication IDを設定すると、
+                                        ルーム中のDiscordステータスに「参加する」ボタン付きで表示されます (F-050/F-051)
+                                    </div>
                                 </div>
                             </div>
                         </div>
