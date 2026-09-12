@@ -87,6 +87,11 @@ It features multi-peer screen sharing, voice chat (microphone), text chat, and a
 *   **クライアントID必須**: Discord Developer Portal でアプリを作成しApplication IDを取得する必要がある。解決順: 起動引数 `--p2d-discord-client-id=` / 環境変数 `P2D_DISCORD_CLIENT_ID` > 設定モーダルの入力欄 (localStorage)。未設定なら機能は無効 (無害)
 *   **ディープリンク (F-051)**: `tauri-plugin-deep-link` で `p2d` プロトコルをHKCU登録、`tauri-plugin-single-instance` で2インスタンス目のURLを1インスタンス目へ転送。コールド起動時はargvから復元 (`get_launch_join`)。**E2Eモードではsingle-instanceを無効化** (2インスタンス同時起動が前提のため)
 
+### 9. QR接続・接続履歴 (`src/components/QrJoin.tsx` + `src/lib/history.ts`, F-012/F-013)
+*   **QR表示**: ルーム内コントロールバーのQRボタン → `p2d://join/<コード>` のQR + コードの大きな表示 + コピー。カメラで読むとプロトコルハンドラ経由でP2Dが起動し自動参加
+*   **QR読み取り**: 参加画面の「QRコードで読み取る」→ カメラ (`getUserMedia`) + jsQR (純JS) でスキャン。`p2d://join/` 形式も素のコードも受け付ける。カメラ権限なしはエラー表示でフォールバック
+*   **接続履歴**: 直近8件をlocalStorageに保持。参加画面の「接続履歴」チップをクリックでコード入力に反映
+
 ---
 
 
@@ -139,10 +144,11 @@ signaling-server/
 *   **Signaling再接続**: `signalingClient.ts` にWebSocket再接続を実装
 *   **実機2台E2E (2026-09-13)**: デスクトップ⇔ノートPCのクロスマシンテストで両側passed。画面/音声受信バイト・CTRLバッジ・チャット往復を実証
 *   **Discord Rich Presence (F-050) / 参加ボタン (F-051)**: ルーム中のDiscordステータス表示 + `p2d://join/<code>` ディープリンク参加。要Discord Application ID (設定モーダルまたは起動引数)
+*   **QR接続 (F-012) / 接続履歴 (F-013)**: ルーム内QR表示・カメラスキャン参加・直近8件の履歴チップ
 
 ### 🔄 In Progress / TODO
-*   F-052 Discord招待 (中) / F-012 QRコード接続、F-013 接続履歴 (中/低)
-*   パッケージング・クロスプラットフォームテスト (仕様§9 Phase 3)
+*   F-052 Discord招待 (中)
+*   WebRTCピアレベル自動再接続の検証・クロスプラットフォームテスト (仕様§9 Phase 3)
 
 ### ⚠️ Known Issues
 *   WebRTCピアレベルの自動再接続は未検証 (シグナリングWSの再接続のみ実装済み)

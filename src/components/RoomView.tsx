@@ -11,7 +11,9 @@ import { listen } from '@tauri-apps/api/event';
 import { useWebRTC } from '../hooks/useWebRTC';
 import { ChatPanel } from './ChatPanel';
 import { MonitorPicker } from './MonitorPicker';
+import { QrModal, QrScannerModal } from './QrJoin';
 import { normalizeKeyName } from '../lib/dataChannel';
+import { addRecentRoom, getRecentRooms, RecentRoom } from '../lib/history';
 import { clearPresence, getStoredDiscordClientId, resolveDiscordClientId, setStoredDiscordClientId, updatePresence } from '../lib/discord';
 
 // ビデオグリッドアイテム
@@ -255,6 +257,19 @@ export function RoomView({ onLeave, signalingUrl, turnConfig, e2eConfig }: { onL
         onLeave();
     };
 
+    // --- QR接続 (F-012) / 接続履歴 (F-013) ---
+    const [showQr, setShowQr] = useState(false);
+    const [showQrScan, setShowQrScan] = useState(false);
+    const [recentRooms, setRecentRooms] = useState<RecentRoom[]>([]);
+    useEffect(() => {
+        setRecentRooms(getRecentRooms());
+    }, [mode]);
+    useEffect(() => {
+        if (isConnected && roomCode) {
+            addRecentRoom(roomCode);
+        }
+    }, [isConnected, roomCode]);
+
     // --- 未接続時 (メニュー画面) ---
     if (!isConnected) {
         return (
@@ -336,6 +351,13 @@ export function RoomView({ onLeave, signalingUrl, turnConfig, e2eConfig }: { onL
                                         placeholder="XXXXXX"
                                         maxLength={6}
                                     />
+                                    <button
+                                        onClick={() => setShowQrScan(true)}
+                                        className="mt-2 text-xs text-purple-400 hover:text-purple-300 transition-colors flex items-center gap-1"
+                                    >
+                                        <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M3 9a2 2 0 012-2h.93a2 2 0 001.664-.89l.812-1.22A2 2 0 0110.07 4h3.86a2 2 0 011.664.89l.812 1.22A2 2 0 0018.07 7H19a2 2 0 012 2v9a2 2 0 01-2 2H5a2 2 0 01-2-2V9z" /><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 13a3 3 0 11-6 0 3 3 0 016 0z" /></svg>
+                                        QRコードで読み取る
+                                    </button>
                                 </div>
                                 <div>
                                     <label className="text-xs text-purple-400 font-bold uppercase tracking-wider block mb-2">Your Name</label>
@@ -357,6 +379,23 @@ export function RoomView({ onLeave, signalingUrl, turnConfig, e2eConfig }: { onL
                                         Join
                                     </button>
                                 </div>
+                                {recentRooms.length > 0 && (
+                                    <div className="pt-4 border-t border-white/10">
+                                        <label className="text-xs text-gray-500 font-bold uppercase tracking-wider block mb-2">接続履歴</label>
+                                        <div className="flex flex-wrap gap-2">
+                                            {recentRooms.map(r => (
+                                                <button
+                                                    key={r.code}
+                                                    onClick={() => setInputCode(r.code)}
+                                                    className="px-3 py-1.5 rounded-lg bg-white/5 border border-white/10 font-mono text-sm text-gray-300 hover:border-purple-500/50 hover:text-white transition-colors"
+                                                    title={new Date(r.at).toLocaleString()}
+                                                >
+                                                    {r.code}
+                                                </button>
+                                            ))}
+                                        </div>
+                                    </div>
+                                )}
                             </div>
                         </div>
                     )}
@@ -647,6 +686,19 @@ export function RoomView({ onLeave, signalingUrl, turnConfig, e2eConfig }: { onL
                     </svg>
                 </button>
 
+                {/* QR Share Button (F-012) */}
+                {roomCode && (
+                    <button
+                        onClick={() => setShowQr(true)}
+                        className="w-12 h-12 rounded-full bg-white/5 border border-white/10 flex items-center justify-center text-gray-400 hover:text-white hover:bg-white/10 transition-colors"
+                        title="QRコードで招待"
+                    >
+                        <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 4h6v6H4zM14 4h6v6h-6zM4 14h6v6H4zM14 14h2v2h-2zM18 14h2v2h-2zM16 16h2v2h-2zM14 18h2v2h-2zM18 18h2v2h-2z" />
+                        </svg>
+                    </button>
+                )}
+
                 {/* Settings Button */}
                 <button
                     onClick={() => setShowSettings(true)}
@@ -803,6 +855,20 @@ export function RoomView({ onLeave, signalingUrl, turnConfig, e2eConfig }: { onL
                         </div>
                     </div>
                 </div>
+            )}
+
+            {/* QR Share (F-012) */}
+            {showQr && roomCode && (
+                <QrModal roomCode={roomCode} onClose={() => setShowQr(false)} />
+            )}
+            {showQrScan && (
+                <QrScannerModal
+                    onScan={(code) => {
+                        setShowQrScan(false);
+                        setInputCode(code);
+                    }}
+                    onClose={() => setShowQrScan(false)}
+                />
             )}
         </div>
 
