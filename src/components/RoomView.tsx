@@ -510,15 +510,15 @@ export function RoomView({ onLeave, signalingUrl, turnConfig, e2eConfig, onOpenS
                         </div>
                     </div>
 
-                    {/* Chat Panel (Integrated) */}
-                    <div className="h-1/2 min-h-[300px] border-t border-white/5 relative">
+                    {/* Chat Panel (Integrated) — 下端に固定 */}
+                    <div className="h-1/2 min-h-[280px] border-t border-[var(--md-outline-variant)]/60 relative">
                         <div className="absolute inset-0">
                             <ChatPanel
                                 messages={chatMessages}
                                 onSendMessage={sendChatMessage}
                                 isConnected={isConnected}
                                 myId={myId}
-                                className="h-full !rounded-none !bg-transparent border-none"
+                                className="h-full"
                             />
                         </div>
                     </div>
