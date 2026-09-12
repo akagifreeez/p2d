@@ -372,6 +372,67 @@ export function useWebRTC(options?: { signalingUrl?: string; turnConfig?: TurnCo
             }
         };
 
+        // ピアレベル自動再接続: ICEがfailed/長時間disconnectedになったらrestartIce+再交渉で復旧を試みる
+        let restartCount = 0;
+        let disconnectTimer: number | null = null;
+        const maxRestarts = 5;
+
+        const attemptIceRestart = (reason: string) => {
+            if (pc.connectionState === 'closed') return;
+            if (!signalingRef.current) return; // シグナリングが死んでいるなら復旧できない
+            if (restartCount >= maxRestarts) {
+                console.warn(`[WebRTC] ICE restart上限(${maxRestarts})到達: ${peerId}`);
+                return;
+            }
+            restartCount += 1;
+            console.warn(`[WebRTC] ICE restart #${restartCount} (${reason}): ${peerId}`);
+            try {
+                pc.restartIce();
+            } catch (e) {
+                console.error('[WebRTC] restartIce失敗:', e);
+            }
+            // restartIceだけでは再交渉が走らないケースがあるため、少し置いてofferを作り直す
+            window.setTimeout(() => {
+                if (pc.signalingState !== 'stable' || pc.connectionState === 'closed') return;
+                void (async () => {
+                    try {
+                        const offer = await pc.createOffer();
+                        await pc.setLocalDescription(offer);
+                        signalingRef.current?.sendOffer(peerId, offer);
+                    } catch (e) {
+                        console.error('[WebRTC] 再接続offer失敗:', e);
+                    }
+                })();
+            }, 500);
+        };
+
+        pc.oniceconnectionstatechange = () => {
+            const s = pc.iceConnectionState;
+            if (s === 'disconnected') {
+                // 短瞬の切断はよくある → 5秒待って復旧しなければrestart
+                if (disconnectTimer === null) {
+                    disconnectTimer = window.setTimeout(() => {
+                        disconnectTimer = null;
+                        if (pc.iceConnectionState === 'disconnected' || pc.iceConnectionState === 'failed') {
+                            attemptIceRestart('disconnected>5s');
+                        }
+                    }, 5000);
+                }
+            } else if (s === 'failed') {
+                if (disconnectTimer !== null) {
+                    window.clearTimeout(disconnectTimer);
+                    disconnectTimer = null;
+                }
+                attemptIceRestart('failed');
+            } else if (s === 'connected' || s === 'completed') {
+                restartCount = 0;
+                if (disconnectTimer !== null) {
+                    window.clearTimeout(disconnectTimer);
+                    disconnectTimer = null;
+                }
+            }
+        };
+
         // Track受信 (映像/音声)
         pc.ontrack = (event) => {
             console.log(`[WebRTC] Track受信: ${peerId} (${event.track.kind})`);

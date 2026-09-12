@@ -145,10 +145,11 @@ signaling-server/
 *   **実機2台E2E (2026-09-13)**: デスクトップ⇔ノートPCのクロスマシンテストで両側passed。画面/音声受信バイト・CTRLバッジ・チャット往復を実証
 *   **Discord Rich Presence (F-050) / 参加ボタン (F-051)**: ルーム中のDiscordステータス表示 + `p2d://join/<code>` ディープリンク参加。要Discord Application ID (設定モーダルまたは起動引数)
 *   **QR接続 (F-012) / 接続履歴 (F-013)**: ルーム内QR表示・カメラスキャン参加・直近8件の履歴チップ
+*   **ピアレベル自動再接続**: ICE `failed` / `disconnected` 5秒継続で `restartIce()` + 再交渉 (sendOffer) を実行。上限5回、接続復帰でカウンタリセット、シグナリング切断中は発火しない。**実環境での強制切断検証は未実施** (Firewall/Wi-Fi断での確認が残置)
 
 ### 🔄 In Progress / TODO
 *   F-052 Discord招待 (中)
-*   WebRTCピアレベル自動再接続の検証・クロスプラットフォームテスト (仕様§9 Phase 3)
+*   ピアレベル再接続の実環境検証 (Wi-Fi断等)・クロスプラットフォームテスト (仕様§9 Phase 3)
 
 ### ⚠️ Known Issues
 *   WebRTCピアレベルの自動再接続は未検証 (シグナリングWSの再接続のみ実装済み)

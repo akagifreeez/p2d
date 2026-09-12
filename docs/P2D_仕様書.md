@@ -617,7 +617,7 @@ interface MouseMoveMessage extends DataChannelMessage {
 ### Phase 3: 品質向上（2週間） — 🔄 進行中
 
 #### Week 8
-- [ ] 自動再接続 — シグナリングWSの再接続は実装済み。WebRTCピアレベルの自動再接続は未検証
+- [x] 自動再接続 — シグナリングWSの再接続に加え、ピアレベル自動再接続 (ICE failed/disconnected継続でrestartIce+再交渉、上限5回) を実装。実環境での強制切断検証は残置
 - [x] 帯域幅適応
 - [x] 接続統計UI
 - [x] システム音声共有 (F-031・仕様外追加分) — WASAPIループバック→AudioWorklet経由で実装
