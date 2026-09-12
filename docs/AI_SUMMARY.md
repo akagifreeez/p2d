@@ -145,11 +145,12 @@ signaling-server/
 *   **実機2台E2E (2026-09-13)**: デスクトップ⇔ノートPCのクロスマシンテストで両側passed。画面/音声受信バイト・CTRLバッジ・チャット往復を実証
 *   **Discord Rich Presence (F-050) / 参加ボタン (F-051)**: ルーム中のDiscordステータス表示 + `p2d://join/<code>` ディープリンク参加。要Discord Application ID (設定モーダルまたは起動引数)
 *   **QR接続 (F-012) / 接続履歴 (F-013)**: ルーム内QR表示・カメラスキャン参加・直近8件の履歴チップ
-*   **ピアレベル自動再接続**: ICE `failed` / `disconnected` 5秒継続で `restartIce()` + 再交渉 (sendOffer) を実行。上限5回、接続復帰でカウンタリセット、シグナリング切断中は発火しない。**実環境での強制切断検証は未実施** (Firewall/Wi-Fi断での確認が残置)
+*   **ピアレベル自動再接続**: ICE `failed` / `disconnected` 5秒継続で `restartIce()` + 再交渉 (グレア対策: ID比較でoffer送信側を決定)。SDP処理はピア単位で直列化。復旧しない場合は部屋再参加で全接続を再構築 (受信メディアの実績があるピア限定)。シグナリング再接続時は部屋に自動再参加。**実環境検証済み (2026-09-13)**: デスクトップ⇔ノートPCでWi-Fi 16秒断を複数回実施し、自動再接続→メディア復帰を確認
+*   **Discord招待 (F-052 v1)**: QRモーダルの「Discord招待文をコピー」で `p2d://join/<code>` 付き招待文をクリップボードへ (RPC経由のjoin secret受信はdiscord-rich-presenceクレートの制約で未対応、将来discord-sdk置換で対応)
 
 ### 🔄 In Progress / TODO
-*   F-052 Discord招待 (中)
-*   ピアレベル再接続の実環境検証 (Wi-Fi断等)・クロスプラットフォームテスト (仕様§9 Phase 3)
+*   F-052のRPC完全対応 (join secret + ACTIVITY_JOIN受信)
+*   クロスプラットフォームテスト (仕様§9 Phase 3)
 
 ### ⚠️ Known Issues
 *   WebRTCピアレベルの自動再接続は未検証 (シグナリングWSの再接続のみ実装済み)
