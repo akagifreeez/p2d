@@ -34,8 +34,12 @@ function App() {
         if (savedTurnCredential) setTurnCredential(savedTurnCredential);
 
         // E2E自己テストモード (P2D_E2E_ROLE 環境変数がある起動でのみ有効)
+        // --p2d-signaling-url= があれば設定画面の保存値より優先して初期URLにする
         invoke<E2eConfig>('get_e2e_config')
-            .then(cfg => { if (cfg.enabled) setE2eConfig(cfg); })
+            .then(cfg => {
+                if (cfg.signalingUrl) setSignalingUrl(cfg.signalingUrl);
+                if (cfg.enabled) setE2eConfig(cfg);
+            })
             .catch(() => { });
     }, []);
 

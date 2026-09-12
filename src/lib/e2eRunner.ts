@@ -16,6 +16,8 @@ export interface E2eConfig {
     role: string | null;
     syncPath: string | null;
     logPath: string | null;
+    room: string | null;
+    signalingUrl: string | null;
 }
 
 export interface E2eDeps {
@@ -163,15 +165,17 @@ export async function runE2E(cfg: E2eConfig, deps: E2eDeps): Promise<void> {
             await deps.stopSystemAudio();
             deps.stopScreenShare();
         } else if (cfg.role === 'guest') {
-            // 1. 同期ファイルからルームコード取得
-            let code: string | null = null;
-            for (let i = 0; i < 120; i++) {
-                const raw = (await syncRead()) as string;
-                const m = raw.trim().match(/^[A-Za-z0-9]{4,8}$/);
-                if (m) { code = m[0]; break; }
-                await sleep(500);
+            // 1. ルームコード取得 (直指定があればsyncファイルは不要)
+            let code: string | null = cfg.room;
+            if (!code) {
+                for (let i = 0; i < 120; i++) {
+                    const raw = (await syncRead()) as string;
+                    const m = raw.trim().match(/^[A-Za-z0-9]{4,8}$/);
+                    if (m) { code = m[0]; break; }
+                    await sleep(500);
+                }
             }
-            step('read_room_code', !!code, { code });
+            step('read_room_code', !!code, { code, source: cfg.room ? 'arg' : 'sync-file' });
             if (!code) throw new Error('no room code from sync file');
 
             // 2. 参加

@@ -161,11 +161,16 @@ pub struct E2eConfig {
     pub role: Option<String>,
     pub sync_path: Option<String>,
     pub log_path: Option<String>,
+    /// 既知のルームコードを直指定 (syncファイル不要のguest参加用)
+    pub room: Option<String>,
+    /// シグナリングURL上書き (リモートマシンのサーバーへ接続する場合)
+    pub signaling_url: Option<String>,
 }
 
 /// E2E設定を起動引数 / 環境変数から取得
-/// 引数: --p2d-e2e-role=host --p2d-e2e-sync=<path> --p2d-e2e-log=<path>
-/// 環境変数: P2D_E2E_ROLE / P2D_E2E_SYNC / P2D_E2E_LOG
+/// 引数: --p2d-e2e-role=host|guest --p2d-e2e-sync=<path> --p2d-e2e-log=<path>
+///       --p2d-e2e-room=<code> --p2d-signaling-url=ws://...
+/// 環境変数: P2D_E2E_ROLE / P2D_E2E_SYNC / P2D_E2E_LOG / P2D_E2E_ROOM / P2D_SIGNALING_URL
 #[tauri::command]
 pub fn get_e2e_config() -> E2eConfig {
     let role = e2e_opt("--p2d-e2e-role=", "P2D_E2E_ROLE");
@@ -174,6 +179,8 @@ pub fn get_e2e_config() -> E2eConfig {
         role,
         sync_path: e2e_opt("--p2d-e2e-sync=", "P2D_E2E_SYNC"),
         log_path: e2e_opt("--p2d-e2e-log=", "P2D_E2E_LOG"),
+        room: e2e_opt("--p2d-e2e-room=", "P2D_E2E_ROOM"),
+        signaling_url: e2e_opt("--p2d-signaling-url=", "P2D_SIGNALING_URL"),
     }
 }
 
