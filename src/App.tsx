@@ -1,7 +1,9 @@
 import { useState, useEffect } from 'react';
+import { invoke } from '@tauri-apps/api/core';
 import { useConnectionStore } from './stores/connectionStore';
 import { RoomView } from './components/RoomView';
 import { useWindowPosition } from './hooks/useWindowPosition';
+import type { E2eConfig } from './lib/e2eRunner';
 
 function App() {
     const { connectionState } = useConnectionStore();
@@ -13,6 +15,7 @@ function App() {
     const DEFAULT_SIGNALING_URL = 'ws://localhost:8080';
     const [showSettings, setShowSettings] = useState(false);
     const [signalingUrl, setSignalingUrl] = useState(DEFAULT_SIGNALING_URL);
+    const [e2eConfig, setE2eConfig] = useState<E2eConfig | null>(null);
 
     // TURNサーバー設定
     const [turnUrl, setTurnUrl] = useState('');
@@ -29,6 +32,11 @@ function App() {
         if (savedTurnUrl) setTurnUrl(savedTurnUrl);
         if (savedTurnUsername) setTurnUsername(savedTurnUsername);
         if (savedTurnCredential) setTurnCredential(savedTurnCredential);
+
+        // E2E自己テストモード (P2D_E2E_ROLE 環境変数がある起動でのみ有効)
+        invoke<E2eConfig>('get_e2e_config')
+            .then(cfg => { if (cfg.enabled) setE2eConfig(cfg); })
+            .catch(() => { });
     }, []);
 
     const saveSettings = () => {
@@ -179,7 +187,7 @@ function App() {
                ここでは一旦、URLを渡さずにレンダリングする（デフォルトURLで動作させる）。
             */}
             {/* Passed signalingUrl and turnConfig props */}
-            <RoomView onLeave={() => { }} signalingUrl={signalingUrl} turnConfig={turnConfig} />
+            <RoomView onLeave={() => { }} signalingUrl={signalingUrl} turnConfig={turnConfig} e2eConfig={e2eConfig} />
 
             <div className="fixed bottom-4 left-0 w-full text-center pointer-events-none z-0 opacity-50">
                 <div className="text-[10px] text-gray-600 font-mono tracking-widest">

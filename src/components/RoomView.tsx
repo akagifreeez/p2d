@@ -95,8 +95,9 @@ function VideoGridItem({
 }
 
 import type { TurnConfig } from '../hooks/useWebRTC';
+import { runE2E, type E2eConfig, type E2eDeps } from '../lib/e2eRunner';
 
-export function RoomView({ onLeave, signalingUrl, turnConfig }: { onLeave: () => void; signalingUrl?: string; turnConfig?: TurnConfig }) {
+export function RoomView({ onLeave, signalingUrl, turnConfig, e2eConfig }: { onLeave: () => void; signalingUrl?: string; turnConfig?: TurnConfig; e2eConfig?: E2eConfig | null }) {
     const {
         localStream,
         remoteStreams,
@@ -141,7 +142,29 @@ export function RoomView({ onLeave, signalingUrl, turnConfig }: { onLeave: () =>
         connectionQuality,
         isAdaptiveModeEnabled,
         setAdaptiveModeEnabled,
+        // E2Eテスト用統計
+        getPeerStats,
     } = useWebRTC({ signalingUrl, turnConfig });
+
+    // E2E自己テストランナー (P2D_E2E_ROLE 環境変数がある起動でのみ動作)
+    const e2eDepsRef = useRef<E2eDeps | null>(null);
+    e2eDepsRef.current = {
+        createRoom, joinRoom, roomCode, myId, participants, remoteStreams,
+        chatMessages, peerControlAllowed,
+        startCustomScreenShare, stopScreenShare: () => stopScreenShare(),
+        setRemoteControlAllowed, startSystemAudio, stopSystemAudio,
+        sendChatMessage, getPeerStats,
+    };
+    const e2eStartedRef = useRef(false);
+    useEffect(() => {
+        if (!e2eConfig?.enabled || e2eStartedRef.current) return;
+        e2eStartedRef.current = true;
+        const liveDeps = new Proxy({} as E2eDeps, {
+            get: (_t, prop) => (e2eDepsRef.current as unknown as Record<PropertyKey, unknown>)[prop],
+        });
+        void runE2E(e2eConfig, liveDeps);
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [e2eConfig]);
 
     // 入力ステート
     const [inputCode, setInputCode] = useState('');

@@ -22,11 +22,25 @@ fn get_app_info() -> serde_json::Value {
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     // Windows向け: GPU使用を強制するWebView2追加引数
+    // 外部から環境変数が指定されている場合 (例: CDPテスト用の--remote-debugging-port) は尊重して追記する
     #[cfg(target_os = "windows")]
-    env::set_var(
-        "WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS",
-        "--ignore-gpu-blocklist --enable-gpu-rasterization --enable-accelerated-video-decode"
-    );
+    {
+        const GPU_FLAGS: &str =
+            "--ignore-gpu-blocklist --enable-gpu-rasterization --enable-accelerated-video-decode";
+        match env::var("WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS") {
+            Ok(existing) => {
+                if !existing.contains("ignore-gpu-blocklist") {
+                    env::set_var(
+                        "WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS",
+                        format!("{existing} {GPU_FLAGS}"),
+                    );
+                }
+            }
+            Err(_) => {
+                env::set_var("WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS", GPU_FLAGS);
+            }
+        }
+    }
 
     tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
@@ -48,6 +62,10 @@ pub fn run() {
             bridge::system::get_system_audio_config,
             bridge::system::start_system_audio_capture,
             bridge::system::stop_system_audio_capture,
+            bridge::system::get_e2e_config,
+            bridge::system::e2e_file_write,
+            bridge::system::e2e_file_read,
+            bridge::system::e2e_stdout,
             // Bridge: Capture (ネイティブキャプチャ)
             bridge::capture::get_capture_sources,
             bridge::capture::get_source_frame,

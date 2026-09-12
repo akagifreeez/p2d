@@ -137,3 +137,73 @@ pub fn stop_system_audio_capture(state: State<'_, AudioCaptureState>) -> Result<
     audio_capture::stop(state)
 }
 
+// --- E2E自己テストモード (P2D_E2E_ROLE 環境変数 または --p2d-e2e-role= 引数がある場合のみ動作) ---
+
+fn e2e_opt(flag: &str, env_key: &str) -> Option<String> {
+    for a in std::env::args() {
+        if let Some(v) = a.strip_prefix(flag) {
+            if !v.is_empty() {
+                return Some(v.to_string());
+            }
+        }
+    }
+    std::env::var(env_key).ok()
+}
+
+fn e2e_enabled() -> bool {
+    e2e_opt("--p2d-e2e-role=", "P2D_E2E_ROLE").is_some()
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct E2eConfig {
+    pub enabled: bool,
+    pub role: Option<String>,
+    pub sync_path: Option<String>,
+    pub log_path: Option<String>,
+}
+
+/// E2E設定を起動引数 / 環境変数から取得
+/// 引数: --p2d-e2e-role=host --p2d-e2e-sync=<path> --p2d-e2e-log=<path>
+/// 環境変数: P2D_E2E_ROLE / P2D_E2E_SYNC / P2D_E2E_LOG
+#[tauri::command]
+pub fn get_e2e_config() -> E2eConfig {
+    let role = e2e_opt("--p2d-e2e-role=", "P2D_E2E_ROLE");
+    E2eConfig {
+        enabled: role.is_some(),
+        role,
+        sync_path: e2e_opt("--p2d-e2e-sync=", "P2D_E2E_SYNC"),
+        log_path: e2e_opt("--p2d-e2e-log=", "P2D_E2E_LOG"),
+    }
+}
+
+/// E2Eモード専用のファイル書き込み (同期用・レポート用)
+#[tauri::command]
+pub fn e2e_file_write(path: String, content: String) -> Result<(), String> {
+    println!("[E2E-file] enter: path={:?} len={}", path, content.len());
+    let p = std::path::Path::new(&path);
+    if let Some(parent) = p.parent() {
+        let _ = std::fs::create_dir_all(parent); // 親ディレクトリが無ければ作る
+    }
+    let result = std::fs::write(p, content).map_err(|e| e.to_string());
+    println!("[E2E-file] result: {:?}", &result);
+    result
+}
+
+/// E2Eモード専用のファイル読み込み (ルームコード受け渡し等)
+#[tauri::command]
+pub fn e2e_file_read(path: String) -> Result<String, String> {
+    if !e2e_enabled() {
+        return Err("E2Eモードでのみ使用できます".to_string());
+    }
+    std::fs::read_to_string(&path).map_err(|e| e.to_string())
+}
+
+/// E2Eモード用: フロントのログをアプリのstdoutへ中継 (デバッグ可視化用)
+#[tauri::command]
+pub fn e2e_stdout(line: String) {
+    if e2e_enabled() {
+        println!("[E2E-web] {}", line);
+    }
+}
+

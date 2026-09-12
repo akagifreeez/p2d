@@ -143,6 +143,9 @@ export interface UseWebRTCReturn {
     connectionQuality: BandwidthStats | null;
     isAdaptiveModeEnabled: boolean;
     setAdaptiveModeEnabled: (enabled: boolean) => void;
+
+    // E2Eテスト用統計
+    getPeerStats: () => Promise<{ peerId: string; type: string; kind: string; bytes: number }[]>;
 }
 
 export function useWebRTC(options?: { signalingUrl?: string; turnConfig?: TurnConfig }): UseWebRTCReturn {
@@ -1103,6 +1106,27 @@ export function useWebRTC(options?: { signalingUrl?: string; turnConfig?: TurnCo
     }, []);
 
 
+    /**
+     * E2Eテスト用: 全ピアの送受信バイト統計を取得
+     */
+    const getPeerStats = useCallback(async () => {
+        const out: { peerId: string; type: string; kind: string; bytes: number }[] = [];
+        for (const [peerId, pc] of peerConnectionsRef.current) {
+            try {
+                const stats = await pc.getStats();
+                stats.forEach(r => {
+                    if (r.type === 'outbound-rtp' && (r.kind === 'audio' || r.kind === 'video')) {
+                        out.push({ peerId, type: r.type, kind: r.kind, bytes: r.bytesSent });
+                    }
+                    if (r.type === 'inbound-rtp' && (r.kind === 'audio' || r.kind === 'video')) {
+                        out.push({ peerId, type: r.type, kind: r.kind, bytes: r.bytesReceived });
+                    }
+                });
+            } catch { /* 統計取得失敗は無視 */ }
+        }
+        return out;
+    }, []);
+
     // クリーンアップ
     useEffect(() => {
         return () => {
@@ -1175,5 +1199,8 @@ export function useWebRTC(options?: { signalingUrl?: string; turnConfig?: TurnCo
         connectionQuality,
         isAdaptiveModeEnabled,
         setAdaptiveModeEnabled,
+
+        // E2Eテスト用統計
+        getPeerStats,
     };
 }

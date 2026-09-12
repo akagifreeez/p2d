@@ -71,6 +71,14 @@ It features multi-peer screen sharing, voice chat (microphone), text chat, and a
 *   **ローカル再生なし**: ハウリング防止のため AudioContext はスピーカーへ出力せず送信専用
 *   単体テスト: `cargo test --lib services::audio_capture` (設定解決 + ストリーム構築/再生の実走確認)
 
+### 7. E2E自己テストモード (`src/lib/e2eRunner.ts` + `bridge::system` のe2e_*コマンド)
+*   **起動方法**: `p2d.exe --p2d-e2e-role=host --p2d-e2e-sync=<path> --p2d-e2e-log=<path>` (環境変数 P2D_E2E_ROLE/P2D_E2E_SYNC/P2D_E2E_LOG でも可)
+*   **仕組み**: hostがルーム作成→コードをsyncファイルに書く→guestが読んで参加。以降は両インスタンスが自律的に画面共有・リモート操作許可・システム音声・チャットを実行し、`getPeerStats()` (WebRTC getStats) のバイト増加で検証する
+*   **検証内容**: host=送信バイト増 (video/audio) + チャット往復 / guest=映像トラック生存+受信バイト増・CTRLバッジ受信・音声受信バイト増・チャット受信
+*   **利点**: GUIフォーカス不要 (バックグラウンド完結)・リリースビルドのまま実行可能・結果はJSONレポート (`"passed": true/false`)
+*   **2026-09-12実績**: 2インスタンス (同一PC) で全12ステップ pass。システム音声のE2E受信を統計で証明
+*   ルームコードは数字6桁ではなく**英数字6文字** (例: CWH4K6)
+
 ---
 
 
