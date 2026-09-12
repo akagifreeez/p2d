@@ -29,7 +29,7 @@ export function QrModal({ roomCode, onClose }: { roomCode: string; onClose: () =
             <div className="md-dialog p-6 max-w-sm w-full animate-slide-up text-center">
                 <div className="flex justify-between items-center mb-6">
                     <h2 className="text-xl font-semibold">QRで招待</h2>
-                    <button onClick={onClose} className="md-icon-btn">✕</button>
+                    <button onClick={onClose} className="md-icon-btn"><svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 6l12 12M18 6L6 18" /></svg></button>
                 </div>
                 {dataUrl ? (
                     <img src={dataUrl} alt={`p2d://join/${roomCode}`} className="mx-auto rounded-xl" />
@@ -125,7 +125,7 @@ export function QrScannerModal({ onScan, onClose }: { onScan: (code: string) => 
             <div className="md-dialog p-6 max-w-sm w-full animate-slide-up">
                 <div className="flex justify-between items-center mb-4">
                     <h2 className="text-xl font-semibold">QRスキャン</h2>
-                    <button onClick={onClose} className="md-icon-btn">✕</button>
+                    <button onClick={onClose} className="md-icon-btn"><svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 6l12 12M18 6L6 18" /></svg></button>
                 </div>
                 {error ? (
                     <div className="p-4 rounded-xl bg-[var(--md-error-container)] text-[var(--md-on-error-container)] text-sm">{error}</div>

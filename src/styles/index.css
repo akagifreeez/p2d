@@ -53,11 +53,17 @@
 
 @layer components {
 
-  /* --- ボタン (M3: Filled / Tonal / Error / Text) --- */
-  .btn {
+  /* --- ボタン (M3: Filled / Tonal / Error / Text) ---
+     基底をvariant側にも効かせる (btn-danger単体など .btn 省略時に崩れないように) */
+  .btn,
+  .btn-primary,
+  .btn-secondary,
+  .btn-danger,
+  .btn-text {
     @apply relative inline-flex items-center justify-center gap-2 h-10 px-6 rounded-full text-sm font-medium select-none transition-[background,box-shadow] duration-150;
     @apply focus:outline-none disabled:opacity-40 disabled:pointer-events-none;
   }
+  .btn { /* variantなしの素のボタン */ }
   .btn-primary {
     background: var(--md-primary);
     color: var(--md-on-primary);
