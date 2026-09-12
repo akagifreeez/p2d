@@ -18,6 +18,7 @@ export interface E2eConfig {
     logPath: string | null;
     room: string | null;
     signalingUrl: string | null;
+    stay: string | null;
 }
 
 export interface E2eDeps {
@@ -162,8 +163,10 @@ export async function runE2E(cfg: E2eConfig, deps: E2eDeps): Promise<void> {
             step('chat_roundtrip', gotGuestChat, { received: deps.chatMessages.length });
 
             // 後片付け
-            await deps.stopSystemAudio();
-            deps.stopScreenShare();
+            if (!cfg.stay) {
+                await deps.stopSystemAudio();
+                deps.stopScreenShare();
+            }
         } else if (cfg.role === 'guest') {
             // 1. ルームコード取得 (直指定があればsyncファイルは不要)
             let code: string | null = cfg.room;

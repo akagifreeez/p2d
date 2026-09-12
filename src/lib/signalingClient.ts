@@ -53,7 +53,7 @@ export class SignalingClient {
     private ws: WebSocket | null = null;
     private events: Partial<SignalingEvents> = {};
     private reconnectAttempts = 0;
-    private maxReconnectAttempts = 5;
+    private maxReconnectAttempts = 10;
     private reconnectDelay = 1000;
 
     constructor(private serverUrl: string) { }

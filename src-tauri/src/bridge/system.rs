@@ -165,6 +165,8 @@ pub struct E2eConfig {
     pub room: Option<String>,
     /// シグナリングURL上書き (リモートマシンのサーバーへ接続する場合)
     pub signaling_url: Option<String>,
+    /// フロー後のクリーンアップ (共有停止) をスキップし接続を維持する (再接続検証用)
+    pub stay: Option<String>,
 }
 
 /// E2E設定を起動引数 / 環境変数から取得
@@ -181,6 +183,7 @@ pub fn get_e2e_config() -> E2eConfig {
         log_path: e2e_opt("--p2d-e2e-log=", "P2D_E2E_LOG"),
         room: e2e_opt("--p2d-e2e-room=", "P2D_E2E_ROOM"),
         signaling_url: e2e_opt("--p2d-signaling-url=", "P2D_SIGNALING_URL"),
+        stay: e2e_opt("--p2d-e2e-stay=", "P2D_E2E_STAY"),
     }
 }
 

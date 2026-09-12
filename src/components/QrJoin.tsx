@@ -12,7 +12,9 @@ import jsQR from 'jsqr';
 
 export function QrModal({ roomCode, onClose }: { roomCode: string; onClose: () => void }) {
     const [dataUrl, setDataUrl] = useState('');
-    const [copied, setCopied] = useState(false);
+    const [copied, setCopied] = useState('');
+
+    const inviteText = `P2Dで画面共有に招待します!\n参加リンク: p2d://join/${roomCode}\n(P2Dインストール済みならクリックで自動参加 / コード: ${roomCode})`;
 
     useEffect(() => {
         QRCode.toDataURL(`p2d://join/${roomCode}`, {
@@ -23,6 +25,13 @@ export function QrModal({ roomCode, onClose }: { roomCode: string; onClose: () =
             .then(setDataUrl)
             .catch(() => setDataUrl(''));
     }, [roomCode]);
+
+    const copyText = (text: string, key: string) => {
+        void navigator.clipboard.writeText(text).then(() => {
+            setCopied(key);
+            window.setTimeout(() => setCopied(''), 1500);
+        });
+    };
 
     return (
         <div className="md-scrim">
@@ -41,17 +50,21 @@ export function QrModal({ roomCode, onClose }: { roomCode: string; onClose: () =
                     カメラで読み取ると <span className="font-mono">p2d://join/{roomCode}</span> が開き、P2Dが自動参加します。
                     読めない場合は上のコードを手入力してください。
                 </p>
-                <button
-                    onClick={() => {
-                        void navigator.clipboard.writeText(roomCode).then(() => {
-                            setCopied(true);
-                            window.setTimeout(() => setCopied(false), 1500);
-                        });
-                    }}
-                    className="btn-secondary w-full mt-4 py-2 text-sm"
-                >
-                    {copied ? 'コピーしました' : 'コードをコピー'}
-                </button>
+                <div className="grid grid-cols-1 gap-2 mt-4">
+                    <button
+                        onClick={() => copyText(roomCode, 'code')}
+                        className="btn-secondary w-full py-2 text-sm"
+                    >
+                        {copied === 'code' ? 'コピーしました' : 'コードをコピー'}
+                    </button>
+                    <button
+                        onClick={() => copyText(inviteText, 'invite')}
+                        className="btn-secondary w-full py-2 text-sm"
+                        title="Discordのチャットに貼り付けて招待できます (F-052)"
+                    >
+                        {copied === 'invite' ? '招待文をコピーしました' : 'Discord招待文をコピー'}
+                    </button>
+                </div>
             </div>
         </div>
     );

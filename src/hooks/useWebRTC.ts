@@ -225,6 +225,22 @@ export function useWebRTC(options?: { signalingUrl?: string; turnConfig?: TurnCo
 
     // リモート操作 (F-022: ホスト側の許可ゲート。デフォルトOFF = 安全側)
     const remoteControlAllowedRef = useRef(false);
+    // 再接続時の部屋再参加用 (Wi-Fi断等から WS が繋がり直ったときに入り直す)
+    const roomCodeRef = useRef<string | null>(null);
+    const roomNameRef = useRef<string | undefined>(undefined);
+    // ICE restartのグレア対策 (offerを送る側を決める) に使う自分のID
+    const myIdRef = useRef<string | null>(null);
+    // ピアごとのSDP処理直列化キュー (オファー/アンサーの同時着によるstate競合を防ぐ)
+    const pcOpsRef = useRef(new WeakMap<RTCPeerConnection, Promise<void>>());
+    const enqueueSdpOp = useCallback((pc: RTCPeerConnection, op: () => Promise<void>) => {
+        const prev = pcOpsRef.current.get(pc) || Promise.resolve();
+        const next = prev.then(op).catch(() => { /* チェーンを切らせない */ });
+        pcOpsRef.current.set(pc, next);
+        return next;
+    }, []);
+    // メディアを一度でも受信したピア (メディア停滞チェックの適用対象を絞るため。
+    // 相手が何も送らない場合、受信トラックはmutedのままなのが正常なので再構築してはいけない)
+    const remoteMediaSeenRef = useRef(new Set<string>());
     const [remoteControlAllowed, setRemoteControlAllowedState] = useState(false);
     const [peerControlAllowed, setPeerControlAllowed] = useState<Map<string, boolean>>(new Map());
 
@@ -375,14 +391,46 @@ export function useWebRTC(options?: { signalingUrl?: string; turnConfig?: TurnCo
         // ピアレベル自動再接続: ICEがfailed/長時間disconnectedになったらrestartIce+再交渉で復旧を試みる
         let restartCount = 0;
         let disconnectTimer: number | null = null;
+        let fallbackTimer: number | null = null;
+        let recoveryVerifyTimer: number | null = null;
         const maxRestarts = 5;
 
-        const attemptIceRestart = (reason: string) => {
+        const attemptIceRestart = (reason: string, force = false) => {
             if (pc.connectionState === 'closed') return;
             if (!signalingRef.current) return; // シグナリングが死んでいるなら復旧できない
+            // 復旧保証: 最初の試みから15秒経ってもICEが繋がらなければ、
+            // リスタートの成否に関わらず部屋再参加で接続を全部作り直す
+            if (recoveryVerifyTimer === null) {
+                recoveryVerifyTimer = window.setTimeout(() => {
+                    recoveryVerifyTimer = null;
+                    const s = pc.iceConnectionState;
+                    if (s !== 'connected' && s !== 'completed') {
+                        console.warn(`[WebRTC] ICE未回復(${s}) → 接続を再構築`);
+                        rebuildConnections();
+                    }
+                }, 15000);
+            }
             if (restartCount >= maxRestarts) {
                 console.warn(`[WebRTC] ICE restart上限(${maxRestarts})到達: ${peerId}`);
+                return; // 継続的な復旧はverifyタイマー経由の再構築が担う
+            }
+            // グレア対策: IDの小さい側だけが再起動offerを送る (大きい側は相手のofferを待つ)。
+            // 相手側が死んでいる等で10秒復旧しなければ、全側が自分から試みる
+            if (!force && (myIdRef.current || '') >= peerId) {
+                console.log(`[WebRTC] ICE restart待機 (相手主導, ${reason}): ${peerId}`);
+                if (fallbackTimer === null) {
+                    fallbackTimer = window.setTimeout(() => {
+                        fallbackTimer = null;
+                        if (pc.connectionState === 'failed' || pc.iceConnectionState === 'failed' || pc.iceConnectionState === 'disconnected') {
+                            attemptIceRestart('fallback', true);
+                        }
+                    }, 10000);
+                }
                 return;
+            }
+            if (fallbackTimer !== null) {
+                window.clearTimeout(fallbackTimer);
+                fallbackTimer = null;
             }
             restartCount += 1;
             console.warn(`[WebRTC] ICE restart #${restartCount} (${reason}): ${peerId}`);
@@ -400,7 +448,7 @@ export function useWebRTC(options?: { signalingUrl?: string; turnConfig?: TurnCo
                         await pc.setLocalDescription(offer);
                         signalingRef.current?.sendOffer(peerId, offer);
                     } catch (e) {
-                        console.error('[WebRTC] 再接続offer失敗:', e);
+                        console.error('[WebRTC] 再接続offer失敗:', (e as Error)?.message || String(e));
                     }
                 })();
             }, 500);
@@ -426,16 +474,40 @@ export function useWebRTC(options?: { signalingUrl?: string; turnConfig?: TurnCo
                 attemptIceRestart('failed');
             } else if (s === 'connected' || s === 'completed') {
                 restartCount = 0;
+                console.log(`[WebRTC] ICE復旧: connected (${peerId})`);
                 if (disconnectTimer !== null) {
                     window.clearTimeout(disconnectTimer);
                     disconnectTimer = null;
                 }
+                if (fallbackTimer !== null) {
+                    window.clearTimeout(fallbackTimer);
+                    fallbackTimer = null;
+                }
+                if (recoveryVerifyTimer !== null) {
+                    window.clearTimeout(recoveryVerifyTimer);
+                    recoveryVerifyTimer = null;
+                }
+                // メディア確認: ICEは繋がってもトラックがmutedのまま流れないケースがある
+                // (送信側のtransceiver状態破損)。5秒経っても全受信トラックがmutedなら再構築。
+                // ただし相手が一度もメディアを送っていない場合はmutedが正常なので再構築しない
+                window.setTimeout(() => {
+                    if (pc.connectionState !== 'connected') return;
+                    if (!remoteMediaSeenRef.current.has(peerId)) return;
+                    const receivers = pc.getReceivers().filter(r => r.track);
+                    if (receivers.length === 0) return;
+                    const allMuted = receivers.every(r => r.track.muted);
+                    if (allMuted) {
+                        console.warn('[WebRTC] ICE復旧後もメディアが流れないため接続を再構築');
+                        rebuildConnections();
+                    }
+                }, 5000);
             }
         };
 
         // Track受信 (映像/音声)
         pc.ontrack = (event) => {
             console.log(`[WebRTC] Track受信: ${peerId} (${event.track.kind})`);
+            remoteMediaSeenRef.current.add(peerId);
             const stream = event.streams[0] || new MediaStream([event.track]);
 
             const triggerUpdate = () => setRemoteStreams(prev => new Map(prev));
@@ -491,18 +563,56 @@ export function useWebRTC(options?: { signalingUrl?: string; turnConfig?: TurnCo
         }
 
         // 既存のローカルトラックがあれば追加
+        let attachedExistingMedia = false;
         if (localStreamRef.current) {
             localStreamRef.current.getTracks().forEach(track => {
                 pc.addTrack(track, localStreamRef.current!);
+                attachedExistingMedia = true;
             });
         }
         if (localAudioStreamRef.current) {
             localAudioStreamRef.current.getTracks().forEach(track => {
                 pc.addTrack(track, localAudioStreamRef.current!); // Stream分けるべきか？
+                attachedExistingMedia = true;
             });
         }
+        // 画面共有中のストリームも新規ピアにattachする (再構築/途中参加で共有が見えなくなるのを防ぐ)
+        localStreamsRef.current.forEach(stream => {
+            stream.getTracks().forEach(track => {
+                if (!pc.getSenders().some(s => s.track === track)) {
+                    pc.addTrack(track, stream);
+                    attachedExistingMedia = true;
+                }
+            });
+        });
         if (systemAudioSessionRef.current) {
             pc.addTrack(systemAudioSessionRef.current.track, systemAudioSessionRef.current.stream);
+            attachedExistingMedia = true;
+        }
+        // 既存メディアをattachしたnon-initiator (onnegotiationneededを持たない) は、
+        // 初期negotiation (DCのみのoffer/answer) が落ち着いた後に手動で再交渉する。
+        // これが無いと「共有中に相手が再参加/途中参加」したとき映像が載らない。
+        if (attachedExistingMedia && !isInitiator) {
+            const tryExistingMediaRenegotiation = (attempt = 0) => {
+                if (pc.connectionState === 'closed') return;
+                // ICE接続完了かつSDP stableになるまで待つ (固定遅延だと競合時に握りつぶされる)
+                if (pc.signalingState !== 'stable' || pc.connectionState !== 'connected') {
+                    if (attempt < 20) window.setTimeout(() => tryExistingMediaRenegotiation(attempt + 1), 500);
+                    return;
+                }
+                enqueueSdpOp(pc, async () => {
+                    try {
+                        if (pc.signalingState !== 'stable') return;
+                        const offer = await pc.createOffer();
+                        await pc.setLocalDescription(offer);
+                        signalingRef.current?.sendOffer(peerId, offer);
+                        console.log(`[WebRTC] 既存メディアの再交渉offer送信: ${peerId}`);
+                    } catch (e) {
+                        console.error('[WebRTC] 既存メディア再交渉失敗:', (e as Error)?.message || String(e));
+                    }
+                });
+            };
+            window.setTimeout(() => tryExistingMediaRenegotiation(), 800);
         }
 
         // InitiatorならOffer作成
@@ -520,7 +630,7 @@ export function useWebRTC(options?: { signalingUrl?: string; turnConfig?: TurnCo
         }
 
         return pc;
-    }, [iceServers, setupDataChannel]);
+    }, [iceServers, setupDataChannel, enqueueSdpOp]);
 
     /**
      * シグナリング初期化
@@ -534,6 +644,12 @@ export function useWebRTC(options?: { signalingUrl?: string; turnConfig?: TurnCo
 
         signaling.on('onConnected', () => {
             setConnectionState('connected');
+            // 再接続: 入室中だった部屋に自動で再参加する (サーバー側の入室状態は
+            // WS切断で失われているため。これが無いとICE再起動のofferが届かない)
+            if (roomCodeRef.current) {
+                console.log(`[WebRTC] 再接続: 部屋 ${roomCodeRef.current} に再参加`);
+                signaling.joinRoom(roomCodeRef.current, roomNameRef.current);
+            }
         });
 
         signaling.on('onDisconnected', () => {
@@ -545,6 +661,8 @@ export function useWebRTC(options?: { signalingUrl?: string; turnConfig?: TurnCo
         signaling.on('onRoomJoined', (_roomId, code, myClientId, existingParticipants) => {
             setRoomCode(code);
             setMyId(myClientId);
+            roomCodeRef.current = code;
+            myIdRef.current = myClientId;
             isConnectedRef.current = true;
 
             // 参加者リスト更新
@@ -593,34 +711,37 @@ export function useWebRTC(options?: { signalingUrl?: string; turnConfig?: TurnCo
             dataChannelsRef.current.delete(peerId);
         });
 
-        signaling.on('onOffer', async (senderId, sdp) => {
+        signaling.on('onOffer', (senderId, sdp) => {
             const pc = createPeerConnection(senderId, false); // PC取得または作成(受信側)
-            try {
-                if (pc.signalingState !== 'stable') {
-                    await Promise.all([
-                        pc.setLocalDescription({ type: 'rollback' }),
-                        pc.setRemoteDescription(new RTCSessionDescription(sdp))
-                    ]);
-                } else {
-                    await pc.setRemoteDescription(new RTCSessionDescription(sdp));
+            return enqueueSdpOp(pc, async () => {
+                try {
+                    if (pc.signalingState !== 'stable') {
+                        await Promise.all([
+                            pc.setLocalDescription({ type: 'rollback' }),
+                            pc.setRemoteDescription(new RTCSessionDescription(sdp))
+                        ]);
+                    } else {
+                        await pc.setRemoteDescription(new RTCSessionDescription(sdp));
+                    }
+                    const answer = await pc.createAnswer();
+                    await pc.setLocalDescription(answer);
+                    signalingRef.current?.sendAnswer(senderId, answer);
+                } catch (e) {
+                    console.error('[WebRTC] Offer処理失敗:', (e as Error)?.message || String(e));
                 }
-                const answer = await pc.createAnswer();
-                await pc.setLocalDescription(answer);
-                signalingRef.current?.sendAnswer(senderId, answer);
-            } catch (e) {
-                console.error('[WebRTC] Offer処理失敗:', e);
-            }
+            });
         });
 
-        signaling.on('onAnswer', async (senderId, sdp) => {
+        signaling.on('onAnswer', (senderId, sdp) => {
             const pc = peerConnectionsRef.current.get(senderId);
-            if (pc) {
+            if (!pc) return;
+            return enqueueSdpOp(pc, async () => {
                 try {
                     await pc.setRemoteDescription(new RTCSessionDescription(sdp));
                 } catch (e) {
-                    console.error('[WebRTC] Answer処理失敗:', e);
+                    console.error('[WebRTC] Answer処理失敗:', (e as Error)?.message || String(e));
                 }
-            }
+            });
         });
 
         signaling.on('onIceCandidate', async (senderId, candidate) => {
@@ -642,18 +763,42 @@ export function useWebRTC(options?: { signalingUrl?: string; turnConfig?: TurnCo
      */
     const createRoom = useCallback(async (name?: string) => {
         await connect();
+        roomNameRef.current = name;
         signalingRef.current?.createRoom(name);
     }, [connect]);
 
     const joinRoom = useCallback(async (code: string, name?: string) => {
         await connect();
+        roomNameRef.current = name;
         signalingRef.current?.joinRoom(code, name);
     }, [connect]);
+
+    // ICE再起動で復旧できない場合の最終手段: 部屋に再参加して全ピア接続を作り直す。
+    // leaveRoom → joinRoom により相手側でも peer:left/peer:joined が流れ、
+    // 両側が初期接続と同じ(実績のある)経路で fresh なPCを張り直す。
+    const lastRebuildAtRef = useRef(0);
+    const rebuildConnections = useCallback(() => {
+        const now = Date.now();
+        if (now - lastRebuildAtRef.current < 15000) return; // 再構築ループ防止
+        const code = roomCodeRef.current;
+        const signaling = signalingRef.current;
+        if (!code || !signaling) return;
+        lastRebuildAtRef.current = now;
+        console.log('[WebRTC] 接続再構築: 部屋に再参加します');
+        peerConnectionsRef.current.forEach(pc => pc.close());
+        peerConnectionsRef.current.clear();
+        dataChannelsRef.current.clear();
+        setRemoteStreams(new Map());
+        signaling.leaveRoom();
+        signaling.joinRoom(code, roomNameRef.current);
+    }, [setRemoteStreams]);
 
     /**
      * 切断
      */
     const leaveRoom = useCallback(() => {
+        roomCodeRef.current = null;
+        roomNameRef.current = undefined;
         signalingRef.current?.leaveRoom();
         signalingRef.current?.disconnect();
         signalingRef.current = null;
