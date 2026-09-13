@@ -25,7 +25,7 @@ import {
 } from '../lib/roster';
 import {
     createRoot as createTreeRoot, attach as treeAttach, promote as treePromote,
-    pickParent as pickTreeParent, findNode as findTreeNode, detachSubtree,
+    pickParent as pickTreeParent, findNode as findTreeNode, handleNodeLoss,
 } from '../lib/treeAssign';
 import {
     chooseSignalRoute, makeEnvelope, forwardEnvelope,
@@ -339,6 +339,7 @@ export function useWebRTC(options?: { signalingUrl?: string; turnConfig?: TurnCo
     const treeClientRef = useRef<SignalingClient | null>(null);
     const treeChildrenRef = useRef<Set<string>>(new Set());
     const treeSelfAddrRef = useRef<{ host: string; port: number } | null>(null);
+    const treeRootIdRef = useRef<string | null>(null); // 中継者から見たホスト (コーディネータ) のID
     // 子へ転送するためにキャッシュする下流派生物 (鍵・許可状態)
     const cachedKeyRef = useRef<unknown>(null);
     const cachedControlRef = useRef<unknown>(null);
@@ -1173,6 +1174,7 @@ export function useWebRTC(options?: { signalingUrl?: string; turnConfig?: TurnCo
     /** ゲスト側: 中継へ昇格 — 自分の内蔵サーバーを起動し子を受け付ける (M2) */
     const handleTreePromote = (hostId: string) => {
         if (treeClientRef.current) return; // 既に中継
+        treeRootIdRef.current = hostId;
         void (async () => {
             try {
                 const port = await invoke<number>('embedded_server_start', { port: null, host: null });
@@ -1184,6 +1186,16 @@ export function useWebRTC(options?: { signalingUrl?: string; turnConfig?: TurnCo
                 // 自分のサーバーへ接続 (子の subscribe/chat を受け取る面)
                 const tc = new SignalingClient(`ws://127.0.0.1:${port}`);
                 treeClientRef.current = tc;
+                // 子の消失 (WS切断) をホストへ報告し、fan-outスロットを解放する
+                tc.on('onPeerLeft', (childId) => {
+                    if (treeChildrenRef.current.delete(childId)) {
+                        console.log(`[Tree] 子の消失を検出: ${childId}`);
+                        const up = treeRootIdRef.current;
+                        if (up && signalingRef.current?.isConnected) {
+                            signalingRef.current?.sendRelay(up, 'tree:child_lost', { childId });
+                        }
+                    }
+                });
                 tc.on('onRelayMessage', (childId, t2, p2) => {
                     if (t2 === 'subscribe') {
                         console.log(`[Tree] 子の接続: ${childId}`);
@@ -1559,8 +1571,18 @@ export function useWebRTC(options?: { signalingUrl?: string; turnConfig?: TurnCo
                 // 配信木: 中継者が消えた場合、subtreeの解放+孤児は各自 parent_lost
                 // 経由で再参加する (親が消えた時点で子のWSも落ちるため)
                 const c = treeCoordinatorRef.current;
-                if (c && detachSubtree(c.root, peerId).length > 0) {
-                    console.log(`[Tree] 中継 ${peerId} が消失 — subtreeを解放`);
+                if (c) {
+                    const orphans = handleNodeLoss(c.root, peerId);
+                    if (orphans.length > 0) {
+                        console.log(`[Tree] 中継 ${peerId} が消失 — 孤児 ${orphans.length} 人を再割り当て対象に`);
+                        const hostAddr = hostEndpointRef.current
+                            ?? (embeddedPortRef.current ? `${lanIpRef.current || '127.0.0.1'}:${embeddedPortRef.current}` : null);
+                        for (const o of orphans) {
+                            signalingRef.current?.sendRelay(o.id, 'tree:assign', hostAddr
+                                ? { addr: hostAddr }
+                                : { rejoin: true });
+                        }
+                    }
                 }
             }
             setParticipants(prev => {
@@ -1685,10 +1707,20 @@ export function useWebRTC(options?: { signalingUrl?: string; turnConfig?: TurnCo
             if (type === 'unsubscribe') {
                 relaySubscribersRef.current.delete(senderId);
                 maybeStopRelayLoop();
-                // 配信木: 登録解除 (子を持つ中継者の消失なら subtreeごと外れる)
+                // 配信木: 登録解除 (子を持つ中継者の消失なら subtreeごと解放)
                 const c = treeCoordinatorRef.current;
-                if (c && detachSubtree(c.root, senderId).length > 0) {
-                    console.log(`[Tree] 中継 ${senderId} が離脱 — subtreeを解放`);
+                if (c) {
+                    const orphans = handleNodeLoss(c.root, senderId);
+                    if (orphans.length > 0) {
+                        console.log(`[Tree] 中継 ${senderId} が離脱 — 孤児 ${orphans.length} 人を再割り当て対象に`);
+                        const hostAddr = hostEndpointRef.current
+                            ?? (embeddedPortRef.current ? `${lanIpRef.current || '127.0.0.1'}:${embeddedPortRef.current}` : null);
+                        for (const o of orphans) {
+                            signalingRef.current?.sendRelay(o.id, 'tree:assign', hostAddr
+                                ? { addr: hostAddr }
+                                : { rejoin: true });
+                        }
+                    }
                 }
                 return;
             }
@@ -1715,6 +1747,16 @@ export function useWebRTC(options?: { signalingUrl?: string; turnConfig?: TurnCo
             if (type === 'tree:parent_lost') {
                 // 中継者が消えた: 孤児になった子を再登録する
                 coordinateTree(senderId);
+                return;
+            }
+            if (type === 'tree:child_lost') {
+                // 中継者からの子の消失報告 → 木から解放し、空きスロットへ再割り当て
+                const c = treeCoordinatorRef.current;
+                const childId = p.childId as string;
+                if (c && childId) {
+                    handleNodeLoss(c.root, childId);
+                    coordinateTree(senderId);
+                }
                 return;
             }
             if (type === 'control_allowed') {

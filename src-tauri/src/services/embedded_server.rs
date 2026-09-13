@@ -494,16 +494,15 @@ fn forward_to_peer(client_id: &str, target: Option<&str>, value: &serde_json::Va
 }
 
 fn remove_from_room(state: &SharedState, client_id: &str, code: &str) {
+    // 注意 (課題対応): 空になってもルームは削除しない。ホストの内蔵サーバーの部屋は
+    // ホストが常駐させる「予約済み部屋」であり、全直結視聴者が中継へ移動して
+    // 一時的に空になった瞬間に削除されると、以後の新規参加がROOM_NOT_FOUNDになる。
+    // ルームの寿命 = 内蔵サーバー (ホストアプリ) の寿命。
     let mut st = state.lock().unwrap();
-    let mut room_empty = false;
     if let Some(room) = st.room.as_mut() {
         if room.code == code {
             room.members.remove(client_id);
-            room_empty = room.members.is_empty();
         }
-    }
-    if room_empty {
-        st.room = None;
     }
 }
 

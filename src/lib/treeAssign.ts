@@ -106,6 +106,22 @@ export function attachUnder(
 }
 
 /**
+ * ノード喪失の処理 (peer:left / tree:child_lost 共用)。
+ * - root直結の子 (leaf) → 削除
+ * - root直結の中継 → subtreeごと解放 (孤児を返す: 再割り当て対象)
+ * - 中継配下のノード → その中継の管理領域なのでここでは触らない (空配列)
+ *   ※中継配下は中継が tree:child_lost で報告してくる
+ */
+export function handleNodeLoss(root: TreeNode, lostId: string): TreeNode[] {
+    const lost = findNode(root, lostId);
+    if (!lost || lost === root) return [];
+    if (root.children.some(c => c.id === lostId)) {
+        return detachSubtree(root, lostId);
+    }
+    return [];
+}
+
+/**
  * 中継ノードを昇格させる (子を引き受けられるようにする)。
  * fan-outは§3.1どおり中継視聴者は2。
  */
