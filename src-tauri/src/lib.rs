@@ -26,7 +26,7 @@ pub fn run() {
     #[cfg(target_os = "windows")]
     {
         const GPU_FLAGS: &str =
-            "--ignore-gpu-blocklist --enable-gpu-rasterization --enable-accelerated-video-decode";
+            "--ignore-gpu-blocklist --enable-gpu-rasterization --enable-accelerated-video-decode              --disable-background-timer-throttling --disable-renderer-backgrounding              --disable-backgrounding-occluded-windows";
         match env::var("WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS") {
             Ok(existing) => {
                 if !existing.contains("ignore-gpu-blocklist") {
