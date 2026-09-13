@@ -149,7 +149,11 @@ export async function runE2E(cfg: E2eConfig, deps: E2eDeps): Promise<void> {
             // 2. ゲスト参加待ち
             const twoPeers = await waitFor(() => deps.participants.size >= 1, 45000, 'guest join');
             step('guest_joined', twoPeers, { participants: deps.participants.size });
-            if (!twoPeers) throw new Error('guest did not join');
+            // 参加が遅れても後続の共有ステップまで進める (帯域測定では共有の開始自体が重要)
+            if (!twoPeers) {
+                const latePeers = await waitFor(() => deps.participants.size >= 1, 120000, 'guest join (late)');
+                step('guest_joined_late', latePeers, { participants: deps.participants.size });
+            }
             await sleep(2500); // DataChannel開通待ち
 
             // M1: 名簿ゴシップの収束 (自分 + 全参加者が名簿に載る)

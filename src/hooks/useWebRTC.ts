@@ -577,6 +577,15 @@ export function useWebRTC(options?: { signalingUrl?: string; turnConfig?: TurnCo
         relayVideoRef.current = video;
         relayLoopRef.current = window.setInterval(() => {
             const mseSubs = Array.from(relayCapsRef.current.entries()).filter(([, c]) => c.mse).map(([id]) => id);
+            // 診断: ループ停滞の切り分け (60秒毎)
+            {
+                const w = window as unknown as { __relayDiagAt?: number };
+                const now = Date.now();
+                if (now - (w.__relayDiagAt ?? 0) > 60000) {
+                    w.__relayDiagAt = now;
+                    console.log(`[RelayLoop] diag: subs=${relaySubscribersRef.current.size} caps=${relayCapsRef.current.size} vw=${video.videoWidth} rs=${video.readyState} enc=${!!relayEncoderRef.current} sent=${relayStatsRef.current.h264Chunks} audio=${relayStatsRef.current.audioChunks}`);
+                }
+            }
             const jpegSubs = Array.from(relayCapsRef.current.entries()).filter(([, c]) => !c.mse).map(([id]) => id);
             if (mseSubs.length === 0 && jpegSubs.length === 0) return;
             if (!video.videoWidth) return;
