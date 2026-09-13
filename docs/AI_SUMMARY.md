@@ -15,7 +15,7 @@ It features multi-peer screen sharing, voice chat (microphone), text chat, and a
 ## Architecture (Full Mesh P2P - Updated 2026-09-12)
 
 ### 1. Signaling Server (`signaling-server/` + `signaling-worker/` Cloudflare Workers版)
-*   **Server**: Node.js WebSocket server。**Cloudflare Workers版は `signaling-worker/`** (1ルーム=1 DO、同一プロトコル、単体テスト7件。常設VPS不要の電話帳。`wss://<ワーカー>?room=コード` で接続。詳細は signaling-worker/README.md)
+*   **Server**: Node.js WebSocket server。**Cloudflare Workers版は `signaling-worker/`** (1ルーム=1 DO、同一プロトコル、単体テスト7件。常設VPS不要の電話帳)。**2026-09-14デプロイ済み・本番稼働**: `wss://p2d-signaling.akagifreeez.workers.dev/?room=コード` (E2E済み: create/join/offer転送/relay:h264無改変パススルー)。デプロイはCloudflare MCP (mcp.cloudflare.com/mcp, OAuth済み) のexecuteツールでAPI直接PUT、または `signaling-worker/` で `npx wrangler deploy`
 *   **Protocol**: JSON-based messages.
 *   **Key Messages**:
     *   `room:create` / `room:created`: ルーム作成

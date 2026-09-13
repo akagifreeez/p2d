@@ -21,6 +21,9 @@ npx wrangler deploy
 # → https://p2d-signaling.<サブドメイン>.workers.dev が発行される
 ```
 
+**2026-09-14 デプロイ済み**: `wss://p2d-signaling.akagifreeez.workers.dev/?room=<コード>`
+(再デプロイは `npx wrangler deploy` のほか、Cloudflare MCPのexecuteツールからAPI直接PUTでも可)
+
 ## アーキテクチャ
 
 - **1ルーム = 1 Durable Object** (`RoomDurableObject`)。URLの `?room=<コード>` でDOが特定され、同じ部屋の全員が同じDO上のWebSocketに集約される
