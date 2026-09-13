@@ -1,12 +1,19 @@
 # P2D Infrastructure - Signaling Server + TURN Server
 #
 # 使い方:
+#   cp .env.example .env   # TURN_USER / TURN_PASS / TURN_EXTERNAL_IP を必ず設定
 #   docker-compose up -d
 #
-# 設定:
-#   - TURN_USER, TURN_PASSで認証情報を変更
-#   - TURN_REALMでドメインを設定
-#   - 本番環境ではTURN_EXTERNAL_IPを実際のIPに変更
+# 重要 (監査#2):
+#   - TURN_USER / TURN_PASS / TURN_EXTERNAL_IP は既定値を持たない。
+#     未設定のまま `docker-compose up` すると起動が失敗する (意図的な挙動)。
+#   - TURN_EXTERNAL_IP は coturn の --external-ip に渡される。
+#     NAT/VPS環境ではグローバルIP、自宅LANではそのホストのプライベートIPを設定する。
+#
+# 公開環境 (インターネットに晒す場合):
+#   docker compose -f docker-compose.yml -f docker-compose.tls.yml up -d
+#   → wss:// (シグナリング) と turns:// (TURN over TLS) を有効化する。
+#   詳細は DOCKER.md の「公開環境での TLS」節を参照。
 
 version: '3.8'
 
@@ -24,6 +31,8 @@ services:
     restart: unless-stopped
     environment:
       - NODE_ENV=production
+      # ルーム参加者数の上限 (監査#6)。未設定時のデフォルトは8
+      - P2D_MAX_PARTICIPANTS=${P2D_MAX_PARTICIPANTS:-8}
     networks:
       - p2d-network
     healthcheck:
@@ -36,7 +45,8 @@ services:
   # TURN Server (Coturn)
   # ========================================
   turn:
-    image: coturn/coturn:latest
+    # 監査#2: latestではなく検証済みの固定タグを使う
+    image: coturn/coturn:4.18.0
     container_name: p2d-turn
     ports:
       # TURN/STUN
@@ -49,21 +59,25 @@ services:
       - "49152-49200:49152-49200/udp"
     restart: unless-stopped
     environment:
-      - TURN_USER=${TURN_USER:-p2d}
-      - TURN_PASS=${TURN_PASS:-p2d_secret_password}
+      # 監査#2: 既定資格情報は廃止。未設定なら起動時に失敗する (:? 構文)
+      - TURN_USER=${TURN_USER:? .env に TURN_USER を設定してください}
+      - TURN_PASS=${TURN_PASS:? .env に TURN_PASS を設定してください}
       - TURN_REALM=${TURN_REALM:-p2d.local}
-      - TURN_EXTERNAL_IP=${TURN_EXTERNAL_IP:-}
+      - TURN_EXTERNAL_IP=${TURN_EXTERNAL_IP:? .env に TURN_EXTERNAL_IP を設定してください}
     command:
       - -n
       - --log-file=stdout
       - --min-port=49152
       - --max-port=49200
       - --realm=${TURN_REALM:-p2d.local}
-      - --user=${TURN_USER:-p2d}:${TURN_PASS:-p2d_secret_password}
+      - --user=${TURN_USER}:${TURN_PASS}
       - --lt-cred-mech
       - --fingerprint
       - --listening-port=3478
       - --tls-listening-port=5349
+      # 監査#2: TURN_EXTERNAL_IP を coturn に明示的に渡す
+      # (environment変数はcoturnが解釈しないため command での指定が必須)
+      - --external-ip=${TURN_EXTERNAL_IP}
       - --verbose
     networks:
       - p2d-network

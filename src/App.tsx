@@ -67,6 +67,23 @@ function App() {
         credential: turnCredential || undefined,
     } : undefined;
 
+    // 監査#3: ローカル/プライベート網以外への暗号化なし ws:// 接続を警告する
+    const insecureSignalingWarning = (() => {
+        try {
+            const u = new URL(signalingUrl.trim());
+            if (u.protocol !== 'ws:') return null;
+            const h = u.hostname;
+            const isLocalOrPrivate = h === 'localhost' || h === '::1' || h.endsWith('.local') ||
+                /^127\./.test(h) || /^10\./.test(h) || /^192\.168\./.test(h) ||
+                /^172\.(1[6-9]|2\d|3[01])\./.test(h) ||
+                /^100\.(6[4-9]|[7-9]\d|1[01]\d|12[0-7])\./.test(h); // CGNAT (Tailscale等のVPN網)
+            return isLocalOrPrivate ? null :
+                'このアドレスは暗号化されない ws:// です。公開環境ではリバースプロキシ等でTLS終端した wss:// を使用してください。';
+        } catch {
+            return null;
+        }
+    })();
+
     return (
         <div className="min-h-screen bg-[var(--md-surface)] text-[var(--md-on-surface)] relative">
             {/* 設定モーダル */}
@@ -98,6 +115,12 @@ function App() {
                                     ローカル: <span className="font-mono">ws://localhost:8080</span> /
                                     LAN: <span className="font-mono">ws://192.168.x.x:8080</span>
                                 </p>
+                                {insecureSignalingWarning && (
+                                    <p className="mt-2 text-xs text-[var(--md-error)] flex items-start gap-1.5">
+                                        <span className="shrink-0">⚠</span>
+                                        <span>{insecureSignalingWarning}</span>
+                                    </p>
+                                )}
                             </div>
 
                             {/* TURN Server */}

@@ -124,11 +124,48 @@ function handleMessage(clientId: string, message: SignalingMessage): void {
 }
 
 /**
+ * ルーム移動時: 移動元ルームの残存参加者に退出を通知する (監査#4)
+ * oldRoom は当該クライアント削除済みのルーム。空で削除済みなら null (通知不要)。
+ */
+function notifyOldRoomLeft(oldRoom: Room | null, leftClientId: string): void {
+    if (!oldRoom) return;
+    oldRoom.participants.forEach((_, peerId) => {
+        const peerWs = clients.get(peerId);
+        if (peerWs) {
+            sendMessage(peerWs, {
+                type: 'peer:left',
+                roomId: oldRoom.id,
+                senderId: leftClientId,
+                timestamp: Date.now(),
+                payload: {
+                    peerId: leftClientId,
+                },
+            });
+        }
+    });
+}
+
+/**
+ * 送信者と宛先が同一ルームに所属しているか検証する (監査#1 部屋外中継対策)
+ * 退出後もclient IDを知っている攻撃者が部屋外からOffer等を送れないようにする。
+ */
+function canForward(senderId: string, targetId: string): boolean {
+    const senderRoom = roomManager.getRoomByClientId(senderId);
+    const targetRoom = roomManager.getRoomByClientId(targetId);
+    if (!senderRoom || !targetRoom || senderRoom.id !== targetRoom.id) {
+        console.warn(`[Server] ルーム外中継を拒否: ${senderId} -> ${targetId}`);
+        return false;
+    }
+    return true;
+}
+
+/**
  * ルーム作成ハンドラ
  */
 function handleRoomCreate(clientId: string, ws: WebSocket, message: RoomCreateMessage): void {
     const name = message.payload?.name;
-    const room = roomManager.createRoom(clientId, name);
+    const { room, oldRoom } = roomManager.createRoom(clientId, name);
+    notifyOldRoomLeft(oldRoom, clientId);
 
     sendMessage(ws, {
         type: 'room:created',
@@ -168,12 +205,18 @@ function handleRoomJoin(clientId: string, ws: WebSocket, message: RoomJoinMessag
     }
 
     const name = message.payload?.name;
-    const room = roomManager.joinRoom(roomCode, clientId, name);
+    const result = roomManager.joinRoom(roomCode, clientId, name);
 
-    if (!room) {
-        sendError(ws, 'ROOM_NOT_FOUND', 'ルームが見つかりません');
+    if (!result.ok) {
+        if (result.reason === 'FULL') {
+            sendError(ws, 'ROOM_FULL', 'ルームが満員です');
+        } else {
+            sendError(ws, 'ROOM_NOT_FOUND', 'ルームが見つかりません');
+        }
         return;
     }
+    const { room, oldRoom } = result;
+    notifyOldRoomLeft(oldRoom, clientId);
 
     // 1. 新しい参加者に「既存の参加者リスト」を送る
     const participants: ParticipantInfo[] = [];
@@ -249,6 +292,7 @@ function handleOffer(clientId: string, message: OfferMessage): void {
         console.error(`[Server] Offer: targetIdがありません`);
         return;
     }
+    if (!canForward(clientId, targetId)) return;
 
     const targetWs = clients.get(targetId);
     if (targetWs) {
@@ -269,6 +313,7 @@ function handleAnswer(clientId: string, message: AnswerMessage): void {
         console.error(`[Server] Answer: targetIdがありません`);
         return;
     }
+    if (!canForward(clientId, targetId)) return;
 
     const targetWs = clients.get(targetId);
     if (targetWs) {
@@ -289,6 +334,7 @@ function handleIceCandidate(clientId: string, message: IceCandidateMessage): voi
         // console.error(`[Server] ICE: targetIdがありません`);
         return;
     }
+    if (!canForward(clientId, targetId)) return;
 
     const targetWs = clients.get(targetId);
     if (targetWs) {
@@ -306,6 +352,7 @@ function handleIceCandidate(clientId: string, message: IceCandidateMessage): voi
 function handleRelayForward(clientId: string, message: SignalingMessage): void {
     const targetId = message.targetId;
     if (!targetId) return;
+    if (!canForward(clientId, targetId)) return;
 
     const targetWs = clients.get(targetId);
     if (targetWs) {

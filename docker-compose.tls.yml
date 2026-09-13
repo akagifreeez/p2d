@@ -1,0 +1,65 @@
+# P2D 公開環境用 TLS オーバーレイ (監査#3)
+#
+# インターネットに公開する場合はこのオーバーレイを併用する:
+#   cp .env.example .env   # CADDY_DOMAIN / TURN_USER / TURN_PASS / TURN_EXTERNAL_IP を設定
+#   docker compose -f docker-compose.yml -f docker-compose.tls.yml up -d
+#
+# 有効になるもの:
+#   - シグナリング: Caddy が Let's Encrypt 証明書で wss:// を終端
+#     (クライアントからは wss://<CADDY_DOMAIN> で接続。8080は localhost バインドのみ)
+#   - TURN over TLS (turns://): ./turn/certs/turn.crt と turn.key を事前に配置する
+#     (Let's Encrypt の fullchain.pem / privkey.pem をそのままコピーしてよい)
+#
+# 注意:
+#   - !override 構文は Docker Compose v2.24 以降が必要
+#   - 80/443 ポートを Caddy が使うため、同じホストで他のWebサーバーと併存できない
+
+services:
+  signaling:
+    ports: !override
+      # 直接公開せず Caddy 経由のみにする
+      - "127.0.0.1:8080:8080"
+
+  turn:
+    volumes:
+      - ./turn/certs:/etc/coturn/certs:ro
+    command: !override
+      - -n
+      - --log-file=stdout
+      - --min-port=49152
+      - --max-port=49200
+      - --realm=${TURN_REALM:-p2d.local}
+      - --user=${TURN_USER}:${TURN_PASS}
+      - --lt-cred-mech
+      - --fingerprint
+      - --listening-port=3478
+      - --tls-listening-port=5349
+      - --external-ip=${TURN_EXTERNAL_IP}
+      - --cert=/etc/coturn/certs/turn.crt
+      - --pkey=/etc/coturn/certs/turn.key
+      - --no-tlsv1
+      - --no-tlsv1_1
+      - --no-multicast-peers
+      - --verbose
+
+  caddy:
+    image: caddy:2
+    container_name: p2d-caddy
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    environment:
+      - CADDY_DOMAIN=${CADDY_DOMAIN:? .env に CADDY_DOMAIN を設定してください}
+    volumes:
+      - ./caddy/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      - signaling
+    networks:
+      - p2d-network
+
+volumes:
+  caddy_data:
+  caddy_config:

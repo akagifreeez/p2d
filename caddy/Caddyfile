@@ -1,0 +1,5 @@
+# P2D シグナリングのTLS終端 (監査#3)
+# CADDY_DOMAIN 環境変数で証明書を自動取得する (Let's Encrypt / ACME)
+{$CADDY_DOMAIN} {
+	reverse_proxy signaling:8080
+}

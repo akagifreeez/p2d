@@ -214,6 +214,9 @@ export function RoomView({ onLeave, signalingUrl, turnConfig, e2eConfig, onOpenS
         relayVideoUrl,
         relayAudioUrl,
         getRelayStats,
+        // サーバーエラー (監査#6: 満室などを表示)
+        error: connectionError,
+        clearError,
     } = useWebRTC({ signalingUrl, turnConfig });
 
     // E2E自己テストランナー (P2D_E2E_ROLE 環境変数がある起動でのみ動作)
@@ -368,6 +371,17 @@ export function RoomView({ onLeave, signalingUrl, turnConfig, e2eConfig, onOpenS
                     <p className="text-sm text-[var(--md-on-surface-variant)] mb-8">
                         サーバーを介さない直接接続。コードを共有して相手を招待できます。
                     </p>
+
+                    {/* サーバー由来のエラー (満室ルームへの参加など) */}
+                    {connectionError && (
+                        <div className="md-card p-4 mb-4 flex items-start gap-3 border border-[var(--md-error)]/40">
+                            <svg className="w-5 h-5 text-[var(--md-error)] shrink-0 mt-0.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 9v2m0 4h.01M5 19h14a2 2 0 001.84-2.75L13.74 4a2 2 0 00-3.5 0L3.16 16.25A2 2 0 005 19z" /></svg>
+                            <div className="text-sm flex-1">{connectionError}</div>
+                            <button className="md-icon-btn shrink-0" onClick={clearError} title="閉じる">
+                                <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 6l12 12M18 6L6 18" /></svg>
+                            </button>
+                        </div>
+                    )}
 
                     {/* 表示名 */}
                     <div className="md-card p-5 mb-4">

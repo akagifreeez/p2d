@@ -117,6 +117,7 @@ export interface UseWebRTCReturn {
     roomCode: string | null;
     isConnected: boolean;
     error: string | null;
+    clearError: () => void;
     participants: Map<string, ParticipantInfo>;
     myId: string | null;
 
@@ -297,6 +298,8 @@ export function useWebRTC(options?: { signalingUrl?: string; turnConfig?: TurnCo
     const relayAudioRecRef = useRef<MediaRecorder | null>(null);
     // リレーモードのチャット配送先 (参加者一覧のrefミラー)
     const participantsRef = useRef<Map<string, ParticipantInfo>>(new Map());
+    // useEffect経由の遅延ミラーではなく setState 側で同時に更新する
+    // (監査#1の送信者チェックが最新参加者リストを即座に参照できるようにするため)
     useEffect(() => { participantsRef.current = participants; }, [participants]);
     // ピアごとのSDP処理直列化キュー (オファー/アンサーの同時着によるstate競合を防ぐ)
     const pcOpsRef = useRef(new WeakMap<RTCPeerConnection, Promise<void>>());
@@ -927,6 +930,14 @@ export function useWebRTC(options?: { signalingUrl?: string; turnConfig?: TurnCo
             isConnectedRef.current = false;
         });
 
+        // サーバー由来のエラー (監査#6: 満室ルームへの参加拒否などをUIへ出す)
+        signaling.on('onError', (code, message) => {
+            console.error(`[Signaling] サーバーエラー: ${code} ${message}`);
+            if (code === 'ROOM_FULL') {
+                setError('ルームが満員です (参加者数の上限に達しています)');
+            }
+        });
+
         // 自分の参加完了通知 (既存参加者リストが来る)
         signaling.on('onRoomJoined', (_roomId, code, myClientId, existingParticipants) => {
             setRoomCode(code);
@@ -935,9 +946,10 @@ export function useWebRTC(options?: { signalingUrl?: string; turnConfig?: TurnCo
             myIdRef.current = myClientId;
             isConnectedRef.current = true;
 
-            // 参加者リスト更新
+            // 参加者リスト更新 (refは同時に更新 — 監査#1の送信者チェック用)
             const pMap = new Map<string, ParticipantInfo>();
             existingParticipants.forEach(p => pMap.set(p.id, p));
+            participantsRef.current = pMap;
             setParticipants(pMap);
 
             // **Full Mesh Logic**: 既存の参加者全員に対して Initiator となり接続開始
@@ -957,6 +969,7 @@ export function useWebRTC(options?: { signalingUrl?: string; turnConfig?: TurnCo
             setParticipants(prev => {
                 const next = new Map(prev);
                 next.set(peerId, { id: peerId, name, joinedAt: Date.now() });
+                participantsRef.current = next;
                 return next;
             });
             if (relayModeRef.current) {
@@ -972,6 +985,7 @@ export function useWebRTC(options?: { signalingUrl?: string; turnConfig?: TurnCo
             setParticipants(prev => {
                 const next = new Map(prev);
                 next.delete(peerId);
+                participantsRef.current = next;
                 return next;
             });
             // リレー視聴者が退出したら購読を外す
@@ -996,6 +1010,11 @@ export function useWebRTC(options?: { signalingUrl?: string; turnConfig?: TurnCo
 
         signaling.on('onOffer', (senderId, sdp) => {
             if (relayModeRef.current) return; // リレーモードではWebRTC経路を使わない
+            // 監査#1: 参加者リスト外のpeerからのOfferは破棄 (サーバー側検証の二重化)
+            if (!participantsRef.current.has(senderId)) {
+                console.warn(`[WebRTC] 参加者リスト外のOfferを破棄: ${senderId}`);
+                return;
+            }
             const pc = createPeerConnection(senderId, false); // PC取得または作成(受信側)
             return enqueueSdpOp(pc, async () => {
                 try {
@@ -1018,6 +1037,11 @@ export function useWebRTC(options?: { signalingUrl?: string; turnConfig?: TurnCo
 
         signaling.on('onAnswer', (senderId, sdp) => {
             if (relayModeRef.current) return;
+            // 監査#1: 参加者リスト外のpeerからのAnswerは破棄
+            if (!participantsRef.current.has(senderId)) {
+                console.warn(`[WebRTC] 参加者リスト外のAnswerを破棄: ${senderId}`);
+                return;
+            }
             const pc = peerConnectionsRef.current.get(senderId);
             if (!pc) return;
             return enqueueSdpOp(pc, async () => {
@@ -1030,6 +1054,8 @@ export function useWebRTC(options?: { signalingUrl?: string; turnConfig?: TurnCo
         });
 
         signaling.on('onIceCandidate', async (senderId, candidate) => {
+            // 監査#1: 参加者リスト外のpeerからのICE候補は破棄
+            if (!participantsRef.current.has(senderId)) return;
             const pc = peerConnectionsRef.current.get(senderId);
             if (pc) {
                 try {
@@ -1042,6 +1068,11 @@ export function useWebRTC(options?: { signalingUrl?: string; turnConfig?: TurnCo
 
         // WSリレー (WebRTC非対応エンジンのフォールバック経路)
         signaling.on('onRelayMessage', (senderId, type, payload) => {
+            // 監査#1: 参加者リスト外のpeerからのリレーメッセージは破棄
+            if (!participantsRef.current.has(senderId)) {
+                console.warn(`[Relay] 参加者リスト外のメッセージを破棄: ${senderId} (${type})`);
+                return;
+            }
             const p = (payload || {}) as Record<string, unknown>;
             if (type === 'frame') {
                 // ゲスト側: 最新フレームを保持 (setStateは描画レートに合わせて間引く)
@@ -1198,7 +1229,9 @@ export function useWebRTC(options?: { signalingUrl?: string; turnConfig?: TurnCo
             void sa.stop();
         }
 
-        setParticipants(new Map());
+        const empty = new Map<string, ParticipantInfo>();
+        participantsRef.current = empty;
+        setParticipants(empty);
         setRemoteStreams(new Map());
         reset();
     }, [reset, stopRelayLoop]);
@@ -1762,6 +1795,7 @@ export function useWebRTC(options?: { signalingUrl?: string; turnConfig?: TurnCo
         isConnected: connectionState === 'peer-connected' || connectionState === 'connected',
         roomCode: useConnectionStore(s => s.roomCode),
         error: useConnectionStore(s => s.error),
+        clearError: () => setError(null),
         participants,
         myId,
 

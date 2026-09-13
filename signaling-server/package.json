@@ -7,10 +7,11 @@
     "scripts": {
         "dev": "tsx watch src/index.ts",
         "build": "tsc",
-        "start": "node dist/index.js"
+        "start": "node dist/index.js",
+        "test": "node --import tsx --test --test-force-exit test/roomManager.test.ts test/signaling.integration.test.ts"
     },
     "dependencies": {
-        "ws": "^8.18.0"
+        "ws": "^8.21.0"
     },
     "devDependencies": {
         "@types/node": "^22.0.0",

@@ -14,6 +14,11 @@ function generateRoomCode(): string {
     return code;
 }
 
+// joinRoomの結果 (NOT_FOUND / FULL は現在の所属を変更しない)
+export type JoinRoomResult =
+    | { ok: true; room: Room; oldRoom: Room | null }
+    | { ok: false; reason: 'NOT_FOUND' | 'FULL' };
+
 // ルーム管理クラス
 export class RoomManager {
     // ルームID -> ルーム情報
@@ -26,15 +31,28 @@ export class RoomManager {
     // ルームのタイムアウト（5分）- 誰もいないルームが放置された場合の安全策
     private readonly ROOM_TIMEOUT_MS = 5 * 60 * 1000;
 
-    constructor() {
-        // 定期的に期限切れルームをクリーンアップ
-        setInterval(() => this.cleanupExpiredRooms(), 60 * 1000);
+    // 1ルームの参加者上限 (監査#6: Full Meshの帯域・接続数暴走をサーバー側で拒否)
+    private readonly maxParticipants: number;
+
+    constructor(maxParticipants?: number) {
+        this.maxParticipants = maxParticipants ??
+            parseInt(process.env.P2D_MAX_PARTICIPANTS || '8', 10);
+        if (!Number.isFinite(this.maxParticipants) || this.maxParticipants < 1) {
+            throw new Error(`P2D_MAX_PARTICIPANTS が不正です: ${process.env.P2D_MAX_PARTICIPANTS}`);
+        }
+        // 定期的に期限切れルームをクリーンアップ (サーバー本体はWSで生き続けるためunrefでよい)
+        setInterval(() => this.cleanupExpiredRooms(), 60 * 1000).unref?.();
     }
 
     /**
      * 新しいルームを作成
+     * 監査#4: 既存ルーム所属がある場合は必ず先に退室させる (幽霊参加者防止)
+     * 戻り値の oldRoom は退室後の移動元ルーム (呼び出し元が peer:left を通知するのに使う。
+     * 空になって削除された場合は null)
      */
-    createRoom(creatorId: string, creatorName?: string): Room {
+    createRoom(creatorId: string, creatorName?: string): { room: Room; oldRoom: Room | null } {
+        const oldRoom = this.removeFromCurrentRoom(creatorId).room;
+
         // 一意なルームコードを生成
         let code: string;
         do {
@@ -63,58 +81,74 @@ export class RoomManager {
 
         console.log(`[RoomManager] ルーム作成: ${code} (ID: ${roomId}), 作成者: ${creatorId}`);
 
-        return room;
+        return { room, oldRoom };
     }
 
     /**
      * ルームコードでルームに参加
+     * 監査#4: 失敗時 (NOT_FOUND/FULL) は現在の所属を一切変更しない原子的操作。
+     * 成功時は移動元があれば先に退室させてから参加する。
      */
-    joinRoom(code: string, clientId: string, clientName?: string): Room | null {
+    joinRoom(code: string, clientId: string, clientName?: string): JoinRoomResult {
         const roomId = this.codeToId.get(code.toUpperCase());
-        if (!roomId) {
-            console.log(`[RoomManager] ルーム未発見: ${code}`);
-            return null;
-        }
-
-        const room = this.rooms.get(roomId);
+        const room = roomId ? this.rooms.get(roomId) : undefined;
         if (!room) {
-            return null;
+            console.log(`[RoomManager] ルーム未発見: ${code}`);
+            return { ok: false, reason: 'NOT_FOUND' };
         }
 
-        // 既に参加済みの場合は更新だけ（ID重複対策）
+        // 既に参加済みの場合は何もしない (ID重複対策・peer:left誤通知も起こさない)
         if (room.participants.has(clientId)) {
             console.warn(`[RoomManager] クライアント ${clientId} は既にルームに参加しています`);
-            return room;
+            return { ok: true, room, oldRoom: null };
         }
 
-        // 参加者を追加
+        // 上限チェックは退室の前に行う (失敗時に元の所属を壊さない)
+        if (room.participants.size >= this.maxParticipants) {
+            console.warn(`[RoomManager] ルーム ${room.code} は満員です (${this.maxParticipants}人)`);
+            return { ok: false, reason: 'FULL' };
+        }
+
+        // 別のルームに所属していた場合は退室させてから参加 (監査#4)
+        const oldRoom = this.removeFromCurrentRoom(clientId).room;
+
         const info: ParticipantInfo = {
             id: clientId,
             name: clientName,
             joinedAt: Date.now(),
         };
         room.participants.set(clientId, info);
-        this.clientToRoom.set(clientId, roomId);
+        this.clientToRoom.set(clientId, room.id);
 
-        console.log(`[RoomManager] 参加: ${clientId} -> ルーム ${code}, 現在人数: ${room.participants.size}`);
+        console.log(`[RoomManager] 参加: ${clientId} -> ルーム ${room.code}, 現在人数: ${room.participants.size}`);
 
-        return room;
+        return { ok: true, room, oldRoom };
     }
 
     /**
      * クライアントをルームから削除
      */
     leaveRoom(clientId: string): { room: Room | null } {
+        return { room: this.removeFromCurrentRoom(clientId).room };
+    }
+
+    /**
+     * クライアントの現在のルーム所属を解除する共通処理
+     * 戻り値の room は参加者削除後のルーム (空になって削除された場合は null)
+     */
+    private removeFromCurrentRoom(clientId: string): { room: Room | null; info: ParticipantInfo | null } {
         const roomId = this.clientToRoom.get(clientId);
         if (!roomId) {
-            return { room: null };
+            return { room: null, info: null };
         }
 
         const room = this.rooms.get(roomId);
         if (!room) {
             this.clientToRoom.delete(clientId); // 整合性のため削除
-            return { room: null };
+            return { room: null, info: null };
         }
+
+        const info = room.participants.get(clientId) ?? null;
 
         // 参加者を削除
         room.participants.delete(clientId);
@@ -125,10 +159,10 @@ export class RoomManager {
         if (room.participants.size === 0) {
             console.log(`[RoomManager] ルームが空になったため削除: ${room.code}`);
             this.deleteRoom(roomId);
-            return { room: null }; // ルーム削除済み
+            return { room: null, info };
         }
 
-        return { room };
+        return { room, info };
     }
 
     /**
