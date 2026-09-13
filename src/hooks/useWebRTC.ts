@@ -589,6 +589,9 @@ export function useWebRTC(options?: { signalingUrl?: string; turnConfig?: TurnCo
                     sb.mode = 'sequence';
                     relayVideoSbRef.current = sb;
                     sb.addEventListener('updateend', () => pumpRelayQueue(sb, relayVideoQueueRef.current));
+                    sb.addEventListener('error', () => console.error('[Relay] video SourceBuffer error (readyState:', ms.readyState, ')'));
+                    // sourceopenまでに溜まったinit segment等を即流す (流さないとinit抜けで以後全滅する)
+                    pumpRelayQueue(sb, relayVideoQueueRef.current);
                 } catch (e) {
                     console.error('[Relay] SourceBuffer(video)作成失敗:', e);
                 }
@@ -610,6 +613,8 @@ export function useWebRTC(options?: { signalingUrl?: string; turnConfig?: TurnCo
                     sb.mode = 'sequence';
                     relayAudioSbRef.current = sb;
                     sb.addEventListener('updateend', () => pumpRelayQueue(sb, relayAudioQueueRef.current));
+                    sb.addEventListener('error', () => console.error('[Relay] audio SourceBuffer error (readyState:', ms.readyState, ')'));
+                    pumpRelayQueue(sb, relayAudioQueueRef.current);
                 } catch (e) {
                     console.error('[Relay] SourceBuffer(audio)作成失敗:', e);
                 }
@@ -1061,8 +1066,8 @@ export function useWebRTC(options?: { signalingUrl?: string; turnConfig?: TurnCo
                 ensureRelayVideoSink();
                 const sb = relayVideoSbRef.current;
                 const buf = base64ToArrayBuffer(String(p.d || ''));
-                if (sb && !sb.updating) {
-                    try { sb.appendBuffer(buf); } catch (e) { console.error('[Relay] video appendBuffer失敗:', e); }
+                if (sb && !sb.updating && relayVideoMsRef.current?.readyState === 'open') {
+                    try { sb.appendBuffer(buf); } catch (e) { console.error('[Relay] video appendBuffer失敗:', (e as DOMException)?.name, (e as DOMException)?.message || e); }
                 } else if (relayVideoQueueRef.current.length < 240) {
                     relayVideoQueueRef.current.push(buf);
                 }
@@ -1073,8 +1078,8 @@ export function useWebRTC(options?: { signalingUrl?: string; turnConfig?: TurnCo
                 ensureRelayAudioSink();
                 const sb = relayAudioSbRef.current;
                 const buf = base64ToArrayBuffer(String(p.d || ''));
-                if (sb && !sb.updating) {
-                    try { sb.appendBuffer(buf); } catch (e) { console.error('[Relay] audio appendBuffer失敗:', e); }
+                if (sb && !sb.updating && relayAudioMsRef.current?.readyState === 'open') {
+                    try { sb.appendBuffer(buf); } catch (e) { console.error('[Relay] audio appendBuffer失敗:', (e as DOMException)?.name, (e as DOMException)?.message || e); }
                 } else if (relayAudioQueueRef.current.length < 240) {
                     relayAudioQueueRef.current.push(buf);
                 }
