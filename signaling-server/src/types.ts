@@ -14,6 +14,7 @@ export type MessageType =
     | 'peer:offer'       // SDP Offer
     | 'peer:answer'      // SDP Answer
     | 'peer:ice'         // ICE候補
+    | 'peer:tunnel'      // DC中継シグナリング (レンデブー最小化M2: 封筒転送)
     | 'error'            // エラー
     // WSリレー (WebRTC非対応エンジン向けフォールバック経路・targetId指定で転送)
     | 'relay:frame'
@@ -38,6 +39,8 @@ export interface RoomCreateMessage extends SignalingMessage {
     type: 'room:create';
     payload: {
         name?: string; // 作成者の名前
+        roomCode?: string; // 指定があればそれを使う (サーバーレス参加とコードを揃えるため)
+        hostEndpoint?: string; // ホスト内蔵WSサーバーの住所 (電話帳登録)
     };
 }
 
@@ -68,6 +71,7 @@ export interface RoomJoinedMessage extends SignalingMessage {
         roomCode: string;
         myId: string;
         participants: ParticipantInfo[]; // 既存参加者リスト (自分以外)
+        hostEndpoint?: string; // 電話帳: ホスト内蔵サーバーの住所 (M2)
     };
 }
 
@@ -120,6 +124,10 @@ export interface Room {
     code: string;
     participants: Map<string, ParticipantInfo>;
     createdAt: number;
+    // レンデブー最小化 (M2): ホスト内蔵WSサーバーの住所 (host:port)。
+    // サーバーは「電話帳」としてこれを参加者に配布するだけで、以後の
+    // シグナリング/メディアには関与しない
+    hostEndpoint?: string;
 }
 
 // 参加者情報

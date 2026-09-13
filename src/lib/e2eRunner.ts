@@ -43,7 +43,10 @@ export interface E2eDeps {
     getRelayStats: () => {
         frames: number; bytes: number; lastFrameAt: number; h264Chunks: number; audioChunks: number;
         subscribers: number; mseSubscribers: number; audioSubscribers: number;
+        sigVerified: number; sigInvalid: number;
     };
+    // レンデブー最小化 (M1): 名簿ゴシップのエントリ一覧 (収束検証)
+    getRoster: () => { id: string }[];
 }
 
 const sleep = (ms: number) => new Promise(r => setTimeout(r, ms));
@@ -138,16 +141,28 @@ export async function runE2E(cfg: E2eConfig, deps: E2eDeps): Promise<void> {
             if (!twoPeers) throw new Error('guest did not join');
             await sleep(2500); // DataChannel開通待ち
 
+            // M1: 名簿ゴシップの収束 (自分 + 全参加者が名簿に載る)
+            const rosterOk = await waitFor(
+                () => deps.getRoster().length >= deps.participants.size + 1,
+                10000, 'roster convergence'
+            );
+            step('roster_sync', rosterOk, { roster: deps.getRoster().map(r => r.id), participants: deps.participants.size });
+
             // 3. 画面共有 (最初のモニター)
             const sources = await invoke<{ id: string; name: string; is_monitor: boolean }[]>('get_capture_sources');
             const monitor = sources.find(s => s.is_monitor);
             if (!monitor) throw new Error('no monitor source');
             await deps.startCustomScreenShare(monitor.id, true);
             await sleep(3000);
+            const relay0 = deps.getRelayStats();
             const vOut0 = bytesSum(await deps.getPeerStats(), 'outbound-rtp', 'video');
             await sleep(3000);
+            const relay1 = deps.getRelayStats();
             const vOut1 = bytesSum(await deps.getPeerStats(), 'outbound-rtp', 'video');
-            step('screen_share_sending', vOut1 > vOut0, { videoBytesDelta: vOut1 - vOut0 });
+            // リレー視聴者 (Linux等) にはPC統計が無いのでリレーチャンク増加で判定
+            const relayDelta = (relay1.h264Chunks + relay1.frames) - (relay0.h264Chunks + relay0.frames);
+            step('screen_share_sending', vOut1 > vOut0 || relayDelta > 0,
+                { videoBytesDelta: vOut1 - vOut0, relayChunksDelta: relayDelta });
 
             // 4. リモート操作を許可
             deps.setRemoteControlAllowed(true);
@@ -156,10 +171,14 @@ export async function runE2E(cfg: E2eConfig, deps: E2eDeps): Promise<void> {
 
             // 5. システム音声
             await deps.startSystemAudio();
+            const relayA0 = deps.getRelayStats();
             const aOut0 = bytesSum(await deps.getPeerStats(), 'outbound-rtp', 'audio');
             await sleep(4000);
+            const relayA1 = deps.getRelayStats();
             const aOut1 = bytesSum(await deps.getPeerStats(), 'outbound-rtp', 'audio');
-            step('system_audio_sending', aOut1 > aOut0, { audioBytesDelta: aOut1 - aOut0 });
+            const relayAudioDelta = relayA1.audioChunks - relayA0.audioChunks;
+            step('system_audio_sending', aOut1 > aOut0 || relayAudioDelta > 0,
+                { audioBytesDelta: aOut1 - aOut0, relayAudioChunksDelta: relayAudioDelta });
 
             // 6. チャット送信 & ゲストからの受信
             deps.sendChatMessage('E2E-ping-from-host');
@@ -169,8 +188,11 @@ export async function runE2E(cfg: E2eConfig, deps: E2eDeps): Promise<void> {
             );
             step('chat_roundtrip', gotGuestChat, { received: deps.chatMessages.length });
 
-            // 後片付け
-            if (!cfg.stay) {
+            // stay時: 後から来た参加者 (サーバー死亡後の内蔵サーバー経由参加など) にも
+            // チャット経路を検証できるよう、ホストのpingを定期的に再送する
+            if (cfg.stay) {
+                setInterval(() => deps.sendChatMessage('E2E-ping-from-host'), 5000);
+            } else {
                 await deps.stopSystemAudio();
                 deps.stopScreenShare();
             }
@@ -188,11 +210,26 @@ export async function runE2E(cfg: E2eConfig, deps: E2eDeps): Promise<void> {
             step('read_room_code', !!code, { code, source: cfg.room ? 'arg' : 'sync-file' });
             if (!code) throw new Error('no room code from sync file');
 
-            // 2. 参加
-            await deps.joinRoom(code, 'E2E-Guest');
+            // 2. 参加 (ディープリンク自動参加と競合しても収束するようリトライ)
+            for (let attempt = 0; attempt < 10; attempt++) {
+                try {
+                    await deps.joinRoom(code, 'E2E-Guest');
+                    break;
+                } catch (e) {
+                    console.error(`[E2E] joinRoom attempt ${attempt + 1} failed:`, String(e));
+                    await sleep(2000);
+                }
+            }
             const twoPeers = await waitFor(() => deps.participants.size >= 1, 30000, 'host discover');
             step('joined_room', twoPeers, { participants: deps.participants.size });
             if (!twoPeers) throw new Error('could not join');
+
+            // M1: 名簿ゴシップの収束
+            const rosterOk = await waitFor(
+                () => deps.getRoster().length >= deps.participants.size + 1,
+                10000, 'roster convergence'
+            );
+            step('roster_sync', rosterOk, { roster: deps.getRoster().map(r => r.id), participants: deps.participants.size });
 
             // 3. ホスト映像の受信
             if (deps.isRelayMode) {
@@ -246,6 +283,15 @@ export async function runE2E(cfg: E2eConfig, deps: E2eDeps): Promise<void> {
                     audioDelta = a1 - a0;
                 }
                 step('system_audio_receiving', audioDelta > 0, { audioBytesDelta: audioDelta });
+            }
+
+            // M3: リレーチャンクのEd25519署名検証 (リレーモードのみ)
+            if (deps.isRelayMode) {
+                const sigOk = await waitFor(() => deps.getRelayStats().sigVerified > 0, 15000, 'relay signature');
+                step('signature_verification', sigOk && deps.getRelayStats().sigInvalid === 0, {
+                    verified: deps.getRelayStats().sigVerified,
+                    invalid: deps.getRelayStats().sigInvalid,
+                });
             }
 
             // 6. チャット往復

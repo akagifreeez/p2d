@@ -12,6 +12,7 @@ import { useWebRTC } from '../hooks/useWebRTC';
 import { ChatPanel } from './ChatPanel';
 import { MonitorPicker } from './MonitorPicker';
 import { QrModal, QrScannerModal } from './QrJoin';
+import { parseInvite } from '../lib/invite';
 import { normalizeKeyName } from '../lib/dataChannel';
 import { addRecentRoom, getRecentRooms, RecentRoom } from '../lib/history';
 import { clearPresence, getStoredDiscordClientId, resolveDiscordClientId, setStoredDiscordClientId, updatePresence } from '../lib/discord';
@@ -217,6 +218,9 @@ export function RoomView({ onLeave, signalingUrl, turnConfig, e2eConfig, onOpenS
         // サーバーエラー (監査#6: 満室などを表示)
         error: connectionError,
         clearError,
+        // レンデブー最小化 (M1/M4): 名簿ゴシップ + 招待v2直行参加
+        getRoster,
+        joinRoomAt,
     } = useWebRTC({ signalingUrl, turnConfig });
 
     // E2E自己テストランナー (P2D_E2E_ROLE 環境変数がある起動でのみ動作)
@@ -228,6 +232,7 @@ export function RoomView({ onLeave, signalingUrl, turnConfig, e2eConfig, onOpenS
         setRemoteControlAllowed, startSystemAudio, stopSystemAudio,
         sendChatMessage, getPeerStats,
         isRelayMode, getRelayStats,
+        getRoster,
     };
     const e2eStartedRef = useRef(false);
     useEffect(() => {
@@ -303,15 +308,35 @@ export function RoomView({ onLeave, signalingUrl, turnConfig, e2eConfig, onOpenS
         // 冷却起動 (アプリが閉じた状態でURLを開いた場合) は起動引数から復元
         void (async () => {
             try {
-                const code = await invoke<string | null>('get_launch_join');
-                if (code && !isConnected) joinRoom(code).catch(() => { /* 部屋が無い等 */ });
+                const invite = await invoke<{ code: string; endpoint: string | null } | null>('get_launch_invite');
+                if (invite?.code && !isConnected) {
+                    if (invite.endpoint) {
+                        // 招待v2: ホストの内蔵サーバーへ直行 (シグナリングサーバー不使用)
+                        joinRoomAt(invite.code, `ws://${invite.endpoint}`).catch(() => { /* 部屋が無い等 */ });
+                    } else {
+                        joinRoom(invite.code).catch(() => { /* 部屋が無い等 */ });
+                    }
+                }
             } catch {
                 // ignore
             }
         })();
         // 実行中インスタンスへの2インスタンス目転送はイベントで届く
         const unlisten = listen<string>('p2d-join-url', (e) => {
-            if (e.payload && !isConnected) joinRoom(e.payload).catch(() => { /* 部屋が無い等 */ });
+            if (!e.payload || isConnected) return;
+            try {
+                // ペイロードはJSON文字列 {code, endpoint} (旧形式=素のコードにも対応)
+                const parsed = JSON.parse(e.payload) as { code?: string; endpoint?: string | null };
+                if (parsed?.code) {
+                    if (parsed.endpoint) {
+                        joinRoomAt(parsed.code, `ws://${parsed.endpoint}`).catch(() => { /* 部屋が無い等 */ });
+                    } else {
+                        joinRoom(parsed.code).catch(() => { /* 部屋が無い等 */ });
+                    }
+                }
+            } catch {
+                joinRoom(e.payload).catch(() => { /* 部屋が無い等 */ });
+            }
         });
         return () => { void unlisten.then((f) => f()); };
         // joinRoom は安定したuseCallback、isConnected は起動直後 false 固定でハンドラ内のみ参照
@@ -327,6 +352,24 @@ export function RoomView({ onLeave, signalingUrl, turnConfig, e2eConfig, onOpenS
 
     // --- QR接続 (F-012) / 接続履歴 (F-013) ---
     const [showQr, setShowQr] = useState(false);
+    // 招待v2 (M4): ホスト内蔵サーバーの住所 (LAN IP:port) をQRに埋め込む
+    const [inviteEndpoint, setInviteEndpoint] = useState<string | null>(null);
+    useEffect(() => {
+        if (!roomCode || !isConnected) {
+            setInviteEndpoint(null);
+            return;
+        }
+        let cancelled = false;
+        void (async () => {
+            try {
+                const port = await invoke<number | null>('embedded_server_status');
+                if (!port || cancelled) return;
+                const ip = await invoke<string | null>('get_local_lan_address');
+                if (!cancelled && ip) setInviteEndpoint(`${ip}:${port}`);
+            } catch { /* noop */ }
+        })();
+        return () => { cancelled = true; };
+    }, [roomCode, isConnected]);
 
     // --- リレー品質プリセット (WSリレーのホスト側設定。変更はイベントで稼働中ループへ反映) ---
     const [relayQualityKey, setRelayQualityKeyState] = useState<RelayQualityKey>(getRelayQualityKey());
@@ -429,7 +472,14 @@ export function RoomView({ onLeave, signalingUrl, turnConfig, e2eConfig, onOpenS
                                 <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.8} d="M3 9a2 2 0 012-2h.93a2 2 0 001.664-.89l.812-1.22A2 2 0 0110.07 4h3.86a2 2 0 011.664.89l.812 1.22A2 2 0 0018.07 7H19a2 2 0 012 2v9a2 2 0 01-2 2H5a2 2 0 01-2-2V9z" /><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.8} d="M15 13a3 3 0 11-6 0 3 3 0 016 0z" /></svg>
                             </button>
                             <button
-                                onClick={() => joinRoom(inputCode, displayName)}
+                                onClick={() => {
+                                    const invite = parseInvite(inputCode);
+                                    if (invite?.endpoint) {
+                                        joinRoomAt(invite.code, `ws://${invite.endpoint}`, displayName);
+                                    } else if (invite) {
+                                        joinRoom(invite.code, displayName);
+                                    }
+                                }}
                                 className="btn-secondary px-6"
                                 disabled={!inputCode.trim() || !displayName.trim()}
                             >
@@ -950,7 +1000,7 @@ export function RoomView({ onLeave, signalingUrl, turnConfig, e2eConfig, onOpenS
 
             {/* QR Share (F-012) */}
             {showQr && roomCode && (
-                <QrModal roomCode={roomCode} onClose={() => setShowQr(false)} />
+                <QrModal roomCode={roomCode} inviteEndpoint={inviteEndpoint} onClose={() => setShowQr(false)} />
             )}
             {showQrScan && (
                 <QrScannerModal

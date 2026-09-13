@@ -16,6 +16,8 @@ export type MessageType =
     | 'peer:offer'
     | 'peer:answer'
     | 'peer:ice'
+    // DC中継シグナリング (レンデブー最小化M2): サーバー死亡時にピア経由でSDP/ICEを届ける封筒
+    | 'peer:tunnel'
     | 'error'
     // WSリレー (WebRTC非対応エンジン向けフォールバック経路)
     | 'relay:frame'
@@ -39,6 +41,17 @@ export interface ParticipantInfo {
     id: string;
     name?: string;
     joinedAt: number;
+    // ホスト内蔵サーバーの住所 (電話帳が配布する、M2以降)
+    hostEndpoint?: string;
+}
+
+// DC中継シグナリングの封筒 (src/lib/signalRouter.ts と同期)
+export interface TunnelEnvelope {
+    originalSender: string;
+    kind: 'offer' | 'answer' | 'ice';
+    targetId: string;
+    payload: unknown;
+    hops: number;
 }
 
 // シグナリングクライアントのイベント
@@ -47,12 +60,14 @@ export interface SignalingEvents {
     onDisconnected: () => void;
     onRoomCreated: (roomCode: string, roomId: string) => void;
     // 更新: peersリストではなくParticipantInfo[]を受け取る
-    onRoomJoined: (roomId: string, roomCode: string, myId: string, participants: ParticipantInfo[]) => void;
+    onRoomJoined: (roomId: string, roomCode: string, myId: string, participants: ParticipantInfo[], hostEndpoint?: string | null) => void;
     onPeerJoined: (peerId: string, peerName?: string) => void;
     onPeerLeft: (peerId: string) => void;
     onOffer: (senderId: string, sdp: RTCSessionDescriptionInit) => void;
     onAnswer: (senderId: string, sdp: RTCSessionDescriptionInit) => void;
     onIceCandidate: (senderId: string, candidate: RTCIceCandidateInit) => void;
+    // peer:tunnel 受信 (senderId=転送者, payload=封筒 {originalSender, kind, targetId, payload, hops})
+    onTunneledMessage?: (senderId: string, envelope: TunnelEnvelope) => void;
     onError: (code: string, message: string) => void;
     // WSリレー: relay:* をすべて1つのハンドラへ集約 (type は 'relay:' を除去したもの)
     onRelayMessage?: (senderId: string, type: string, payload: unknown) => void;
@@ -64,6 +79,8 @@ export class SignalingClient {
     private reconnectAttempts = 0;
     private maxReconnectAttempts = 10;
     private reconnectDelay = 1000;
+    // 移行 (内蔵サーバーへの切替) 時に古いクライアントの再接続を止めるためのフラグ
+    private disposed = false;
 
     constructor(private serverUrl: string) { }
 
@@ -125,6 +142,14 @@ export class SignalingClient {
     }
 
     /**
+     * 切断 + 再接続ループの停止 (サーバー移行時に旧クライアントを捨てる)
+     */
+    dispose(): void {
+        this.disposed = true;
+        this.disconnect();
+    }
+
+    /**
      * メッセージをハンドル
      */
     private handleMessage(message: SignalingMessage): void {
@@ -146,9 +171,9 @@ export class SignalingClient {
             }
 
             case 'room:joined': {
-                const payload = message.payload as { roomId: string; roomCode: string; myId: string; participants: ParticipantInfo[] };
+                const payload = message.payload as { roomId: string; roomCode: string; myId: string; participants: ParticipantInfo[]; hostEndpoint?: string };
                 if (payload.roomId) { // 空でない場合のみ
-                    this.events.onRoomJoined?.(payload.roomId, payload.roomCode, payload.myId, payload.participants);
+                    this.events.onRoomJoined?.(payload.roomId, payload.roomCode, payload.myId, payload.participants, payload.hostEndpoint);
                 }
                 break;
             }
@@ -184,6 +209,14 @@ export class SignalingClient {
                 break;
             }
 
+            case 'peer:tunnel': {
+                const envelope = message.payload as TunnelEnvelope;
+                if (envelope && typeof envelope.originalSender === 'string') {
+                    this.events.onTunneledMessage?.(message.senderId || '', envelope);
+                }
+                break;
+            }
+
             case 'error': {
                 const payload = message.payload as { code: string; message: string };
                 this.events.onError?.(payload.code, payload.message);
@@ -206,12 +239,12 @@ export class SignalingClient {
     }
 
     /**
-     * ルームを作成
+     * ルームを作成 (レンデブー最小化 M2: ローカル生成コードと内蔵サーバー住所を電話帳へ登録)
      */
-    createRoom(name?: string): void {
+    createRoom(name?: string, roomCode?: string, hostEndpoint?: string): void {
         this.send({
             type: 'room:create',
-            payload: { name },
+            payload: { name, roomCode, hostEndpoint },
         });
     }
 
@@ -242,6 +275,17 @@ export class SignalingClient {
             type: `relay:${type}` as MessageType,
             targetId,
             payload,
+        });
+    }
+
+    /**
+     * DC中継シグナリングの封筒を宛先ピアへ転送依頼する (M2)
+     */
+    sendTunnel(targetId: string, envelope: TunnelEnvelope): void {
+        this.send({
+            type: 'peer:tunnel',
+            targetId,
+            payload: envelope,
         });
     }
 
@@ -282,6 +326,7 @@ export class SignalingClient {
      * 再接続を試行
      */
     private attemptReconnect(): void {
+        if (this.disposed) return;
         if (this.reconnectAttempts >= this.maxReconnectAttempts) {
             console.log('[Signaling] 再接続上限に達しました');
             return;

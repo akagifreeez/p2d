@@ -54,17 +54,22 @@ pub fn run() {
         builder
     } else {
         // single-instance は最初に登録する必要がある (2インスタンス目の起動をここで受け、
-        // p2d://join/CODE を実行中インスタンスへ転送する — F-051)
+        // p2d://join/CODE[@host:port] を実行中インスタンスへ転送する — F-051 / M4)
         builder.plugin(tauri_plugin_single_instance::init(|app, args, _cwd| {
-            if let Some(code) = bridge::discord::find_join_url(args) {
+            if let Some(invite) = bridge::discord::find_join_url(args) {
                 {
                     let state = app.state::<bridge::discord::JoinCodeState>();
                     if let Ok(mut g) = state.0.lock() {
-                        *g = Some(code.clone());
+                        *g = Some(invite.clone());
                     };
                 }
                 use tauri::Emitter;
-                let _ = app.emit("p2d-join-url", code);
+                // ペイロードはJSON文字列 {code, endpoint} (旧クライアント形式=素のコードにも対応)
+                let payload = serde_json::json!({
+                    "code": invite.code,
+                    "endpoint": invite.endpoint,
+                });
+                let _ = app.emit("p2d-join-url", payload.to_string());
             }
         }))
     };
@@ -98,8 +103,14 @@ pub fn run() {
             // Bridge: Discord Rich Presence (F-050/F-051)
             bridge::discord::get_discord_config,
             bridge::discord::get_launch_join,
+            bridge::discord::get_launch_invite,
             bridge::discord::discord_set_presence,
             bridge::discord::discord_clear_presence,
+            // レンデブー最小化 (M2/M3/M4): ホスト内蔵サーバー + LAN住所
+            services::embedded_server::embedded_server_start,
+            services::embedded_server::embedded_server_stop,
+            services::embedded_server::embedded_server_status,
+            services::embedded_server::get_local_lan_address,
         ])
         .setup(|app| {
             // クリップボード状態の初期化
@@ -117,7 +128,12 @@ pub fn run() {
                 Mutex::new(Some(services::discord::start_worker(app.handle().clone()))),
             ));
 
-            // ディープリンク (p2d://join/CODE) の処理 (F-051)
+            // ホスト内蔵シグナリング/リレーWSサーバー (レンデブー最小化 M2/M3)
+            app.manage(services::embedded_server::EmbeddedServerState(
+                Mutex::new(None),
+            ));
+
+            // ディープリンク (p2d://join/CODE[@host:port]) の処理 (F-051 / M4)
             // プロトコルハンドラ登録 (Windows: HKCU\Software\Classes\p2d)。失敗しても致命傷にしない。
             app.manage(bridge::discord::JoinCodeState(Mutex::new(
                 bridge::discord::find_join_url(env::args()),

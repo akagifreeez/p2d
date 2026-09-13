@@ -50,14 +50,25 @@ export class RoomManager {
      * 戻り値の oldRoom は退室後の移動元ルーム (呼び出し元が peer:left を通知するのに使う。
      * 空になって削除された場合は null)
      */
-    createRoom(creatorId: string, creatorName?: string): { room: Room; oldRoom: Room | null } {
+    createRoom(
+        creatorId: string,
+        creatorName?: string,
+        requestedCode?: string,
+        hostEndpoint?: string,
+    ): { room: Room; oldRoom: Room | null } {
         const oldRoom = this.removeFromCurrentRoom(creatorId).room;
 
-        // 一意なルームコードを生成
+        // ルームコード: 指定があればそれを使う (レンデブー最小化 M2/M4:
+        // ホストがローカル生成したコードとサーバー登録を一致させる)。
+        // 指定コードが既に使われていた場合は新規生成にフォールバック
         let code: string;
-        do {
-            code = generateRoomCode();
-        } while (this.codeToId.has(code));
+        if (requestedCode && /^[A-Z0-9]{4,8}$/.test(requestedCode) && !this.codeToId.has(requestedCode)) {
+            code = requestedCode;
+        } else {
+            do {
+                code = generateRoomCode();
+            } while (this.codeToId.has(code));
+        }
 
         const roomId = crypto.randomUUID();
 
@@ -73,6 +84,7 @@ export class RoomManager {
             code,
             participants: new Map([[creatorId, creator]]),
             createdAt: Date.now(),
+            hostEndpoint,
         };
 
         this.rooms.set(roomId, room);

@@ -9,22 +9,25 @@
 import { useEffect, useRef, useState } from 'react';
 import QRCode from 'qrcode';
 import jsQR from 'jsqr';
+import { buildInvite } from '../lib/invite';
 
-export function QrModal({ roomCode, onClose }: { roomCode: string; onClose: () => void }) {
+export function QrModal({ roomCode, inviteEndpoint, onClose }: { roomCode: string; inviteEndpoint?: string | null; onClose: () => void }) {
     const [dataUrl, setDataUrl] = useState('');
     const [copied, setCopied] = useState('');
 
-    const inviteText = `P2Dで画面共有に招待します!\n参加リンク: p2d://join/${roomCode}\n(P2Dインストール済みならクリックで自動参加 / コード: ${roomCode})`;
+    // 招待v2: 内蔵サーバーが動いている場合は住所を埋め込む (サーバーレス参加, M4)
+    const invitePayload = buildInvite(roomCode, inviteEndpoint);
+    const inviteText = `P2Dで画面共有に招待します!\n参加リンク: ${invitePayload}\n(P2Dインストール済みならクリックで自動参加 / コード: ${roomCode})`;
 
     useEffect(() => {
-        QRCode.toDataURL(`p2d://join/${roomCode}`, {
+        QRCode.toDataURL(invitePayload, {
             width: 280,
             margin: 2,
             color: { dark: '#0f172a', light: '#ffffff' },
         })
             .then(setDataUrl)
             .catch(() => setDataUrl(''));
-    }, [roomCode]);
+    }, [invitePayload]);
 
     const copyText = (text: string, key: string) => {
         void navigator.clipboard.writeText(text).then(() => {
@@ -47,8 +50,11 @@ export function QrModal({ roomCode, onClose }: { roomCode: string; onClose: () =
                 )}
                 <div className="mt-5 text-2xl font-mono font-bold tracking-[0.3em] text-[var(--md-primary)]">{roomCode}</div>
                 <p className="text-xs text-[var(--md-on-surface-variant)] mt-2">
-                    カメラで読み取ると <span className="font-mono">p2d://join/{roomCode}</span> が開き、P2Dが自動参加します。
+                    カメラで読み取ると <span className="font-mono">{invitePayload}</span> が開き、P2Dが自動参加します。
                     読めない場合は上のコードを手入力してください。
+                    {inviteEndpoint && (
+                        <>住所埋め込み (招待v2) のため、シグナリングサーバーが無くてもLANで参加できます。</>
+                    )}
                 </p>
                 <div className="grid grid-cols-1 gap-2 mt-4">
                     <button
@@ -106,7 +112,12 @@ export function QrScannerModal({ onScan, onClose }: { onScan: (code: string) => 
                         const img = ctx.getImageData(0, 0, canvas.width, canvas.height);
                         const found = jsQR(img.data, img.width, img.height);
                         if (found?.data) {
-                            // p2d://join/CODE 形式でも素のコードでも受け付ける
+                            // p2d://join/CODE / p2d://join/CODE@host:port / 素のコードを受け付ける
+                            const v2 = /p2d:\/\/join\/([A-Za-z0-9]{4,8})@([A-Za-z0-9.\-]+:[0-9]+)/.exec(found.data);
+                            if (v2) {
+                                onScan(`p2d://join/${v2[1]}@${v2[2]}`);
+                                return;
+                            }
                             const m = /p2d:\/\/join\/([A-Za-z0-9]{4,8})/.exec(found.data);
                             const raw = m ? m[1] : found.data.trim();
                             if (/^[A-Za-z0-9]{4,8}$/.test(raw)) {

@@ -9,7 +9,7 @@
 // 「参加」した際の ACTIVITY_JOIN イベントを受け取って p2d-join-url として
 // フロントエンドへ転送する (ディープリンクと同じ経路で参加する)。
 
-use crate::bridge::discord::JoinCodeState;
+use crate::bridge::discord::{JoinCodeState, JoinInvite};
 use discord_sdk::activity::{ActivityBuilder, PartyPrivacy, Secrets};
 use discord_sdk::{Discord, DiscordApp, DiscordHandler, DiscordMsg, Event, Subscriptions};
 use std::num::NonZeroU32;
@@ -65,7 +65,7 @@ impl DiscordHandler for JoinHandler {
         use tauri::Manager;
         if let Some(state) = self.app.try_state::<JoinCodeState>() {
             if let Ok(mut g) = state.0.lock() {
-                *g = Some(secret.clone());
+                *g = Some(JoinInvite { code: secret.clone(), endpoint: None });
             }
         }
         use tauri::Emitter;

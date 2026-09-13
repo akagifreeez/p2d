@@ -92,6 +92,10 @@ function handleMessage(clientId: string, message: SignalingMessage): void {
             handleRoomCreate(clientId, ws, message as RoomCreateMessage);
             break;
 
+        case 'peer:tunnel':
+            handleTunnelForward(clientId, message);
+            break;
+
         case 'room:join':
             handleRoomJoin(clientId, ws, message as RoomJoinMessage);
             break;
@@ -164,7 +168,9 @@ function canForward(senderId: string, targetId: string): boolean {
  */
 function handleRoomCreate(clientId: string, ws: WebSocket, message: RoomCreateMessage): void {
     const name = message.payload?.name;
-    const { room, oldRoom } = roomManager.createRoom(clientId, name);
+    const { room, oldRoom } = roomManager.createRoom(
+        clientId, name, message.payload?.roomCode, message.payload?.hostEndpoint,
+    );
     notifyOldRoomLeft(oldRoom, clientId);
 
     sendMessage(ws, {
@@ -175,6 +181,7 @@ function handleRoomCreate(clientId: string, ws: WebSocket, message: RoomCreateMe
         payload: {
             roomCode: room.code,
             roomId: room.id,
+            hostEndpoint: room.hostEndpoint,
         },
     });
 
@@ -236,6 +243,7 @@ function handleRoomJoin(clientId: string, ws: WebSocket, message: RoomJoinMessag
             roomCode: room.code,
             myId: clientId,
             participants: participants,
+            hostEndpoint: room.hostEndpoint,
         },
     });
 
@@ -334,6 +342,26 @@ function handleIceCandidate(clientId: string, message: IceCandidateMessage): voi
         // console.error(`[Server] ICE: targetIdがありません`);
         return;
     }
+    if (!canForward(clientId, targetId)) return;
+
+    const targetWs = clients.get(targetId);
+    if (targetWs) {
+        sendMessage(targetWs, {
+            ...message,
+            senderId: clientId,
+            timestamp: Date.now(),
+        });
+    }
+}
+
+/**
+ * DC中継シグナリング転送ハンドラ (レンデブー最小化 M2)
+ * 転送者と宛先の同一ルーム所属のみ検証する (中身はクライアント間の封筒)。
+ * サーバー死亡後にピア経由でSDP/ICEを届けるための最小限の電話帳機能。
+ */
+function handleTunnelForward(clientId: string, message: SignalingMessage): void {
+    const targetId = message.targetId;
+    if (!targetId) return;
     if (!canForward(clientId, targetId)) return;
 
     const targetWs = clients.get(targetId);

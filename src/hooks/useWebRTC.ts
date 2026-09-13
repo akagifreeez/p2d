@@ -19,9 +19,27 @@ import {
     RELAY_MSE_VIDEO_MIME, RELAY_MSE_AUDIO_MIME, RELAY_AUDIO_REC_MIME,
 } from '../lib/relayEncoder';
 import { getRelayQualityPreset, RELAY_QUALITY_CHANGED_EVENT } from '../lib/relayQuality';
+import {
+    initRoster, mergeRosters, mergeEntry, applyDepart, rosterEntries, shouldInitiateTo,
+    type RosterState, type RosterEntry,
+} from '../lib/roster';
+import {
+    chooseSignalRoute, makeEnvelope, forwardEnvelope,
+    type TunnelEnvelope, type SignalKind,
+} from '../lib/signalRouter';
+import { generateRelayKeyPair, signChunk, verifyChunk, chunkDataFromB64, type RelayKeyPair } from '../lib/relaySign';
 
 // WebRTC APIの有無 (Ubuntu等のWebKitGTKはWebRTC無効ビルドで RTCPeerConnection が存在しない)
 export const SUPPORTS_WEBRTC = typeof RTCPeerConnection !== 'undefined';
+
+// 中央サーバーと同じ文字集合の6桁ルームコード (レンデブー最小化M2/M4:
+// ホストがローカル生成し、電話帳登録と内蔵サーバーの両方で同じコードを使う)
+function genLocalRoomCode(): string {
+    const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+    let code = '';
+    for (let i = 0; i < 6; i++) code += chars.charAt(Math.floor(Math.random() * chars.length));
+    return code;
+}
 
 // WSリレー視聴者の能力 (subscribe時に申告)
 interface RelayViewerCaps {
@@ -111,6 +129,8 @@ export interface UseWebRTCReturn {
     // 接続操作
     createRoom: (name?: string) => Promise<void>;
     joinRoom: (roomCode: string, name?: string) => Promise<void>;
+    /** 指定サーバーURLで参加する (M4: 招待v2 p2d://join/CODE@host:port) */
+    joinRoomAt: (roomCode: string, wsUrl: string, name?: string) => Promise<void>;
     leaveRoom: () => void;
 
     // 状態
@@ -119,6 +139,8 @@ export interface UseWebRTCReturn {
     error: string | null;
     clearError: () => void;
     participants: Map<string, ParticipantInfo>;
+    /** M1: 名簿ゴシップの現在のエントリ一覧 (収束検証用) */
+    getRoster: () => { id: string; name?: string; joinedAt: number; hostEndpoint?: string }[];
     myId: string | null;
 
     // 画面共有
@@ -142,6 +164,7 @@ export interface UseWebRTCReturn {
     getRelayStats: () => {
         frames: number; bytes: number; lastFrameAt: number; h264Chunks: number; audioChunks: number;
         subscribers: number; mseSubscribers: number; audioSubscribers: number;
+        sigVerified: number; sigInvalid: number;
     };
 
     // マイク
@@ -271,6 +294,27 @@ export function useWebRTC(options?: { signalingUrl?: string; turnConfig?: TurnCo
     // ICE restartのグレア対策 (offerを送る側を決める) に使う自分のID
     const myIdRef = useRef<string | null>(null);
 
+    // === レンデブー最小化 (M1〜M4) ===
+    // M1: 名簿ゴシップ (全員が同一名簿を持つ・決定論的union合流)
+    const rosterRef = useRef<RosterState>(initRoster());
+    const selfJoinedAtRef = useRef<number>(0);
+    const rosterThrottleRef = useRef(0);
+    // DCで届くゴシップ/トンネル系メッセージの振り分け (後段で毎レンダー差し替え)
+    const dcDispatchRef = useRef<(type: string, payload: unknown, fromPeer: string) => void>(() => { });
+    // signalingハンドラ束ね配線 (後段で毎レンダー差し替え)
+    const wireSignalingRef = useRef<(signaling: SignalingClient) => void>(() => { });
+    const switchSignalingRef = useRef<(url: string) => Promise<void>>(async () => { });
+    // M2: ホスト内蔵サーバー (ポート/電話帳で学んだendpoint/移行済みフラグ/ホストフラグ)
+    const embeddedPortRef = useRef<number | null>(null);
+    const hostEndpointRef = useRef<string | null>(null);
+    const isHostRef = useRef(false);
+    const migratedRef = useRef(false);
+    // M3: リレーチャンク署名 (ホスト=鍵ペア+署名 / ゲスト=公開鍵+検証)
+    const relayKeysRef = useRef<RelayKeyPair | null>(null);
+    const relayPubKeyRef = useRef<string | null>(null);
+    const relayChunkSeqRef = useRef(0);
+    const lanIpRef = useRef<string | null>(null);
+
     // === WSリレーモード (LinuxのWebKitGTK等 WebRTC非対応エンジン向けフォールバック) ===
     const relayModeRef = useRef<boolean>(!SUPPORTS_WEBRTC);
     const [isRelayMode] = useState<boolean>(!SUPPORTS_WEBRTC);
@@ -280,7 +324,7 @@ export function useWebRTC(options?: { signalingUrl?: string; turnConfig?: TurnCo
     const relayLoopRef = useRef<number | null>(null);
     const relayFrameSeqRef = useRef(0);
     const [relayFrame, setRelayFrame] = useState<string | null>(null);
-    const relayStatsRef = useRef({ frames: 0, bytes: 0, lastFrameAt: 0, h264Chunks: 0, audioChunks: 0 });
+    const relayStatsRef = useRef({ frames: 0, bytes: 0, lastFrameAt: 0, h264Chunks: 0, audioChunks: 0, sigVerified: 0, sigInvalid: 0 });
     const relayLastRenderRef = useRef(0);
     // H264/MSE品質モード
     const relayCapsRef = useRef<Map<string, RelayViewerCaps>>(new Map()); // peerId -> caps
@@ -339,6 +383,17 @@ export function useWebRTC(options?: { signalingUrl?: string; turnConfig?: TurnCo
             dataChannelsRef.current.set(peerId, channel);
             // 自分がホスト側の場合、リモート操作の許可状態を即通知
             channel.send(JSON.stringify({ type: 'control:remote_allowed', payload: { allowed: remoteControlAllowedRef.current }, timestamp: Date.now() }));
+            // M1: 名簿ゴシップ — 開通したDCへ自分の知る名簿をすべて渡す
+            try {
+                channel.send(JSON.stringify({
+                    type: 'roster:sync',
+                    payload: {
+                        entries: rosterEntries(rosterRef.current),
+                        tombstones: [...rosterRef.current.tombstones.values()],
+                    },
+                    timestamp: Date.now(),
+                }));
+            } catch { /* DC死んでいたら無視 */ }
             if (connectionState !== 'peer-connected' && peerConnectionsRef.current.size > 0) {
                 setConnectionState('peer-connected');
             }
@@ -373,6 +428,9 @@ export function useWebRTC(options?: { signalingUrl?: string; turnConfig?: TurnCo
                     if (remoteControlAllowedRef.current) {
                         void applyInputEvent(data.type, data.payload);
                     }
+                } else if (data.type === 'roster:sync' || data.type === 'roster:depart' || data.type === 'tunnel:sig') {
+                    // レンデブー最小化 (M1/M2): 名簿ゴシップ + DC中継シグナリング
+                    dcDispatchRef.current(data.type, data.payload, peerId);
                 }
                 // 他のメッセージタイプ（controlなど）は必要に応じて追加
             } catch (e) {
@@ -488,8 +546,16 @@ export function useWebRTC(options?: { signalingUrl?: string; turnConfig?: TurnCo
                         onBox: (buf) => {
                             const d = arrayBufferToBase64(buf);
                             relayStatsRef.current.h264Chunks++;
+                            // M3: チャンク毎に一意なseq + Ed25519署名 (改ざん/偽装/リプレイ対策)
+                            relayChunkSeqRef.current++;
+                            const seq = relayChunkSeqRef.current;
+                            const ts = Date.now();
+                            const keys = relayKeysRef.current;
+                            const sig = keys ? signChunk(keys.secretKeyB64, seq, ts, chunkDataFromB64(d)) : undefined;
                             for (const peerId of mseSubs) {
-                                signalingRef.current?.sendRelay(peerId, 'h264', { seq: relayFrameSeqRef.current, d });
+                                signalingRef.current?.sendRelay(peerId, 'h264', sig
+                                    ? { seq, ts, d, sig }
+                                    : { seq, d });
                             }
                         },
                         onError: (e) => console.error('[Relay] H264 encoder error:', (e as Error)?.message || e),
@@ -504,8 +570,15 @@ export function useWebRTC(options?: { signalingUrl?: string; turnConfig?: TurnCo
                 const b64 = dataUrl.slice(dataUrl.indexOf(',') + 1);
                 relayFrameSeqRef.current++;
                 relayStatsRef.current.frames++;
+                // M3: フレームにも署名
+                const frameSeq = relayFrameSeqRef.current;
+                const frameTs = Date.now();
+                const frameKeys = relayKeysRef.current;
+                const frameSig = frameKeys ? signChunk(frameKeys.secretKeyB64, frameSeq, frameTs, chunkDataFromB64(b64)) : undefined;
                 for (const peerId of jpegSubs) {
-                    signalingRef.current?.sendRelay(peerId, 'frame', { seq: relayFrameSeqRef.current, w, h, d: b64 });
+                    signalingRef.current?.sendRelay(peerId, 'frame', frameSig
+                        ? { seq: frameSeq, ts: frameTs, w, h, d: b64, sig: frameSig }
+                        : { seq: frameSeq, w, h, d: b64 });
                 }
             }
         }, intervalMs);
@@ -569,7 +642,17 @@ export function useWebRTC(options?: { signalingUrl?: string; turnConfig?: TurnCo
                 void e.data.arrayBuffer().then(buf => {
                     const d = arrayBufferToBase64(buf);
                     for (const [peerId, c] of relayCapsRef.current) {
-                        if (c.webmAudio) signalingRef.current?.sendRelay(peerId, 'audio', { d });
+                        if (c.webmAudio) {
+                            // M3: 音声チャンクにも署名
+                            relayChunkSeqRef.current++;
+                            const aSeq = relayChunkSeqRef.current;
+                            const aTs = Date.now();
+                            const aKeys = relayKeysRef.current;
+                            const aSig = aKeys ? signChunk(aKeys.secretKeyB64, aSeq, aTs, chunkDataFromB64(d)) : undefined;
+                            signalingRef.current?.sendRelay(peerId, 'audio', aSig
+                                ? { seq: aSeq, ts: aTs, d, sig: aSig }
+                                : { seq: aSeq, d });
+                        }
                     }
                 });
             };
@@ -905,29 +988,273 @@ export function useWebRTC(options?: { signalingUrl?: string; turnConfig?: TurnCo
         return pc;
     }, [iceServers, setupDataChannel, enqueueSdpOp]);
 
+    // === レンデブー最小化 (M1〜M2): DC中継シグナリング + 名簿ゴシップ + 内蔵サーバー移行 ===
+
+    /** 名簿スナップショットを全DCへ送る (ゴシップ再送は1秒に throttle) */
+    const broadcastRosterSync = () => {
+        const now = Date.now();
+        if (now - rosterThrottleRef.current < 1000) return;
+        rosterThrottleRef.current = now;
+        broadcastData('roster:sync', {
+            entries: rosterEntries(rosterRef.current),
+            tombstones: [...rosterRef.current.tombstones.values()],
+        });
+    };
+
     /**
-     * シグナリング初期化
+     * リレーチャンクの署名検証 (M3)。公開鍵を受信済みなら無署名/不正署名の
+     * チャンクは破棄する。鍵が届く前の初期チャンクは通す (WS順序で鍵が先行するのが正常系)。
      */
-    const connect = useCallback(async () => {
-        if (signalingRef.current) return;
+    const verifyRelayChunk = (p: Record<string, unknown>): boolean => {
+        const pub = relayPubKeyRef.current;
+        const sig = typeof p.sig === 'string' ? p.sig : null;
+        if (!sig) {
+            if (pub) {
+                relayStatsRef.current.sigInvalid++;
+                console.warn('[Relay] 鍵配布済みなのに無署名チャンク — 破棄');
+                return false;
+            }
+            return true;
+        }
+        const ok = verifyChunk(pub!, Number(p.seq) || 0, Number(p.ts) || 0, chunkDataFromB64(String(p.d || '')), sig);
+        if (!ok) {
+            relayStatsRef.current.sigInvalid++;
+            console.warn('[Relay] 署名検証失敗 — チャンクを破棄 (改ざん/偽装の可能性)');
+            return false;
+        }
+        relayStatsRef.current.sigVerified++;
+        return true;
+    };
 
-        setConnectionState('connecting');
-        const signaling = new SignalingClient(targetSignalingUrl);
-        signalingRef.current = signaling;
+    /**
+     * 送信経路の選択 (M2)。WSが生きていれば従来通りサーバーへ、
+     * 死んでいればDataChannel (直結 or 中継1ホップ) で届ける。
+     */
+    const sendSig = (targetId: string, kind: SignalKind, payload: unknown) => {
+        const signaling = signalingRef.current;
+        if (signaling?.isConnected) {
+            if (kind === 'offer') signaling.sendOffer(targetId, payload as RTCSessionDescriptionInit);
+            else if (kind === 'answer') signaling.sendAnswer(targetId, payload as RTCSessionDescriptionInit);
+            else signaling.sendIceCandidate(targetId, payload as RTCIceCandidateInit);
+            return;
+        }
+        const myId = myIdRef.current || '';
+        const directDc = dataChannelsRef.current.get(targetId);
+        const hasDirect = !!directDc && directDc.readyState === 'open';
+        const candidates = [...dataChannelsRef.current.entries()]
+            .filter(([, dc]) => dc.readyState === 'open')
+            .map(([id]) => id);
+        const route = chooseSignalRoute(targetId, {
+            wsOpen: false, myId, hasDirectDc: hasDirect, relayCandidates: candidates,
+        });
+        const envelope = makeEnvelope(myId, kind, targetId, payload);
+        if (route.via === 'dc-direct' && directDc) {
+            directDc.send(JSON.stringify({ type: 'tunnel:sig', payload: envelope, timestamp: Date.now() }));
+            console.log(`[Tunnel] ${kind}を直接DC送信: ${targetId}`);
+        } else if (route.via === 'dc-relay' && route.relayPeer) {
+            const relayDc = dataChannelsRef.current.get(route.relayPeer);
+            if (relayDc) {
+                relayDc.send(JSON.stringify({ type: 'tunnel:sig', payload: envelope, timestamp: Date.now() }));
+                console.log(`[Tunnel] ${kind}を${route.relayPeer}経由で中継: ${targetId}`);
+            }
+        } else {
+            console.warn(`[Tunnel] ${kind}の送信経路なし: ${targetId}`);
+        }
+    };
 
+    const handleIncomingOffer = (senderId: string, sdp: RTCSessionDescriptionInit) => {
+        if (relayModeRef.current) return; // リレーモードではWebRTC経路を使わない
+        // 監査#1: 参加者リスト外のpeerからのOfferは破棄 (サーバー側検証の二重化)
+        if (!participantsRef.current.has(senderId)) {
+            console.warn(`[WebRTC] 参加者リスト外のOfferを破棄: ${senderId}`);
+            return;
+        }
+        const pc = createPeerConnection(senderId, false); // PC取得または作成(受信側)
+        return enqueueSdpOp(pc, async () => {
+            try {
+                if (pc.signalingState !== 'stable') {
+                    await Promise.all([
+                        pc.setLocalDescription({ type: 'rollback' }),
+                        pc.setRemoteDescription(new RTCSessionDescription(sdp))
+                    ]);
+                } else {
+                    await pc.setRemoteDescription(new RTCSessionDescription(sdp));
+                }
+                const answer = await pc.createAnswer();
+                await pc.setLocalDescription(answer);
+                sendSig(senderId, 'answer', answer);
+            } catch (e) {
+                console.error('[WebRTC] Offer処理失敗:', (e as Error)?.message || String(e));
+            }
+        });
+    };
+
+    const handleIncomingAnswer = (senderId: string, sdp: RTCSessionDescriptionInit) => {
+        if (relayModeRef.current) return;
+        // 監査#1: 参加者リスト外のpeerからのAnswerは破棄
+        if (!participantsRef.current.has(senderId)) {
+            console.warn(`[WebRTC] 参加者リスト外のAnswerを破棄: ${senderId}`);
+            return;
+        }
+        const pc = peerConnectionsRef.current.get(senderId);
+        if (!pc) return;
+        return enqueueSdpOp(pc, async () => {
+            try {
+                await pc.setRemoteDescription(new RTCSessionDescription(sdp));
+            } catch (e) {
+                console.error('[WebRTC] Answer処理失敗:', (e as Error)?.message || String(e));
+            }
+        });
+    };
+
+    const handleIncomingIce = (senderId: string, candidate: RTCIceCandidateInit) => {
+        // 監査#1: 参加者リスト外のpeerからのICE候補は破棄
+        if (!participantsRef.current.has(senderId)) return;
+        const pc = peerConnectionsRef.current.get(senderId);
+        if (pc) {
+            void pc.addIceCandidate(new RTCIceCandidate(candidate)).catch(() => { /* no-op */ });
+        }
+    };
+
+    /**
+     * tunnel:sig 封筒の処理 (M2)。宛先が自分なら着信処理、
+     * 違えば自分のWS/DCで次ホップへ転送する (伝言板)。
+     */
+    const handleTunnelEnvelope = (envelope: TunnelEnvelope) => {
+        if (!envelope || typeof envelope.targetId !== 'string') return;
+        const myId = myIdRef.current || '';
+        if (envelope.targetId === myId) {
+            if (envelope.kind === 'offer') handleIncomingOffer(envelope.originalSender, envelope.payload as RTCSessionDescriptionInit);
+            else if (envelope.kind === 'answer') handleIncomingAnswer(envelope.originalSender, envelope.payload as RTCSessionDescriptionInit);
+            else if (envelope.kind === 'ice') handleIncomingIce(envelope.originalSender, envelope.payload as RTCIceCandidateInit);
+            return;
+        }
+        const fwd = forwardEnvelope(envelope);
+        if (!fwd) {
+            console.warn(`[Tunnel] ホップ切れ: ${envelope.originalSender} -> ${envelope.targetId}`);
+            return;
+        }
+        const signaling = signalingRef.current;
+        if (signaling?.isConnected) {
+            signaling.sendTunnel(envelope.targetId, fwd);
+            return;
+        }
+        const relayDc = dataChannelsRef.current.get(fwd.targetId);
+        if (relayDc?.readyState === 'open') {
+            relayDc.send(JSON.stringify({ type: 'tunnel:sig', payload: fwd, timestamp: Date.now() }));
+            return;
+        }
+        const candidates = [...dataChannelsRef.current.entries()]
+            .filter(([id, dc]) => dc.readyState === 'open' && id !== myId && id !== fwd.targetId)
+            .map(([id]) => id)
+            .sort();
+        if (candidates.length > 0) {
+            const dc = dataChannelsRef.current.get(candidates[0]);
+            dc?.send(JSON.stringify({ type: 'tunnel:sig', payload: fwd, timestamp: Date.now() }));
+        } else {
+            console.warn(`[Tunnel] 転送経路なし: ${fwd.originalSender} -> ${fwd.targetId}`);
+        }
+    };
+
+    // DCで届くゴシップ/トンネル系メッセージの振り分け (setupDataChannelから参照。
+    // 毎レンダーで最新クロージャを差し替える — e2eDepsRefと同じパターン)
+    dcDispatchRef.current = (type: string, payload: unknown, _fromPeer: string) => {
+        if (type === 'roster:sync') {
+            const p = (payload || {}) as { entries?: RosterEntry[]; tombstones?: { id: string; departedAt: number }[] };
+            const theirs = initRoster();
+            (p.entries || []).forEach(e => mergeEntry(theirs, e as RosterEntry));
+            (p.tombstones || []).forEach(t => applyDepart(theirs, t.id, t.departedAt));
+            rosterRef.current = mergeRosters(rosterRef.current, theirs);
+            // サーバーが死んでいる場合のみ、ゴシップで発見した未知ピアへ自分から接続する
+            // (生きている間はサーバーのfanout+ID規約で接続するため二重接続を避ける)
+            const serverDown = !signalingRef.current?.isConnected;
+            if (serverDown && !relayModeRef.current && myIdRef.current) {
+                for (const e of rosterEntries(rosterRef.current)) {
+                    if (e.id === myIdRef.current) continue;
+                    if (peerConnectionsRef.current.has(e.id)) continue;
+                    if (dataChannelsRef.current.has(e.id)) continue;
+                    if (shouldInitiateTo(myIdRef.current, e.id)) {
+                        console.log(`[Roster] ゴシップで未知ピアを発見 → 接続開始: ${e.id}`);
+                        createPeerConnection(e.id, true);
+                    }
+                }
+            }
+            broadcastRosterSync();
+            return;
+        }
+        if (type === 'roster:depart') {
+            const p = (payload || {}) as { peerId?: string; departedAt?: number };
+            if (p.peerId) {
+                applyDepart(rosterRef.current, p.peerId, p.departedAt || Date.now());
+                broadcastRosterSync();
+            }
+            return;
+        }
+        if (type === 'tunnel:sig') {
+            handleTunnelEnvelope(payload as TunnelEnvelope);
+            return;
+        }
+    };
+
+    /**
+     * 中央サーバー死亡からの移行 (M2)。ホストは自分の内蔵サーバーへ、
+     * ゲストは電話帳で学んだホストendpointへ再参加する。4秒待って中央が
+     * 戻らなければ発動 (一時的な瞬断を移行で潰さない)。
+     */
+    const scheduleEmbeddedMigration = () => {
+        if (migratedRef.current) return;
+        window.setTimeout(() => {
+            if (signalingRef.current?.isConnected) return;
+            if (!roomCodeRef.current || migratedRef.current) return;
+            const isHost = isHostRef.current;
+            const port = embeddedPortRef.current;
+            const endpoint = hostEndpointRef.current;
+            if (isHost && port) {
+                migratedRef.current = true;
+                console.log('[WebRTC] 中央サーバー死亡 → 内蔵サーバーへ移行');
+                void switchSignalingRef.current(`ws://127.0.0.1:${port}`).catch((e) => {
+                    console.error('[WebRTC] 移行失敗:', e);
+                    migratedRef.current = false;
+                });
+            } else if (!isHost && endpoint) {
+                migratedRef.current = true;
+                console.log('[WebRTC] 中央サーバー死亡 → ホスト内蔵サーバーへ移行');
+                void switchSignalingRef.current(`ws://${endpoint}`).catch((e) => {
+                    console.error('[WebRTC] 移行失敗:', e);
+                    migratedRef.current = false;
+                });
+            } else {
+                console.log('[WebRTC] 中央サーバー死亡: 移行先が無いためDC中継で継続');
+            }
+        }, 4000);
+    };
+
+    const wireSignaling = (signaling: SignalingClient) => {
         signaling.on('onConnected', () => {
             setConnectionState('connected');
             // 再接続: 入室中だった部屋に自動で再参加する (サーバー側の入室状態は
             // WS切断で失われているため。これが無いとICE再起動のofferが届かない)
             if (roomCodeRef.current) {
-                console.log(`[WebRTC] 再接続: 部屋 ${roomCodeRef.current} に再参加`);
-                signaling.joinRoom(roomCodeRef.current, roomNameRef.current);
+                if (isHostRef.current) {
+                    // ホスト: 移行先 (内蔵サーバー) には部屋が存在しないので room:create で
+                    // 同じコードを再作成する (M2: createは既存コード一致時はjoinとして動く)
+                    console.log(`[WebRTC] 再接続(ホスト): 部屋 ${roomCodeRef.current} を移行先で再作成`);
+                    const endpoint = embeddedPortRef.current
+                        ? `${lanIpRef.current || '127.0.0.1'}:${embeddedPortRef.current}`
+                        : (hostEndpointRef.current ?? undefined);
+                    signaling.createRoom(roomNameRef.current, roomCodeRef.current, endpoint);
+                } else {
+                    console.log(`[WebRTC] 再接続: 部屋 ${roomCodeRef.current} に再参加`);
+                    signaling.joinRoom(roomCodeRef.current, roomNameRef.current);
+                }
             }
         });
 
         signaling.on('onDisconnected', () => {
             setConnectionState('disconnected');
             isConnectedRef.current = false;
+            // M2: 中央サーバー死亡時は内蔵サーバー (ホスト) / ホストendpoint (ゲスト) へ移行
+            scheduleEmbeddedMigration();
         });
 
         // サーバー由来のエラー (監査#6: 満室ルームへの参加拒否などをUIへ出す)
@@ -939,15 +1266,33 @@ export function useWebRTC(options?: { signalingUrl?: string; turnConfig?: TurnCo
         });
 
         // 自分の参加完了通知 (既存参加者リストが来る)
-        signaling.on('onRoomJoined', (_roomId, code, myClientId, existingParticipants) => {
+        signaling.on('onRoomJoined', (_roomId, code, myClientId, existingParticipants, hostEndpoint) => {
+            const prevMyId = myIdRef.current;
             setRoomCode(code);
             setMyId(myClientId);
             roomCodeRef.current = code;
             myIdRef.current = myClientId;
             isConnectedRef.current = true;
+            if (hostEndpoint) hostEndpointRef.current = hostEndpoint;
+            // M1: 移行 (サーバー付け替え) でクライアントIDが変わったとき、旧IDに墓石を
+            // 立てる。ゴシップで全体に配布され、名簿から旧IDが収束除去される
+            if (migratedRef.current && prevMyId && prevMyId !== myClientId) {
+                applyDepart(rosterRef.current, prevMyId, Date.now());
+            }
 
-            // 参加者リスト更新 (refは同時に更新 — 監査#1の送信者チェック用)
+            // M1: 名簿に自分と既存参加者を登録 (サーバーが配ったjoinedAtを使う=決定論的)
+            selfJoinedAtRef.current = selfJoinedAtRef.current || Date.now();
+            mergeEntry(rosterRef.current, { id: myClientId, name: roomNameRef.current, joinedAt: selfJoinedAtRef.current });
+            for (const p of existingParticipants) {
+                mergeEntry(rosterRef.current, { id: p.id, name: p.name, joinedAt: p.joinedAt });
+            }
+
+            // 参加者リスト更新 (refは同時に更新 — 監査#1の送信者チェック用)。
+            // 移行再参加時は中央経由で知った既存ピアを保持する (内蔵サーバーには不在のため)
             const pMap = new Map<string, ParticipantInfo>();
+            if (migratedRef.current) {
+                participantsRef.current.forEach((v, k) => pMap.set(k, v));
+            }
             existingParticipants.forEach(p => pMap.set(p.id, p));
             participantsRef.current = pMap;
             setParticipants(pMap);
@@ -966,6 +1311,7 @@ export function useWebRTC(options?: { signalingUrl?: string; turnConfig?: TurnCo
         // 他の誰かが参加通知
         signaling.on('onPeerJoined', (peerId, name) => {
             console.log(`[WebRTC] Peer参加: ${peerId}`);
+            mergeEntry(rosterRef.current, { id: peerId, name, joinedAt: Date.now() });
             setParticipants(prev => {
                 const next = new Map(prev);
                 next.set(peerId, { id: peerId, name, joinedAt: Date.now() });
@@ -982,12 +1328,15 @@ export function useWebRTC(options?: { signalingUrl?: string; turnConfig?: TurnCo
 
         signaling.on('onPeerLeft', (peerId) => {
             console.log(`[WebRTC] Peer退出: ${peerId}`);
+            applyDepart(rosterRef.current, peerId, Date.now());
             setParticipants(prev => {
                 const next = new Map(prev);
                 next.delete(peerId);
                 participantsRef.current = next;
                 return next;
             });
+            // 離脱をゴシップで全体へ (M1: サーバーfanoutの二重化。サーバー死亡時はこれが主経路)
+            broadcastData('roster:depart', { peerId, departedAt: Date.now() });
             // リレー視聴者が退出したら購読を外す
             relaySubscribersRef.current.delete(peerId);
             relayCapsRef.current.delete(peerId);
@@ -1008,66 +1357,26 @@ export function useWebRTC(options?: { signalingUrl?: string; turnConfig?: TurnCo
             dataChannelsRef.current.delete(peerId);
         });
 
-        signaling.on('onOffer', (senderId, sdp) => {
-            if (relayModeRef.current) return; // リレーモードではWebRTC経路を使わない
-            // 監査#1: 参加者リスト外のpeerからのOfferは破棄 (サーバー側検証の二重化)
-            if (!participantsRef.current.has(senderId)) {
-                console.warn(`[WebRTC] 参加者リスト外のOfferを破棄: ${senderId}`);
-                return;
-            }
-            const pc = createPeerConnection(senderId, false); // PC取得または作成(受信側)
-            return enqueueSdpOp(pc, async () => {
-                try {
-                    if (pc.signalingState !== 'stable') {
-                        await Promise.all([
-                            pc.setLocalDescription({ type: 'rollback' }),
-                            pc.setRemoteDescription(new RTCSessionDescription(sdp))
-                        ]);
-                    } else {
-                        await pc.setRemoteDescription(new RTCSessionDescription(sdp));
-                    }
-                    const answer = await pc.createAnswer();
-                    await pc.setLocalDescription(answer);
-                    signalingRef.current?.sendAnswer(senderId, answer);
-                } catch (e) {
-                    console.error('[WebRTC] Offer処理失敗:', (e as Error)?.message || String(e));
-                }
-            });
-        });
+        signaling.on('onOffer', (senderId, sdp) => handleIncomingOffer(senderId, sdp));
 
-        signaling.on('onAnswer', (senderId, sdp) => {
-            if (relayModeRef.current) return;
-            // 監査#1: 参加者リスト外のpeerからのAnswerは破棄
-            if (!participantsRef.current.has(senderId)) {
-                console.warn(`[WebRTC] 参加者リスト外のAnswerを破棄: ${senderId}`);
-                return;
-            }
-            const pc = peerConnectionsRef.current.get(senderId);
-            if (!pc) return;
-            return enqueueSdpOp(pc, async () => {
-                try {
-                    await pc.setRemoteDescription(new RTCSessionDescription(sdp));
-                } catch (e) {
-                    console.error('[WebRTC] Answer処理失敗:', (e as Error)?.message || String(e));
-                }
-            });
-        });
+        signaling.on('onAnswer', (senderId, sdp) => handleIncomingAnswer(senderId, sdp));
 
-        signaling.on('onIceCandidate', async (senderId, candidate) => {
-            // 監査#1: 参加者リスト外のpeerからのICE候補は破棄
-            if (!participantsRef.current.has(senderId)) return;
-            const pc = peerConnectionsRef.current.get(senderId);
-            if (pc) {
-                try {
-                    await pc.addIceCandidate(new RTCIceCandidate(candidate));
-                } catch (e) {
-                    // console.warn('ICE Candidate Error', e);
-                }
-            }
-        });
+        signaling.on('onIceCandidate', (senderId, candidate) => handleIncomingIce(senderId, candidate));
+
+        // DC中継シグナリング: サーバー経由で届いた封筒 (M2)
+        signaling.on('onTunneledMessage', (_forwarder, envelope) => handleTunnelEnvelope(envelope));
 
         // WSリレー (WebRTC非対応エンジンのフォールバック経路)
         signaling.on('onRelayMessage', (senderId, type, payload) => {
+            // 署名鍵の配布は監査的検証の対象外 (公開鍵なので改ざんされても検証が失敗するだけ)
+            if (type === 'key') {
+                const p = (payload || {}) as Record<string, unknown>;
+                if (typeof p.pub === 'string') {
+                    relayPubKeyRef.current = p.pub;
+                    console.log('[Relay] 署名検証用の公開鍵を受信');
+                }
+                return;
+            }
             // 監査#1: 参加者リスト外のpeerからのリレーメッセージは破棄
             if (!participantsRef.current.has(senderId)) {
                 console.warn(`[Relay] 参加者リスト外のメッセージを破棄: ${senderId} (${type})`);
@@ -1097,11 +1406,16 @@ export function useWebRTC(options?: { signalingUrl?: string; turnConfig?: TurnCo
                 ensureRelayLoop();
                 startRelayAudioSend();
                 signalingRef.current?.sendRelay(senderId, 'control_allowed', { allowed: remoteControlAllowedRef.current });
+                // M3: 署名検証用の公開鍵を配布 (ルーム毎のエフェメラル鍵)
+                if (relayKeysRef.current) {
+                    signalingRef.current?.sendRelay(senderId, 'key', { pub: relayKeysRef.current.publicKeyB64 });
+                }
                 console.log(`[Relay] 視聴者登録: ${senderId} (mse=${caps.mse} webmAudio=${caps.webmAudio}, 計${relaySubscribersRef.current.size}人)`);
                 return;
             }
             if (type === 'h264') {
                 // ゲスト側: fMP4のbox (init/fragment) を順にappend
+                if (!verifyRelayChunk(p)) return;
                 relayStatsRef.current.h264Chunks++;
                 ensureRelayVideoSink();
                 const sb = relayVideoSbRef.current;
@@ -1114,6 +1428,7 @@ export function useWebRTC(options?: { signalingUrl?: string; turnConfig?: TurnCo
                 return;
             }
             if (type === 'audio') {
+                if (!verifyRelayChunk(p)) return;
                 relayStatsRef.current.audioChunks++;
                 ensureRelayAudioSink();
                 const sb = relayAudioSbRef.current;
@@ -1150,18 +1465,80 @@ export function useWebRTC(options?: { signalingUrl?: string; turnConfig?: TurnCo
                 return;
             }
         });
+    };
+    // 毎レンダーで最新のクロージャへ差し替え (setupDataChannel/e2eDepsRefと同じ規約)
+    wireSignalingRef.current = wireSignaling;
+
+    const connect = useCallback(async () => {
+        if (signalingRef.current) return;
+
+        setConnectionState('connecting');
+        const signaling = new SignalingClient(targetSignalingUrl);
+        signalingRef.current = signaling;
+        wireSignalingRef.current(signaling);
 
         await signaling.connect();
         // eslint-disable-next-line react-hooks/exhaustive-deps
-    }, [setConnectionState, setRoomCode, createPeerConnection, targetSignalingUrl, ensureRelayLoop, maybeStopRelayLoop]);
+    }, [setConnectionState, targetSignalingUrl]);
 
+    /**
+     * 指定URLのサーバーへ signaling クライアントを付け替える (M2移行 / M4招待v2)。
+     * 旧クライアントはdisposeして再接続ループを止める。
+     */
+    const switchSignaling = async (url: string) => {
+        const old = signalingRef.current;
+        if (old) {
+            old.dispose();
+            signalingRef.current = null;
+        }
+        setConnectionState('connecting');
+        const signaling = new SignalingClient(url);
+        signalingRef.current = signaling;
+        wireSignalingRef.current(signaling);
+        await signaling.connect();
+        // 再参加は wireSignaling の onConnected 内 (roomCodeRef) で行われる
+    };
+    switchSignalingRef.current = switchSignaling;
     /**
      * ルーム作成・参加
      */
     const createRoom = useCallback(async (name?: string) => {
-        await connect();
+        isHostRef.current = true;
+        migratedRef.current = false;
+        selfJoinedAtRef.current = Date.now();
+        // M2: ホスト内蔵サーバーを起動 (中央サーバー死亡後の再合流・サーバーレス参加の入口)
+        try {
+            embeddedPortRef.current = await invoke<number>('embedded_server_start', { port: null });
+            lanIpRef.current = await invoke<string | null>('get_local_lan_address');
+            console.log(`[Embedded] port=${embeddedPortRef.current} lan=${lanIpRef.current}`);
+        } catch (e) {
+            console.warn('[Embedded] 起動に失敗 (内蔵サーバーなしで続行):', e);
+        }
+        // M3: リレー署名鍵をルーム毎に生成 (エフェメラル・退出と共に無効)
+        try {
+            relayKeysRef.current = generateRelayKeyPair();
+            relayPubKeyRef.current = null;
+        } catch (e) {
+            console.warn('[Relay] 署名鍵の生成に失敗 (無署名で続行):', e);
+        }
         roomNameRef.current = name;
-        signalingRef.current?.createRoom(name);
+        // コードはローカル生成 (中央サーバーには電話帳登録として渡し、
+        // 内蔵サーバーと同じコードでサーバーレス参加を可能にする)
+        const localCode = genLocalRoomCode();
+        const endpoint = embeddedPortRef.current
+            ? `${lanIpRef.current || '127.0.0.1'}:${embeddedPortRef.current}`
+            : null;
+        hostEndpointRef.current = endpoint;
+        try {
+            await connect();
+            signalingRef.current?.createRoom(name, localCode, endpoint ?? undefined);
+        } catch (e) {
+            // M4: 中央サーバー無しで部屋を作る (LAN完全サーバーレス)
+            console.warn('[WebRTC] 中央サーバーに接続できない → 内蔵サーバーのみで作成:', e);
+            if (!embeddedPortRef.current) throw e;
+            await switchSignalingRef.current(`ws://127.0.0.1:${embeddedPortRef.current}`);
+            signalingRef.current?.createRoom(name, localCode, endpoint ?? undefined);
+        }
     }, [connect]);
 
     const joinRoom = useCallback(async (code: string, name?: string) => {
@@ -1169,6 +1546,26 @@ export function useWebRTC(options?: { signalingUrl?: string; turnConfig?: TurnCo
         roomNameRef.current = name;
         signalingRef.current?.joinRoom(code, name);
     }, [connect]);
+
+    /**
+     * 指定サーバーURLで部屋に参加する (M4: 招待v2 p2d://join/CODE@host:port の直行経路)
+     */
+    const joinRoomAt = useCallback(async (code: string, wsUrl: string, name?: string) => {
+        isHostRef.current = false;
+        migratedRef.current = false;
+        selfJoinedAtRef.current = Date.now();
+        roomNameRef.current = name;
+        if (signalingRef.current) {
+            signalingRef.current.dispose();
+            signalingRef.current = null;
+        }
+        setConnectionState('connecting');
+        const signaling = new SignalingClient(wsUrl);
+        signalingRef.current = signaling;
+        wireSignalingRef.current(signaling);
+        await signaling.connect();
+        signaling.joinRoom(code, name);
+    }, [setConnectionState]);
 
     // ICE再起動で復旧できない場合の最終手段: 部屋に再参加して全ピア接続を作り直す。
     // leaveRoom → joinRoom により相手側でも peer:left/peer:joined が流れ、
@@ -1198,8 +1595,19 @@ export function useWebRTC(options?: { signalingUrl?: string; turnConfig?: TurnCo
         roomCodeRef.current = null;
         roomNameRef.current = undefined;
         signalingRef.current?.leaveRoom();
-        signalingRef.current?.disconnect();
+        signalingRef.current?.dispose();
         signalingRef.current = null;
+        // レンデブー最小化: ホストは内蔵サーバーを止め、ゴシップ状態をリセットする
+        if (isHostRef.current) {
+            void invoke('embedded_server_stop').catch(() => { /* noop */ });
+        }
+        isHostRef.current = false;
+        migratedRef.current = false;
+        hostEndpointRef.current = null;
+        embeddedPortRef.current = null;
+        rosterRef.current = initRoster();
+        relayKeysRef.current = null;
+        relayPubKeyRef.current = null;
 
         // リレーの後片付け
         stopRelayLoop();
@@ -1791,11 +2199,14 @@ export function useWebRTC(options?: { signalingUrl?: string; turnConfig?: TurnCo
         remoteStreams,
         createRoom,
         joinRoom,
+        joinRoomAt,
         leaveRoom,
         isConnected: connectionState === 'peer-connected' || connectionState === 'connected',
         roomCode: useConnectionStore(s => s.roomCode),
         error: useConnectionStore(s => s.error),
         clearError: () => setError(null),
+        // レンデブー最小化 (M1): 名簿ゴシップの状態 (E2E収束検証用)
+        getRoster: () => rosterEntries(rosterRef.current),
         participants,
         myId,
 
