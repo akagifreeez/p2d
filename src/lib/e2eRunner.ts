@@ -10,6 +10,7 @@
  * ウィンドウがバックグラウンドでも完結する。
  */
 import { invoke } from '@tauri-apps/api/core';
+import { detectRelayCapabilities } from './relayEncoder';
 
 export interface E2eConfig {
     enabled: boolean;
@@ -39,7 +40,10 @@ export interface E2eDeps {
     getPeerStats: () => Promise<{ peerId: string; type: string; kind: string; bytes: number }[]>;
     // WSリレーモード (WebRTC非対応エンジン向けフォールバック)
     isRelayMode: boolean;
-    getRelayStats: () => { frames: number; bytes: number; lastFrameAt: number; subscribers: number };
+    getRelayStats: () => {
+        frames: number; bytes: number; lastFrameAt: number; h264Chunks: number; audioChunks: number;
+        subscribers: number; mseSubscribers: number; audioSubscribers: number;
+    };
 }
 
 const sleep = (ms: number) => new Promise(r => setTimeout(r, ms));
@@ -192,12 +196,13 @@ export async function runE2E(cfg: E2eConfig, deps: E2eDeps): Promise<void> {
 
             // 3. ホスト映像の受信
             if (deps.isRelayMode) {
-                // リレーモード: フレーム着信数の増加で判定
+                // リレーモード: フレーム/H264チャンク着信数の増加で判定
                 await sleep(3000);
-                const f1 = deps.getRelayStats().frames;
+                const s1 = deps.getRelayStats();
                 await sleep(3000);
-                const f2 = deps.getRelayStats().frames;
-                step('video_receiving', f2 > f1, { relayFramesDelta: f2 - f1, total: f2 });
+                const s2 = deps.getRelayStats();
+                const delta = (s2.frames + s2.h264Chunks) - (s1.frames + s1.h264Chunks);
+                step('video_receiving', delta > 0, { relayMediaDelta: delta, h264Chunks: s2.h264Chunks, jpegFrames: s2.frames });
             } else {
                 const hasLiveVideo = await waitFor(
                     () => [...deps.remoteStreams.values()].some(s =>
@@ -219,9 +224,19 @@ export async function runE2E(cfg: E2eConfig, deps: E2eDeps): Promise<void> {
             );
             step('remote_control_badge', ctrlAllowed, { peerControlAllowed: [...deps.peerControlAllowed.values()] });
 
-            // 5. ホストのシステム音声受信 (リレーモードは音声リレー未対応のためスキップ)
+            // 5. ホストのシステム音声受信 (リレー時はwebm/opusチャンク着信で判定・非対応エンジンはスキップ)
             if (deps.isRelayMode) {
-                step('system_audio_receiving', true, { skipped: 'relay-mode' });
+                const caps = detectRelayCapabilities();
+                if (!caps.webmAudio) {
+                    step('system_audio_receiving', true, { skipped: 'relay-mode: webm/opus MSE非対応' });
+                } else {
+                    let audioChunks = 0;
+                    for (let i = 0; i < 6 && audioChunks === 0; i++) {
+                        await sleep(3000);
+                        audioChunks = deps.getRelayStats().audioChunks;
+                    }
+                    step('system_audio_receiving', audioChunks > 0, { relayAudioChunks: audioChunks });
+                }
             } else {
                 let audioDelta = 0;
                 for (let i = 0; i < 10 && audioDelta <= 0; i++) {

@@ -14,6 +14,10 @@ import type { ChatMessageData } from '../lib/dataChannel';
 import { startSystemAudioCapture, type SystemAudioSession } from '../lib/systemAudio';
 import { BandwidthMonitor, type BandwidthStats } from '../lib/bandwidthMonitor';
 import { AdaptiveController } from '../lib/adaptiveController';
+import {
+    RelayH264Encoder, detectRelayCapabilities, arrayBufferToBase64, base64ToArrayBuffer,
+    RELAY_MSE_VIDEO_MIME, RELAY_MSE_AUDIO_MIME, RELAY_AUDIO_REC_MIME,
+} from '../lib/relayEncoder';
 
 // WebRTC APIの有無 (Ubuntu等のWebKitGTKはWebRTC無効ビルドで RTCPeerConnection が存在しない)
 export const SUPPORTS_WEBRTC = typeof RTCPeerConnection !== 'undefined';
@@ -22,6 +26,12 @@ export const SUPPORTS_WEBRTC = typeof RTCPeerConnection !== 'undefined';
 const RELAY_MAX_WIDTH = 1600;
 const RELAY_INTERVAL_MS = 80; // 約12.5fps
 const RELAY_JPEG_QUALITY = 0.6;
+
+// WSリレー視聴者の能力 (subscribe時に申告)
+interface RelayViewerCaps {
+    mse: boolean;      // H264/fMP4 + MSE 再生可
+    webmAudio: boolean; // audio/webm(opus) の MSE 再生可
+}
 
 // Helper to prioritize specific codecs
 function prioritizeCodecs(pc: RTCPeerConnection, preferredCodec: 'auto' | 'av1' | 'vp9' | 'h264' | 'vp8') {
@@ -55,6 +65,21 @@ function prioritizeCodecs(pc: RTCPeerConnection, preferredCodec: 'auto' | 'av1' 
             }
         }
     });
+}
+
+// SourceBufferのappendキューを捌く (updateendごとに呼ばれる)
+function pumpRelayQueue(sb: SourceBuffer, queue: ArrayBuffer[]): void {
+    // 消化が追いつかない場合は生きてる映像を優先して捨てる
+    while (queue.length > 60) queue.shift();
+    while (queue.length > 0 && !sb.updating) {
+        try {
+            sb.appendBuffer(queue.shift()!);
+        } catch (e) {
+            console.error('[Relay] appendBuffer失敗:', e);
+            queue.length = 0;
+            break;
+        }
+    }
 }
 
 
@@ -115,7 +140,12 @@ export interface UseWebRTCReturn {
     // WSリレーモード (WebRTC非対応エンジン: Linux等)
     isRelayMode: boolean;
     relayFrame: string | null;
-    getRelayStats: () => { frames: number; bytes: number; lastFrameAt: number; subscribers: number };
+    relayVideoUrl: string | null;
+    relayAudioUrl: string | null;
+    getRelayStats: () => {
+        frames: number; bytes: number; lastFrameAt: number; h264Chunks: number; audioChunks: number;
+        subscribers: number; mseSubscribers: number; audioSubscribers: number;
+    };
 
     // マイク
     startMicrophone: () => Promise<void>;
@@ -253,8 +283,22 @@ export function useWebRTC(options?: { signalingUrl?: string; turnConfig?: TurnCo
     const relayLoopRef = useRef<number | null>(null);
     const relayFrameSeqRef = useRef(0);
     const [relayFrame, setRelayFrame] = useState<string | null>(null);
-    const relayStatsRef = useRef({ frames: 0, bytes: 0, lastFrameAt: 0 });
+    const relayStatsRef = useRef({ frames: 0, bytes: 0, lastFrameAt: 0, h264Chunks: 0, audioChunks: 0 });
     const relayLastRenderRef = useRef(0);
+    // H264/MSE品質モード
+    const relayCapsRef = useRef<Map<string, RelayViewerCaps>>(new Map()); // peerId -> caps
+    const relayEncoderRef = useRef<RelayH264Encoder | null>(null);
+    // ゲスト側: MSE再生 (video=H264/fMP4, audio=webm/opus)
+    const relayVideoMsRef = useRef<MediaSource | null>(null);
+    const relayVideoSbRef = useRef<SourceBuffer | null>(null);
+    const relayVideoQueueRef = useRef<ArrayBuffer[]>([]);
+    const relayAudioMsRef = useRef<MediaSource | null>(null);
+    const relayAudioSbRef = useRef<SourceBuffer | null>(null);
+    const relayAudioQueueRef = useRef<ArrayBuffer[]>([]);
+    const [relayVideoUrl, setRelayVideoUrl] = useState<string | null>(null);
+    const [relayAudioUrl, setRelayAudioUrl] = useState<string | null>(null);
+    // ホスト側: 音声リレー (MediaRecorder)
+    const relayAudioRecRef = useRef<MediaRecorder | null>(null);
     // リレーモードのチャット配送先 (参加者一覧のrefミラー)
     const participantsRef = useRef<Map<string, ParticipantInfo>>(new Map());
     useEffect(() => { participantsRef.current = participants; }, [participants]);
@@ -400,7 +444,8 @@ export function useWebRTC(options?: { signalingUrl?: string; turnConfig?: TurnCo
     }, []);
 
     /**
-     * ホスト側: WSリレーのフレーム送信ループを開始 (視聴者がいる時だけ動く)
+     * ホスト側: WSリレーのフレーム送信ループを開始 (視聴者がいる時だけ動く)。
+     * MSE対応視聴者にはH264/fMP4、非対応にはJPEGを送る。
      */
     const ensureRelayLoop = useCallback(() => {
         if (relayLoopRef.current || !SUPPORTS_WEBRTC) return;
@@ -417,7 +462,9 @@ export function useWebRTC(options?: { signalingUrl?: string; turnConfig?: TurnCo
 
         relayVideoRef.current = video;
         relayLoopRef.current = window.setInterval(() => {
-            if (relaySubscribersRef.current.size === 0) return;
+            const mseSubs = Array.from(relayCapsRef.current.entries()).filter(([, c]) => c.mse).map(([id]) => id);
+            const jpegSubs = Array.from(relayCapsRef.current.entries()).filter(([, c]) => !c.mse).map(([id]) => id);
+            if (mseSubs.length === 0 && jpegSubs.length === 0) return;
             if (!video.videoWidth) return;
             if (video.readyState < 2) return;
             const w = Math.min(RELAY_MAX_WIDTH, video.videoWidth);
@@ -425,15 +472,40 @@ export function useWebRTC(options?: { signalingUrl?: string; turnConfig?: TurnCo
             if (canvas.width !== w || canvas.height !== h) {
                 canvas.width = w;
                 canvas.height = h;
+                // サイズが変わったらエンコーダを作り直す
+                if (relayEncoderRef.current) { relayEncoderRef.current.close(); relayEncoderRef.current = null; }
             }
             const ctx = canvas.getContext('2d');
             if (!ctx) return;
             ctx.drawImage(video, 0, 0, w, h);
-            const dataUrl = canvas.toDataURL('image/jpeg', RELAY_JPEG_QUALITY);
-            const b64 = dataUrl.slice(dataUrl.indexOf(',') + 1);
-            relayFrameSeqRef.current++;
-            for (const peerId of relaySubscribersRef.current) {
-                signalingRef.current?.sendRelay(peerId, 'frame', { seq: relayFrameSeqRef.current, w, h, d: b64 });
+
+            // H264/fMP4 (品質モード)
+            if (mseSubs.length > 0) {
+                if (!relayEncoderRef.current) {
+                    relayEncoderRef.current = new RelayH264Encoder({
+                        width: w, height: h,
+                        onBox: (buf) => {
+                            const d = arrayBufferToBase64(buf);
+                            relayStatsRef.current.h264Chunks++;
+                            for (const peerId of mseSubs) {
+                                signalingRef.current?.sendRelay(peerId, 'h264', { seq: relayFrameSeqRef.current, d });
+                            }
+                        },
+                        onError: (e) => console.error('[Relay] H264 encoder error:', (e as Error)?.message || e),
+                    });
+                }
+                relayEncoderRef.current.encode(canvas);
+            }
+
+            // JPEG (低遅延フォールバック)
+            if (jpegSubs.length > 0) {
+                const dataUrl = canvas.toDataURL('image/jpeg', RELAY_JPEG_QUALITY);
+                const b64 = dataUrl.slice(dataUrl.indexOf(',') + 1);
+                relayFrameSeqRef.current++;
+                relayStatsRef.current.frames++;
+                for (const peerId of jpegSubs) {
+                    signalingRef.current?.sendRelay(peerId, 'frame', { seq: relayFrameSeqRef.current, w, h, d: b64 });
+                }
             }
         }, RELAY_INTERVAL_MS);
         console.log('[Relay] フレーム送信ループ開始');
@@ -448,6 +520,10 @@ export function useWebRTC(options?: { signalingUrl?: string; turnConfig?: TurnCo
             relayLoopRef.current = null;
             relayVideoRef.current = null;
             relaySubscribersRef.current.clear();
+            relayCapsRef.current.clear();
+            relayEncoderRef.current?.close();
+            relayEncoderRef.current = null;
+            stopRelayAudioSend();
             console.log('[Relay] フレーム送信ループ停止');
         }
     }, []);
@@ -460,6 +536,89 @@ export function useWebRTC(options?: { signalingUrl?: string; turnConfig?: TurnCo
             stopRelayLoop();
         }
     }, [stopRelayLoop]);
+
+    /**
+     * ホスト側: システム音声をリレー視聴者へ送る (MediaRecorder → webm/opusチャンク)
+     */
+    const startRelayAudioSend = useCallback(() => {
+        if (relayAudioRecRef.current) return;
+        const caps = Array.from(relayCapsRef.current.values());
+        if (!caps.some(c => c.webmAudio)) return;
+        const stream = systemAudioSessionRef.current?.stream;
+        if (!stream) return;
+        try {
+            const rec = new MediaRecorder(stream, {
+                mimeType: RELAY_AUDIO_REC_MIME,
+                audioBitsPerSecond: 48_000,
+            });
+            rec.ondataavailable = (e) => {
+                if (!e.data || e.data.size === 0) return;
+                relayStatsRef.current.audioChunks++;
+                void e.data.arrayBuffer().then(buf => {
+                    const d = arrayBufferToBase64(buf);
+                    for (const [peerId, c] of relayCapsRef.current) {
+                        if (c.webmAudio) signalingRef.current?.sendRelay(peerId, 'audio', { d });
+                    }
+                });
+            };
+            rec.start(600);
+            relayAudioRecRef.current = rec;
+            console.log('[Relay] 音声送信開始');
+        } catch (e) {
+            console.error('[Relay] MediaRecorder起動失敗:', e);
+        }
+    }, []);
+
+    const stopRelayAudioSend = useCallback(() => {
+        const rec = relayAudioRecRef.current;
+        if (rec) {
+            try { rec.stop(); } catch { /* noop */ }
+            relayAudioRecRef.current = null;
+        }
+    }, []);
+
+    // === ゲスト側: MSE appendユーティリティ ===
+    const ensureRelayVideoSink = useCallback(() => {
+        if (relayVideoMsRef.current || typeof MediaSource === 'undefined') return;
+        try {
+            const ms = new MediaSource();
+            relayVideoMsRef.current = ms;
+            ms.addEventListener('sourceopen', () => {
+                try {
+                    const sb = ms.addSourceBuffer(RELAY_MSE_VIDEO_MIME);
+                    sb.mode = 'sequence';
+                    relayVideoSbRef.current = sb;
+                    sb.addEventListener('updateend', () => pumpRelayQueue(sb, relayVideoQueueRef.current));
+                } catch (e) {
+                    console.error('[Relay] SourceBuffer(video)作成失敗:', e);
+                }
+            });
+            setRelayVideoUrl(URL.createObjectURL(ms));
+        } catch (e) {
+            console.error('[Relay] MediaSource初期化失敗:', e);
+        }
+    }, []);
+
+    const ensureRelayAudioSink = useCallback(() => {
+        if (relayAudioMsRef.current || typeof MediaSource === 'undefined') return;
+        try {
+            const ms = new MediaSource();
+            relayAudioMsRef.current = ms;
+            ms.addEventListener('sourceopen', () => {
+                try {
+                    const sb = ms.addSourceBuffer(RELAY_MSE_AUDIO_MIME);
+                    sb.mode = 'sequence';
+                    relayAudioSbRef.current = sb;
+                    sb.addEventListener('updateend', () => pumpRelayQueue(sb, relayAudioQueueRef.current));
+                } catch (e) {
+                    console.error('[Relay] SourceBuffer(audio)作成失敗:', e);
+                }
+            });
+            setRelayAudioUrl(URL.createObjectURL(ms));
+        } catch (e) {
+            console.error('[Relay] MediaSource(audio)初期化失敗:', e);
+        }
+    }, []);
 
     /**
      * PeerConnection作成
@@ -771,7 +930,7 @@ export function useWebRTC(options?: { signalingUrl?: string; turnConfig?: TurnCo
             // リレーモード (WebRTC非対応エンジン) ではPCを作らず、リレー購読だけ行う
             existingParticipants.forEach(p => {
                 if (relayModeRef.current) {
-                    signalingRef.current?.sendRelay(p.id, 'subscribe', {});
+                    signalingRef.current?.sendRelay(p.id, 'subscribe', detectRelayCapabilities());
                 } else {
                     createPeerConnection(p.id, true); // Initiator = true
                 }
@@ -787,7 +946,7 @@ export function useWebRTC(options?: { signalingUrl?: string; turnConfig?: TurnCo
                 return next;
             });
             if (relayModeRef.current) {
-                signalingRef.current?.sendRelay(peerId, 'subscribe', {});
+                signalingRef.current?.sendRelay(peerId, 'subscribe', detectRelayCapabilities());
                 return;
             }
             // 相手からのOfferを待つ (Initiator = false)
@@ -803,6 +962,7 @@ export function useWebRTC(options?: { signalingUrl?: string; turnConfig?: TurnCo
             });
             // リレー視聴者が退出したら購読を外す
             relaySubscribersRef.current.delete(peerId);
+            relayCapsRef.current.delete(peerId);
             maybeStopRelayLoop();
             // PC cleanup
             const pc = peerConnectionsRef.current.get(peerId);
@@ -882,11 +1042,42 @@ export function useWebRTC(options?: { signalingUrl?: string; turnConfig?: TurnCo
                 return;
             }
             if (type === 'subscribe') {
-                // ホスト側: 視聴者登録 → フレーム送信を開始し、許可状態も即通知
+                // ホスト側: 視聴者登録 (能力を記録してモード別に配送) → 許可状態も即通知
+                const caps: RelayViewerCaps = {
+                    mse: !!(p as Record<string, unknown>).mse,
+                    webmAudio: !!(p as Record<string, unknown>).webmAudio,
+                };
                 relaySubscribersRef.current.add(senderId);
+                relayCapsRef.current.set(senderId, caps);
                 ensureRelayLoop();
+                startRelayAudioSend();
                 signalingRef.current?.sendRelay(senderId, 'control_allowed', { allowed: remoteControlAllowedRef.current });
-                console.log(`[Relay] 視聴者登録: ${senderId} (${relaySubscribersRef.current.size}人)`);
+                console.log(`[Relay] 視聴者登録: ${senderId} (mse=${caps.mse} webmAudio=${caps.webmAudio}, 計${relaySubscribersRef.current.size}人)`);
+                return;
+            }
+            if (type === 'h264') {
+                // ゲスト側: fMP4のbox (init/fragment) を順にappend
+                relayStatsRef.current.h264Chunks++;
+                ensureRelayVideoSink();
+                const sb = relayVideoSbRef.current;
+                const buf = base64ToArrayBuffer(String(p.d || ''));
+                if (sb && !sb.updating) {
+                    try { sb.appendBuffer(buf); } catch (e) { console.error('[Relay] video appendBuffer失敗:', e); }
+                } else if (relayVideoQueueRef.current.length < 240) {
+                    relayVideoQueueRef.current.push(buf);
+                }
+                return;
+            }
+            if (type === 'audio') {
+                relayStatsRef.current.audioChunks++;
+                ensureRelayAudioSink();
+                const sb = relayAudioSbRef.current;
+                const buf = base64ToArrayBuffer(String(p.d || ''));
+                if (sb && !sb.updating) {
+                    try { sb.appendBuffer(buf); } catch (e) { console.error('[Relay] audio appendBuffer失敗:', e); }
+                } else if (relayAudioQueueRef.current.length < 240) {
+                    relayAudioQueueRef.current.push(buf);
+                }
                 return;
             }
             if (type === 'unsubscribe') {
@@ -968,6 +1159,14 @@ export function useWebRTC(options?: { signalingUrl?: string; turnConfig?: TurnCo
         // リレーの後片付け
         stopRelayLoop();
         setRelayFrame(null);
+        setRelayVideoUrl(null);
+        setRelayAudioUrl(null);
+        relayVideoMsRef.current = null;
+        relayVideoSbRef.current = null;
+        relayVideoQueueRef.current = [];
+        relayAudioMsRef.current = null;
+        relayAudioSbRef.current = null;
+        relayAudioQueueRef.current = [];
 
         peerConnectionsRef.current.forEach(pc => pc.close());
         peerConnectionsRef.current.clear();
@@ -1430,11 +1629,14 @@ export function useWebRTC(options?: { signalingUrl?: string; turnConfig?: TurnCo
             });
 
             setIsSystemAudioEnabled(true);
+
+            // リレー視聴者がいれば音声も送る (session.streamをMediaRecorderへ)
+            if (relaySubscribersRef.current.size > 0) startRelayAudioSend();
         } catch (e) {
             console.error('[WebRTC] System audio start failed:', e);
             setError('システム音声の共有に失敗しました');
         }
-    }, [setError]);
+    }, [setError, startRelayAudioSend]);
 
     /**
      * システム音声の共有を停止 (F-031)
@@ -1444,6 +1646,7 @@ export function useWebRTC(options?: { signalingUrl?: string; turnConfig?: TurnCo
         if (!session) return;
         systemAudioSessionRef.current = null;
         setIsSystemAudioEnabled(false);
+        stopRelayAudioSend();
 
         peerConnectionsRef.current.forEach(async (pc, peerId) => {
             const sender = pc.getSenders().find(s => s.track === session.track);
@@ -1459,7 +1662,7 @@ export function useWebRTC(options?: { signalingUrl?: string; turnConfig?: TurnCo
 
         await session.stop();
         console.log('[WebRTC] System audio sharing stopped');
-    }, []);
+    }, [stopRelayAudioSend]);
 
     // 音声デバイス列挙
     const refreshAudioDevices = useCallback(async () => {
@@ -1517,6 +1720,8 @@ export function useWebRTC(options?: { signalingUrl?: string; turnConfig?: TurnCo
     const getRelayStats = useCallback(() => ({
         ...relayStatsRef.current,
         subscribers: relaySubscribersRef.current.size,
+        mseSubscribers: Array.from(relayCapsRef.current.values()).filter(c => c.mse).length,
+        audioSubscribers: Array.from(relayCapsRef.current.values()).filter(c => c.webmAudio).length,
     }), []);
 
     // クリーンアップ
@@ -1549,6 +1754,8 @@ export function useWebRTC(options?: { signalingUrl?: string; turnConfig?: TurnCo
         // WSリレーモード (WebRTC非対応エンジン向け)
         isRelayMode,
         relayFrame,
+        relayVideoUrl,
+        relayAudioUrl,
         getRelayStats,
 
         startScreenShare,

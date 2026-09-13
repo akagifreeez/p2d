@@ -27,12 +27,14 @@ interface RemoteControlBinding {
 function VideoGridItem({
     stream,
     frameSrc,
+    mseUrl,
     label,
     isLocal = false,
     control
 }: {
     stream?: MediaStream | null;
-    frameSrc?: string | null; // WSリレーのJPEGフレーム (WebRTC非対応エンジン向け)
+    frameSrc?: string | null; // WSリレーのJPEGフレーム (低遅延フォールバック)
+    mseUrl?: string | null;   // WSリレーのMediaSource URL (H264/fMP4)
     label?: string;
     isLocal?: boolean;
     control?: RemoteControlBinding;
@@ -84,7 +86,17 @@ function VideoGridItem({
 
     return (
         <div className="relative aspect-video overflow-hidden group rounded-xl bg-[var(--md-surface-lowest,var(--md-surface))] border border-[var(--md-outline-variant)]/50">
-            {frameSrc ? (
+            {mseUrl ? (
+                <video
+                    ref={videoRef}
+                    src={mseUrl}
+                    autoPlay
+                    playsInline
+                    muted // 音声はリレー音声要素で再生
+                    className={`w-full h-full object-contain ${control?.allowed ? 'cursor-crosshair' : ''}`}
+                    {...pointerHandlers(() => videoRef.current)}
+                />
+            ) : frameSrc ? (
                 <img
                     ref={frameRef}
                     src={frameSrc}
@@ -137,7 +149,7 @@ function VideoGridItem({
 
             {/* Label Overlay */}
             <div className="absolute bottom-3 left-3 px-3 py-1 rounded-full bg-black/60 text-xs font-medium text-white flex items-center gap-2">
-                <div className={`w-2 h-2 rounded-full ${stream ? 'bg-[var(--md-primary)]' : 'bg-[var(--md-outline)]'}`}></div>
+                <div className={`w-2 h-2 rounded-full ${(stream || frameSrc || mseUrl) ? 'bg-[var(--md-primary)]' : 'bg-[var(--md-outline)]'}`}></div>
                 {label || '不明'}
                 {isLocal && <span className="text-[var(--md-on-surface-variant)] text-[10px] ml-1">(自分)</span>}
             </div>
@@ -198,6 +210,8 @@ export function RoomView({ onLeave, signalingUrl, turnConfig, e2eConfig, onOpenS
         // WSリレーモード (WebRTC非対応エンジン: Linux等)
         isRelayMode,
         relayFrame,
+        relayVideoUrl,
+        relayAudioUrl,
         getRelayStats,
     } = useWebRTC({ signalingUrl, turnConfig });
 
@@ -575,6 +589,16 @@ export function RoomView({ onLeave, signalingUrl, turnConfig, e2eConfig, onOpenS
                     </div>
                 </div>
 
+                {/* WSリレー音声 (webm/opus をMSEで再生。ゲストはここでホストのシステム音声を聞く) */}
+                {isRelayMode && relayAudioUrl && (
+                    <audio
+                        src={relayAudioUrl}
+                        autoPlay
+                        className="hidden"
+                        onCanPlay={(e) => { void e.currentTarget.play().catch(() => { /* 自動再生ポリシー */ }); }}
+                    />
+                )}
+
                 {/* Video Grid Area */}
                 <div className="flex-1 p-6 overflow-y-auto custom-scrollbar">
                     <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-4 auto-rows-fr">
@@ -612,12 +636,13 @@ export function RoomView({ onLeave, signalingUrl, turnConfig, e2eConfig, onOpenS
                         ))}
 
                         {/* WSリレー (WebRTC非対応エンジン: Linux等からの受信) */}
-                        {isRelayMode && relayFrame && (() => {
+                        {isRelayMode && (relayVideoUrl || relayFrame) && (() => {
                             const hostPeer = Array.from(participants.keys()).find(id => id !== myId) || '';
                             return (
                                 <VideoGridItem
                                     key="relay-frame"
-                                    frameSrc={relayFrame}
+                                    frameSrc={relayVideoUrl ? undefined : relayFrame}
+                                    mseUrl={relayVideoUrl}
                                     label={`${participants.get(hostPeer)?.name || 'Host'} (リレー)`}
                                     control={{
                                         peerId: hostPeer,
@@ -630,7 +655,7 @@ export function RoomView({ onLeave, signalingUrl, turnConfig, e2eConfig, onOpenS
                         })()}
 
                         {/* Empty State if no streams */}
-                        {!localStream && localStreams.size === 0 && remoteStreams.size === 0 && !relayFrame && (
+                        {!localStream && localStreams.size === 0 && remoteStreams.size === 0 && !relayFrame && !relayVideoUrl && (
                             <div className="col-span-full h-96 flex flex-col items-center justify-center text-[var(--md-on-surface-variant)] border-2 border-dashed border-[var(--md-outline-variant)] rounded-xl bg-[var(--md-surface-low)]">
                                 <svg className="w-12 h-12 mb-4 opacity-40" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1} d="M15 10l4.553-2.276A1 1 0 0121 8.618v6.764a1 1 0 01-1.447.894L15 14M5 18h8a2 2 0 002-2V8a2 2 0 00-2-2H5a2 2 0 00-2 2v8a2 2 0 002 2z" /></svg>
                                 <p className="text-base font-medium">まだ共有はありません</p>
