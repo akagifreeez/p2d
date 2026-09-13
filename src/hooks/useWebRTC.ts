@@ -1104,7 +1104,9 @@ export function useWebRTC(options?: { signalingUrl?: string; turnConfig?: TurnCo
     const coordinateTree = (newSubId: string) => {
         const myId = myIdRef.current;
         if (!myId) return;
-        if (treeRoleRef.current === 'none') treeRoleRef.current = 'host';
+        // コーディネータはホスト (根) のみが務める。視聴者は自らをhost役に
+        // 上げない (複数コーディネータ分裂を防ぐ — scale testで判明)
+        if (!isHostRef.current) return;
         const c = treeCoordinatorRef.current ??= {
             root: createTreeRoot(myId, treeFanoutRef.current),
             promotePending: null,
@@ -1141,12 +1143,31 @@ export function useWebRTC(options?: { signalingUrl?: string; turnConfig?: TurnCo
         const node = findTreeNode(c.root, senderId);
         if (node) treePromote(node, addr);
         console.log(`[Tree] 中継 ${senderId} が準備完了: ${addr.host}:${addr.port}`);
-        // 満杯で待っていた視聴者を中継へ割り当てる
+        // 満杯で待っていた視聴者を、中継のfan-out上限まで割り当てる (超過分は次の昇格へ)
+        let slots = node?.fanout ?? 0;
+        const assigned = new Set<string>();
+        const remaining = new Set<string>();
         for (const id of c.overCapacity) {
-            signalingRef.current?.sendRelay(id, 'tree:assign', { addr });
+            if (node && slots > 0) {
+                slots--;
+                treeAttach(node, { id, addr: null, depth: 0, fanout: 0, children: [] });
+                signalingRef.current?.sendRelay(id, 'tree:assign', { addr });
+                assigned.add(id);
+            } else {
+                remaining.add(id);
+            }
         }
-        c.overCapacity.clear();
+        c.overCapacity = remaining;
+        // まだ溢れている場合: 次の昇格候補 (中継未昇格の直結視聴者) を昇格させる
         c.promotePending = null;
+        if (c.overCapacity.size > 0) {
+            const candidate = c.root.children.find(ch => !ch.addr);
+            if (candidate) {
+                c.promotePending = candidate.id;
+                console.log(`[Tree] 直結が満杯のまま → ${candidate.id} を追加で中継昇格`);
+                signalingRef.current?.sendRelay(candidate.id, 'tree:promote', { code: roomCodeRef.current });
+            }
+        }
     };
 
     /** ゲスト側: 中継へ昇格 — 自分の内蔵サーバーを起動し子を受け付ける (M2) */
@@ -1494,6 +1515,19 @@ export function useWebRTC(options?: { signalingUrl?: string; turnConfig?: TurnCo
                     createPeerConnection(p.id, true); // Initiator = true
                 }
             });
+            // リレー視聴者のsubscribe再送: 複数WS間の到達順競合で、視聴者のsubscribeが
+            // ホストのpeer:joined処理より先に届くと参加者ガードに破棄されるため、
+            // 鍵 (relay:key) を受け取るまで再送し続けて収束させる (ホスト側の登録は冪等)
+            if (relayModeRef.current && existingParticipants.length > 0) {
+                [2000, 5000, 9000, 14000].forEach(delay => window.setTimeout(() => {
+                    if (!signalingRef.current?.isConnected) return;
+                    if (cachedKeyRef.current) return; // 既に鍵受信=受信経路は確立済み
+                    for (const p of existingParticipants) {
+                        if (!participantsRef.current.has(p.id)) continue;
+                        signalingRef.current?.sendRelay(p.id, 'subscribe', detectRelayCapabilities());
+                    }
+                }, delay));
+            }
             broadcastRosterSync();
         });
 
@@ -1747,6 +1781,7 @@ export function useWebRTC(options?: { signalingUrl?: string; turnConfig?: TurnCo
      */
     const createRoom = useCallback(async (name?: string) => {
         isHostRef.current = true;
+        treeRoleRef.current = 'host';
         migratedRef.current = false;
         selfJoinedAtRef.current = Date.now();
         // M2: ホスト内蔵サーバーを起動 (中央サーバー死亡後の再合流・サーバーレス参加の入口)
