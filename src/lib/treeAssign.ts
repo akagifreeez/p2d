@@ -122,6 +122,25 @@ export function handleNodeLoss(root: TreeNode, lostId: string): TreeNode[] {
 }
 
 /**
+ * 昇格候補を幅優先で探す (issue #7 のfan-out強制対応)。
+ * root直結に限らず、木全体から「最浅の未昇格ノード」を返す。
+ * これがないとroot直結が全て昇格済みになった時点で候補ゼロとなり、
+ * 超過分の視聴者が永遠にホスト直結のまま残留する。
+ * root自身はホストなので昇格対象外。
+ */
+export function findPromoteCandidate(root: TreeNode, maxDepth = MAX_DEPTH): TreeNode | null {
+    const queue: TreeNode[] = [root];
+    while (queue.length > 0) {
+        const node = queue.shift()!;
+        if (node !== root && !node.addr && node.depth + 1 <= maxDepth) {
+            return node;
+        }
+        queue.push(...node.children);
+    }
+    return null;
+}
+
+/**
  * 中継ノードを昇格させる (子を引き受けられるようにする)。
  * fan-outは§3.1どおり中継視聴者は2。
  */

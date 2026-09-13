@@ -26,6 +26,7 @@ import {
 import {
     createRoot as createTreeRoot, attach as treeAttach, promote as treePromote,
     pickParent as pickTreeParent, findNode as findTreeNode, handleNodeLoss,
+    findPromoteCandidate as findTreePromoteCandidate,
 } from '../lib/treeAssign';
 import {
     chooseSignalRoute, makeEnvelope, forwardEnvelope,
@@ -1135,9 +1136,11 @@ export function useWebRTC(options?: { signalingUrl?: string; turnConfig?: TurnCo
             return;
         }
 
-        // ホスト直結が満杯: 最古の直結視聴者 (中継未昇格) を昇格する
+        // ホスト直結が満杯: 木全体から最浅の未昇格ノードを昇格する (issue#7)。
+        // root直結に限定すると、直結が全て昇格済みの時点で候補ゼロになり
+        // 超過分の視聴者が永遠にホスト直結のまま残留する
         c.overCapacity.add(newSubId);
-        const candidate = c.root.children.find((ch: { addr: unknown; id: string }) => !ch.addr && ch.id !== c.promotePending);
+        const candidate = findTreePromoteCandidate(c.root, 3);
         if (candidate && !c.promotePending) {
             console.log(`[Tree] 直結満員 → ${candidate.id} を中継へ昇格指示`);
             c.promotePending = candidate.id;

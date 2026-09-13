@@ -8,7 +8,8 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
     createRoot, attach, attachUnder, promote, pickParent, detachSubtree, reassignOrphans,
-    validateInvariants, findNode, flatten, ROOT_FANOUT, RELAY_FANOUT, MAX_DEPTH,
+    validateInvariants, findNode, flatten, findPromoteCandidate,
+    ROOT_FANOUT, RELAY_FANOUT, MAX_DEPTH,
 } from '../src/lib/treeAssign.js';
 
 test('M1: 10ノード割り当てシミュレーション — 深さ≤3・fan-out≤上限を満たす', () => {
@@ -130,4 +131,50 @@ test('幅優先: 浅いノードから順に満たす', () => {
     assert.ok(p);
     // ホスト直結(深さ1)がまだ空き → そちらが優先される
     assert.equal(p.id, 'host');
+});
+
+test('issue#7: fanout=2で9視聴者 — BFS昇格により全員がfan-out/深さ上限内で収容される', () => {
+    const root = createRoot('host', 2);
+    let portSeq = 9000;
+    const promoteShallowest = () => {
+        const cand = findPromoteCandidate(root, 3);
+        if (!cand) return false;
+        promote(cand, { host: 'h' + cand.id, port: portSeq++ }, 2);
+        return true;
+    };
+    let assigned = 0;
+    for (let i = 1; i <= 9; i++) {
+        const id = 'v' + i;
+        let parent = pickParent(root, 3);
+        if (!parent) {
+            if (promoteShallowest()) parent = pickParent(root, 3);
+        }
+        assert.ok(parent, `v${i}: 割り当て先が見つかるべき (assigned=${assigned})`);
+        attach(root, { id, addr: null, depth: 0, fanout: 0, children: [] });
+        assigned++;
+    }
+    assert.equal(assigned, 9);
+    const inv = validateInvariants(root, 3);
+    assert.ok(inv.ok, `不変条件違反: ${inv.violations.join(', ')}`);
+    // 中継のfan-outは全て上限2以内 (validateInvariantsが検証済み)
+});
+
+test('issue#7: fanout=1でも鎖が深さ3まで構築され、以降は拒否される', () => {
+    const root = createRoot('host', 1);
+    let portSeq = 9000;
+    for (let i = 1; i <= 5; i++) {
+        const id = 'c' + i;
+        let parent = pickParent(root, 3);
+        if (!parent) {
+            const cand = findPromoteCandidate(root, 3);
+            if (!cand) { assert.ok(i > 3, `c${i} は深さ上限までの間なら割り当てられるべき`); break; }
+            promote(cand, { host: 'h' + cand.id, port: portSeq++ }, 1);
+            parent = pickParent(root, 3);
+        }
+        assert.ok(parent, `c${i}: 割り当て成功するべき`);
+        attach(root, { id, addr: null, depth: 0, fanout: 0, children: [] });
+    }
+    assert.equal(flatten(root).length, 4); // host + c1..c3 (深さ上限=3なのでc4以降は拒否)
+    const inv = validateInvariants(root, 3);
+    assert.ok(inv.ok);
 });
