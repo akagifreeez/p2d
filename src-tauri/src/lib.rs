@@ -112,9 +112,9 @@ pub fn run() {
             // システム音声キャプチャ状態の初期化 (F-031)
             app.manage(services::audio_capture::AudioCaptureState(Mutex::new(None)));
 
-            // Discord Presenceワーカー起動 (F-050)
+            // Discord Presenceワーカー起動 (F-050/F-052)
             app.manage(services::discord::DiscordPresenceState(
-                Mutex::new(Some(services::discord::start_worker())),
+                Mutex::new(Some(services::discord::start_worker(app.handle().clone()))),
             ));
 
             // ディープリンク (p2d://join/CODE) の処理 (F-051)

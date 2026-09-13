@@ -18,14 +18,10 @@ import {
     RelayH264Encoder, detectRelayCapabilities, arrayBufferToBase64, base64ToArrayBuffer,
     RELAY_MSE_VIDEO_MIME, RELAY_MSE_AUDIO_MIME, RELAY_AUDIO_REC_MIME,
 } from '../lib/relayEncoder';
+import { getRelayQualityPreset, RELAY_QUALITY_CHANGED_EVENT } from '../lib/relayQuality';
 
 // WebRTC APIの有無 (Ubuntu等のWebKitGTKはWebRTC無効ビルドで RTCPeerConnection が存在しない)
 export const SUPPORTS_WEBRTC = typeof RTCPeerConnection !== 'undefined';
-
-// WSリレーの画質パラメータ (JPEG+canvas方式。LAN想定)
-const RELAY_MAX_WIDTH = 1600;
-const RELAY_INTERVAL_MS = 80; // 約12.5fps
-const RELAY_JPEG_QUALITY = 0.6;
 
 // WSリレー視聴者の能力 (subscribe時に申告)
 interface RelayViewerCaps {
@@ -449,6 +445,8 @@ export function useWebRTC(options?: { signalingUrl?: string; turnConfig?: TurnCo
      */
     const ensureRelayLoop = useCallback(() => {
         if (relayLoopRef.current || !SUPPORTS_WEBRTC) return;
+        const q = getRelayQualityPreset();
+        const intervalMs = Math.round(1000 / q.fps);
         const stream = localStreamsRef.current.values().next().value || localStreamRef.current;
         const videoTrack = stream?.getVideoTracks?.()[0];
         if (!videoTrack) return; // 画面共有開始時に再度呼ばれる
@@ -467,7 +465,7 @@ export function useWebRTC(options?: { signalingUrl?: string; turnConfig?: TurnCo
             if (mseSubs.length === 0 && jpegSubs.length === 0) return;
             if (!video.videoWidth) return;
             if (video.readyState < 2) return;
-            const w = Math.min(RELAY_MAX_WIDTH, video.videoWidth);
+            const w = Math.min(q.maxWidth, video.videoWidth);
             const h = Math.round(video.videoHeight * (w / video.videoWidth));
             if (canvas.width !== w || canvas.height !== h) {
                 canvas.width = w;
@@ -483,7 +481,7 @@ export function useWebRTC(options?: { signalingUrl?: string; turnConfig?: TurnCo
             if (mseSubs.length > 0) {
                 if (!relayEncoderRef.current) {
                     relayEncoderRef.current = new RelayH264Encoder({
-                        width: w, height: h,
+                        width: w, height: h, bitrate: q.bitrate,
                         onBox: (buf) => {
                             const d = arrayBufferToBase64(buf);
                             relayStatsRef.current.h264Chunks++;
@@ -499,7 +497,7 @@ export function useWebRTC(options?: { signalingUrl?: string; turnConfig?: TurnCo
 
             // JPEG (低遅延フォールバック)
             if (jpegSubs.length > 0) {
-                const dataUrl = canvas.toDataURL('image/jpeg', RELAY_JPEG_QUALITY);
+                const dataUrl = canvas.toDataURL('image/jpeg', q.jpegQuality);
                 const b64 = dataUrl.slice(dataUrl.indexOf(',') + 1);
                 relayFrameSeqRef.current++;
                 relayStatsRef.current.frames++;
@@ -507,8 +505,8 @@ export function useWebRTC(options?: { signalingUrl?: string; turnConfig?: TurnCo
                     signalingRef.current?.sendRelay(peerId, 'frame', { seq: relayFrameSeqRef.current, w, h, d: b64 });
                 }
             }
-        }, RELAY_INTERVAL_MS);
-        console.log('[Relay] フレーム送信ループ開始');
+        }, intervalMs);
+        console.log(`[Relay] フレーム送信ループ開始 (品質: ${q.label} ${q.maxWidth}px / ${(q.bitrate / 1_000_000).toFixed(1)}Mbps / ${q.fps}fps)`);
     }, []);
 
     /**
@@ -536,6 +534,17 @@ export function useWebRTC(options?: { signalingUrl?: string; turnConfig?: TurnCo
             stopRelayLoop();
         }
     }, [stopRelayLoop]);
+
+    // リレー品質設定の変更で稼働中のループを作り直す (停止中なら次回start時から新設定)
+    useEffect(() => {
+        const onQualityChanged = () => {
+            if (!relayLoopRef.current) return;
+            stopRelayLoop();
+            ensureRelayLoop();
+        };
+        window.addEventListener(RELAY_QUALITY_CHANGED_EVENT, onQualityChanged);
+        return () => window.removeEventListener(RELAY_QUALITY_CHANGED_EVENT, onQualityChanged);
+    }, [stopRelayLoop, ensureRelayLoop]);
 
     /**
      * ホスト側: システム音声をリレー視聴者へ送る (MediaRecorder → webm/opusチャンク)

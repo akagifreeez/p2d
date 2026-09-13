@@ -159,6 +159,7 @@ function VideoGridItem({
 
 import type { TurnConfig } from '../hooks/useWebRTC';
 import { runE2E, type E2eConfig, type E2eDeps } from '../lib/e2eRunner';
+import { applyRelayQuality, getRelayQualityKey, RELAY_QUALITY_PRESETS, type RelayQualityKey } from '../lib/relayQuality';
 
 export function RoomView({ onLeave, signalingUrl, turnConfig, e2eConfig, onOpenSettings }: { onLeave: () => void; signalingUrl?: string; turnConfig?: TurnConfig; e2eConfig?: E2eConfig | null; onOpenSettings?: () => void }) {
     const {
@@ -323,6 +324,13 @@ export function RoomView({ onLeave, signalingUrl, turnConfig, e2eConfig, onOpenS
 
     // --- QR接続 (F-012) / 接続履歴 (F-013) ---
     const [showQr, setShowQr] = useState(false);
+
+    // --- リレー品質プリセット (WSリレーのホスト側設定。変更はイベントで稼働中ループへ反映) ---
+    const [relayQualityKey, setRelayQualityKeyState] = useState<RelayQualityKey>(getRelayQualityKey());
+    const setRelayQuality = (key: RelayQualityKey) => {
+        setRelayQualityKeyState(key);
+        applyRelayQuality(key);
+    };
     const [showQrScan, setShowQrScan] = useState(false);
     const [recentRooms, setRecentRooms] = useState<RecentRoom[]>([]);
     useEffect(() => {
@@ -860,6 +868,30 @@ export function RoomView({ onLeave, signalingUrl, turnConfig, e2eConfig, onOpenS
                                         onClick={() => setRemoteControlAllowed(!remoteControlAllowed)}
                                         className={`md-switch ${remoteControlAllowed ? 'on' : ''}`}
                                     />
+                                </div>
+
+                                {/* リレー品質 (WSリレー配信のホスト側エンコード設定) */}
+                                <div className="mt-5">
+                                    <label className="block text-sm font-medium mb-2">リレー品質 (WebRTC非対応の視聴者向け)</label>
+                                    <div className="grid grid-cols-3 gap-2">
+                                        {(Object.keys(RELAY_QUALITY_PRESETS) as RelayQualityKey[]).map((key) => (
+                                            <button
+                                                key={key}
+                                                onClick={() => setRelayQuality(key)}
+                                                className={`py-2 rounded-lg text-sm border transition-colors ${relayQualityKey === key
+                                                    ? 'bg-[var(--md-primary)] text-[var(--md-on-primary)] border-transparent'
+                                                    : 'border-[var(--md-outline-variant)] hover:bg-[var(--md-surface-container)]'}`}
+                                            >
+                                                {RELAY_QUALITY_PRESETS[key].label}
+                                                <div className="text-[10px] opacity-80 mt-0.5">
+                                                    {RELAY_QUALITY_PRESETS[key].maxWidth}px / {(RELAY_QUALITY_PRESETS[key].bitrate / 1_000_000).toFixed(1)}Mbps
+                                                </div>
+                                            </button>
+                                        ))}
+                                    </div>
+                                    <div className="text-xs text-[var(--md-on-surface-variant)] mt-2">
+                                        共有中でも即時反映されます。視聴者全員がWebRTC対応の場合は使用されません。
+                                    </div>
                                 </div>
 
                                 {/* Discord Rich Presence (F-050) */}

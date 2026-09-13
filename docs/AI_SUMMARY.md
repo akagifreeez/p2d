@@ -146,13 +146,14 @@ signaling-server/
 *   **Discord Rich Presence (F-050) / 参加ボタン (F-051)**: ルーム中のDiscordステータス表示 + `p2d://join/<code>` ディープリンク参加。要Discord Application ID (設定モーダルまたは起動引数)
 *   **QR接続 (F-012) / 接続履歴 (F-013)**: ルーム内QR表示・カメラスキャン参加・直近8件の履歴チップ
 *   **ピアレベル自動再接続**: ICE `failed` / `disconnected` 5秒継続で `restartIce()` + 再交渉 (グレア対策: ID比較でoffer送信側を決定)。SDP処理はピア単位で直列化。復旧しない場合は部屋再参加で全接続を再構築 (受信メディアの実績があるピア限定)。シグナリング再接続時は部屋に自動再参加。**実環境検証済み (2026-09-13)**: デスクトップ⇔ノートPCでWi-Fi 16秒断を複数回実施し、自動再接続→メディア復帰を確認
-*   **Discord招待 (F-052 v1)**: QRモーダルの「Discord招待文をコピー」で `p2d://join/<code>` 付き招待文をクリップボードへ (RPC経由のjoin secret受信はdiscord-rich-presenceクレートの制約で未対応、将来discord-sdk置換で対応)
+*   **Discord招待 (F-052 v2)**: Rust側を `discord-sdk` 0.4 に移行。プレゼンスに join secret (=ルームコード) を載せ、相手がDiscord上で「参加」した際の **ACTIVITY_JOINイベントを受信**してディープリンクと同じ `p2d-join-url` 経路で自動参加。QRモーダルの「Discord招待文をコピー」(v1) も継続。**要実機確認**: 本環境にDiscordクライアントが無いため、実際の受信は有効なApplication ID+Discord起動+2人のDiscordユーザーで確認すること
+*   **リレー品質設定UI**: 設定モーダルで 省データ(1024px/1Mbps/10fps) / 標準(1600px/2.5Mbps/12fps) / 高画質(1920px/5Mbps/15fps) を選択。localStorage保存・変更イベントで稼働中のエンコーダを即時作り直し
 *   **Linux検証 (2026-09-13)**: pve上にUbuntu 24.04 VM (192.168.11.16) をcloud-initで自動構築しネイティブビルド。`tauri build` で **deb/rpm/AppImage生成✅**・起動✅・M3 UI描画✅(Noto CJK)・履歴機能✅・シグナリング参加✅。ただし**P2P本体は不可** — Ubuntu/Debian系公式WebKitGTKはWebRTC無効ビルドで`RTCPeerConnection`が未定義 (実証: python-giプローブNO_RTCPC + tcpdumpでメディアパケット0 + offer受信後もanswer不出力)。詳細はKnown Issues
 
 *   **WSリレーモード (2026-09-13実装・実機検証済み)**: WebRTC非対応エンジン(Linux WebKitGTK)向けフォールバック。2モード: **H264/fMP4+MSE (品質モード・デフォルト)** — ホストがWebCodecs VideoEncoder(avc1.420028, 2.5Mbps)→mp4-muxer(fragmented)→top-level box再組立(moof+mdatペア)でWS送信、ゲストはMediaSource(sequence)で`<video>`再生。JPEG比~1/10の帯域・MSE分の1-2秒遅延 / **JPEG (低遅延フォールバック)** — canvas→toDataURLを`<img>`描画。ゲストの能力(`MediaSource.isTypeSupported`)をsubscribe時に申告しホストが視聴者ごとに切替。**音声リレー**: システム音声をMediaRecorder(webm/opus 48kbps)でチャンク送信→ゲストはwebm MSE。チャット(`relay:chat`)・リモート操作入力(`relay:input`)・操作許可バッジ(`relay:control_allowed`)もWS。視聴者subscribe時のみ送信=WebRTC全員対応なら零コスト。自動判定: `typeof RTCPeerConnection === 'undefined'`。**実機検証(2026-09-13)**: デスクトップ(Windows host) × Ubuntu 24.04 VM (guest) で guest passed:true — H264のみで受信(jpegFrames=0)・音声チャンク着信・チャット往復・操作バッジ・スクショでデコード描画を確認。**実装の罠**: sourceopenまでに届いたinit segmentをキューに溜めるだけでは流されず、fragmentが先にappendされてMSEが即死する → sourceopen時に必ずpumpすること
 
 ### 🔄 In Progress / TODO
-*   F-052のRPC完全対応 (join secret + ACTIVITY_JOIN受信)
+*   F-052の実機確認 (有効なApplication ID + Discord起動 + 2人のDiscordユーザーでACTIVITY_JOIN受信を確認 — コードは完了)
 *   macOSテスト (Apple Silicon実機必須。Linuxは2026-09-13検証済み — Known Issuesのプラットフォーム制約あり)
 
 ### 📐 配送方式ロードマップ (2026-09-13 本人確認済みの計画)

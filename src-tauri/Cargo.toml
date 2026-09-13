@@ -20,10 +20,11 @@ serde_json = "1"
 enigo = "0.3"
 arboard = "3.4"
 cpal = "0.15"
-tokio = { version = "1", features = ["rt"] }
+tokio = { version = "1", features = ["rt", "sync", "net", "time"] }
 xcap = "0.8.1"
 image = { version = "0.25.9", features = ["png", "jpeg", "webp"] }
 base64 = "0.22.1"
-discord-rich-presence = "1.1.0"
 tauri-plugin-deep-link = "2.4.10"
 tauri-plugin-single-instance = "2.4.4"
+discord-sdk = "0.4.0"
+async-trait = "0.1.92"
