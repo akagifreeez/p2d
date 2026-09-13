@@ -147,13 +147,14 @@ signaling-server/
 *   **QR接続 (F-012) / 接続履歴 (F-013)**: ルーム内QR表示・カメラスキャン参加・直近8件の履歴チップ
 *   **ピアレベル自動再接続**: ICE `failed` / `disconnected` 5秒継続で `restartIce()` + 再交渉 (グレア対策: ID比較でoffer送信側を決定)。SDP処理はピア単位で直列化。復旧しない場合は部屋再参加で全接続を再構築 (受信メディアの実績があるピア限定)。シグナリング再接続時は部屋に自動再参加。**実環境検証済み (2026-09-13)**: デスクトップ⇔ノートPCでWi-Fi 16秒断を複数回実施し、自動再接続→メディア復帰を確認
 *   **Discord招待 (F-052 v1)**: QRモーダルの「Discord招待文をコピー」で `p2d://join/<code>` 付き招待文をクリップボードへ (RPC経由のjoin secret受信はdiscord-rich-presenceクレートの制約で未対応、将来discord-sdk置換で対応)
+*   **Linux検証 (2026-09-13)**: pve上にUbuntu 24.04 VM (192.168.11.16) をcloud-initで自動構築しネイティブビルド。`tauri build` で **deb/rpm/AppImage生成✅**・起動✅・M3 UI描画✅(Noto CJK)・履歴機能✅・シグナリング参加✅。ただし**P2P本体は不可** — Ubuntu/Debian系公式WebKitGTKはWebRTC無効ビルドで`RTCPeerConnection`が未定義 (実証: python-giプローブNO_RTCPC + tcpdumpでメディアパケット0 + offer受信後もanswer不出力)。詳細はKnown Issues
 
 ### 🔄 In Progress / TODO
 *   F-052のRPC完全対応 (join secret + ACTIVITY_JOIN受信)
-*   クロスプラットフォームテスト (仕様§9 Phase 3)
+*   macOSテスト (Apple Silicon実機必須。Linuxは2026-09-13検証済み — Known Issuesのプラットフォーム制約あり)
 
 ### ⚠️ Known Issues
-*   WebRTCピアレベルの自動再接続は未検証 (シグナリングWSの再接続のみ実装済み)
+*   **Linux (Ubuntu/Debian系) はP2P不可**: ディストリ公式WebKitGTKがWebRTC無効ビルド (`typeof RTCPeerConnection === 'undefined'`)。GStreamerプラグイン(webrtc/dtls/nice等)を入れても回復しない=エンジン層の欠如。ビルド・起動・UI・シグナリング参加・履歴は正常。将来の選択肢: メディアリレーフォールバック / CEF評価 / 独自ビルドWebKit配布(非現実的)
 *   複数音声トラック (マイク+システム音声) のリモート再生はChromiumのメディア要素ミキシング挙動に依存
 *   システム音声共有はスピーカー出力を丸ごと拾うため、相手の音声もループする (エコー防止はヘッドホン推奨・UIのツールチップに記載済み)
 *   Discord Rich Presenceは有効なApplication IDが無いと表示されない (偽IDではIPC接続後にActivity送信で切断される。動作自体は正常=ログ `[Discord] IPC接続成功`)
