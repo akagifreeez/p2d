@@ -105,9 +105,15 @@ pub async fn embedded_server_start(
     let want_port = port.unwrap_or(DEFAULT_EMBEDDED_PORT);
     let want_host = host.unwrap_or_else(|| "0.0.0.0".to_string());
 
-    let listener = TcpListener::bind((want_host.as_str(), want_port))
-        .await
-        .map_err(|e| format!("{want_host}:{want_port}をlistenできません: {e}"))?;
+    // 指定ポートが塞がっていた場合 (例: 同一マシン上の複数インスタンスが各自
+    // 内蔵サーバーを持つ配信木ケース) はエフェメラルポートへフォールバックする
+    let listener = match TcpListener::bind((want_host.as_str(), want_port)).await {
+        Ok(l) => l,
+        Err(bind_err) if want_port != 0 => TcpListener::bind((want_host.as_str(), 0))
+            .await
+            .map_err(|e| format!("{want_host}:{want_port}とエフェメラルポートの両方でlistenできません: {bind_err} / {e}"))?,
+        Err(e) => return Err(format!("{want_host}:0をlistenできません: {e}")),
+    };
 
     let (shutdown_tx, mut shutdown_rx) = mpsc::unbounded_channel::<()>();
     let shared: SharedState = Arc::new(Mutex::new(ServerStateInner::default()));

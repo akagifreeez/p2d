@@ -167,6 +167,10 @@ pub struct E2eConfig {
     pub signaling_url: Option<String>,
     /// フロー後のクリーンアップ (共有停止) をスキップし接続を維持する (再接続検証用)
     pub stay: Option<String>,
+    /// WebRTC対応エンジンでも強制的にWSリレーモードにする (配信木のE2E検証用)
+    pub force_relay: bool,
+    /// 配信木コーディネータのホスト直結上限 (既定4。E2Eでは小さくして昇格を誘発)
+    pub tree_fanout: Option<u16>,
 }
 
 /// E2E設定を起動引数 / 環境変数から取得
@@ -176,7 +180,14 @@ pub struct E2eConfig {
 #[tauri::command]
 pub fn get_e2e_config() -> E2eConfig {
     let role = e2e_opt("--p2d-e2e-role=", "P2D_E2E_ROLE");
+    let force_relay = e2e_opt("--p2d-force-relay=", "P2D_FORCE_RELAY")
+        .map(|v| v == "1" || v == "true")
+        .unwrap_or(false);
+    let tree_fanout = e2e_opt("--p2d-tree-fanout=", "P2D_TREE_FANOUT")
+        .and_then(|v| v.parse::<u16>().ok());
     E2eConfig {
+        force_relay,
+        tree_fanout,
         enabled: role.is_some(),
         role,
         sync_path: e2e_opt("--p2d-e2e-sync=", "P2D_E2E_SYNC"),

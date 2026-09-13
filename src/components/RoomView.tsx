@@ -221,7 +221,11 @@ export function RoomView({ onLeave, signalingUrl, turnConfig, e2eConfig, onOpenS
         // レンデブー最小化 (M1/M4): 名簿ゴシップ + 招待v2直行参加
         getRoster,
         joinRoomAt,
-    } = useWebRTC({ signalingUrl, turnConfig });
+        // 配信木 (M2〜M4): 強制リレー+コーディネータ
+        setRelayMode,
+        getTreeInfo,
+        getRelayKeyFingerprint,
+    } = useWebRTC({ signalingUrl, turnConfig, treeFanout: e2eConfig?.treeFanout ?? undefined });
 
     // E2E自己テストランナー (P2D_E2E_ROLE 環境変数がある起動でのみ動作)
     const e2eDepsRef = useRef<E2eDeps | null>(null);
@@ -232,8 +236,13 @@ export function RoomView({ onLeave, signalingUrl, turnConfig, e2eConfig, onOpenS
         setRemoteControlAllowed, startSystemAudio, stopSystemAudio,
         sendChatMessage, getPeerStats,
         isRelayMode, getRelayStats,
-        getRoster,
+        getRoster, getTreeInfo,
     };
+    // 配信木E2E: forceRelay指定時はWebRTC対応エンジンでもリレーモードへ強制
+    useEffect(() => {
+        if (e2eConfig?.forceRelay) setRelayMode(true);
+    }, [e2eConfig, setRelayMode]);
+
     const e2eStartedRef = useRef(false);
     useEffect(() => {
         if (!e2eConfig?.enabled || e2eStartedRef.current) return;
@@ -370,6 +379,17 @@ export function RoomView({ onLeave, signalingUrl, turnConfig, e2eConfig, onOpenS
         })();
         return () => { cancelled = true; };
     }, [roomCode, isConnected]);
+
+    // M4: 署名鍵フィンガープリント (QRに同梱して帯域外照合)
+    const [keyFingerprint, setKeyFingerprint] = useState<string | null>(null);
+    useEffect(() => {
+        if (!roomCode || !isConnected) {
+            setKeyFingerprint(null);
+            return;
+        }
+        const t = window.setTimeout(() => setKeyFingerprint(getRelayKeyFingerprint()), 1000);
+        return () => window.clearTimeout(t);
+    }, [roomCode, isConnected, getRelayKeyFingerprint]);
 
     // --- リレー品質プリセット (WSリレーのホスト側設定。変更はイベントで稼働中ループへ反映) ---
     const [relayQualityKey, setRelayQualityKeyState] = useState<RelayQualityKey>(getRelayQualityKey());
@@ -1000,7 +1020,7 @@ export function RoomView({ onLeave, signalingUrl, turnConfig, e2eConfig, onOpenS
 
             {/* QR Share (F-012) */}
             {showQr && roomCode && (
-                <QrModal roomCode={roomCode} inviteEndpoint={inviteEndpoint} onClose={() => setShowQr(false)} />
+                <QrModal roomCode={roomCode} inviteEndpoint={inviteEndpoint} keyFingerprint={keyFingerprint} onClose={() => setShowQr(false)} />
             )}
             {showQrScan && (
                 <QrScannerModal

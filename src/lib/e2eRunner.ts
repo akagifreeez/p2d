@@ -20,6 +20,10 @@ export interface E2eConfig {
     room: string | null;
     signalingUrl: string | null;
     stay: string | null;
+    /** 配信木テスト: WebRTC対応でもWSリレーモードへ強制 */
+    forceRelay: boolean;
+    /** 配信木コーディネータのホスト直結上限 */
+    treeFanout: number | null;
 }
 
 export interface E2eDeps {
@@ -47,6 +51,13 @@ export interface E2eDeps {
     };
     // レンデブー最小化 (M1): 名簿ゴシップのエントリ一覧 (収束検証)
     getRoster: () => { id: string }[];
+    // 配信木 (M2/M3): 自ノードの状態
+    getTreeInfo: () => {
+        role: 'none' | 'host' | 'relay';
+        children: string[];
+        addr: { host: string; port: number } | null;
+        parent: string | null;
+    };
 }
 
 const sleep = (ms: number) => new Promise(r => setTimeout(r, ms));
@@ -187,6 +198,9 @@ export async function runE2E(cfg: E2eConfig, deps: E2eDeps): Promise<void> {
                 15000, 'guest chat'
             );
             step('chat_roundtrip', gotGuestChat, { received: deps.chatMessages.length });
+
+            // 配信木: 昇格/割り当ての結果 (treeFanout超過時に中継が生まれる)
+            step('tree_topology', true, { tree: deps.getTreeInfo() });
 
             // stay時: 後から来た参加者 (サーバー死亡後の内蔵サーバー経由参加など) にも
             // チャット経路を検証できるよう、ホストのpingを定期的に再送する

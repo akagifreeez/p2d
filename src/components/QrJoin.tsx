@@ -11,7 +11,7 @@ import QRCode from 'qrcode';
 import jsQR from 'jsqr';
 import { buildInvite } from '../lib/invite';
 
-export function QrModal({ roomCode, inviteEndpoint, onClose }: { roomCode: string; inviteEndpoint?: string | null; onClose: () => void }) {
+export function QrModal({ roomCode, inviteEndpoint, keyFingerprint, onClose }: { roomCode: string; inviteEndpoint?: string | null; keyFingerprint?: string | null; onClose: () => void }) {
     const [dataUrl, setDataUrl] = useState('');
     const [copied, setCopied] = useState('');
 
@@ -49,6 +49,11 @@ export function QrModal({ roomCode, inviteEndpoint, onClose }: { roomCode: strin
                     <div className="h-[280px] flex items-center justify-center text-[var(--md-on-surface-variant)]">QR生成中…</div>
                 )}
                 <div className="mt-5 text-2xl font-mono font-bold tracking-[0.3em] text-[var(--md-primary)]">{roomCode}</div>
+                {keyFingerprint && (
+                    <div className="mt-2 text-[10px] font-mono text-[var(--md-on-surface-variant)]" title="ホストの署名鍵の指紋。配信木経由でも受信映像が本物のホスト産か、この照合で帯域外検証できます">
+                        鍵FP: <span className="tracking-normal">{keyFingerprint}</span>
+                    </div>
+                )}
                 <p className="text-xs text-[var(--md-on-surface-variant)] mt-2">
                     カメラで読み取ると <span className="font-mono">{invitePayload}</span> が開き、P2Dが自動参加します。
                     読めない場合は上のコードを手入力してください。

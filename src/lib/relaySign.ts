@@ -69,6 +69,12 @@ export function verifyChunk(
     }
 }
 
+/** 公開鍵のフィンガープリント (SHA-512先頭8バイトhex)。QRに同梱して帯域外照合に使う (M4) */
+export function keyFingerprint(publicKeyB64: string): string {
+    const h = nacl.hash(b64decode(publicKeyB64));
+    return Array.from(h.slice(0, 8)).map(b => b.toString(16).padStart(2, '0')).join('');
+}
+
 /** チャンクのデータ部 (base64 → bytes) を取り出す */
 export function chunkDataFromB64(dB64: string): Uint8Array {
     return b64decode(dB64);

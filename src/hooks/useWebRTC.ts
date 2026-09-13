@@ -24,10 +24,14 @@ import {
     type RosterState, type RosterEntry,
 } from '../lib/roster';
 import {
+    createRoot as createTreeRoot, attach as treeAttach, promote as treePromote,
+    pickParent as pickTreeParent, findNode as findTreeNode, detachSubtree,
+} from '../lib/treeAssign';
+import {
     chooseSignalRoute, makeEnvelope, forwardEnvelope,
     type TunnelEnvelope, type SignalKind,
 } from '../lib/signalRouter';
-import { generateRelayKeyPair, signChunk, verifyChunk, chunkDataFromB64, type RelayKeyPair } from '../lib/relaySign';
+import { generateRelayKeyPair, signChunk, verifyChunk, chunkDataFromB64, keyFingerprint, type RelayKeyPair } from '../lib/relaySign';
 
 // WebRTC APIの有無 (Ubuntu等のWebKitGTKはWebRTC無効ビルドで RTCPeerConnection が存在しない)
 export const SUPPORTS_WEBRTC = typeof RTCPeerConnection !== 'undefined';
@@ -141,6 +145,17 @@ export interface UseWebRTCReturn {
     participants: Map<string, ParticipantInfo>;
     /** M1: 名簿ゴシップの現在のエントリ一覧 (収束検証用) */
     getRoster: () => { id: string; name?: string; joinedAt: number; hostEndpoint?: string }[];
+    /** 配信木 (E2E検証用): 強制的にWSリレーモードへ切り替える */
+    setRelayMode: (v: boolean) => void;
+    /** 配信木 (E2E検証用): 自ノードの状態 */
+    getTreeInfo: () => {
+        role: 'none' | 'host' | 'relay';
+        children: string[];
+        addr: { host: string; port: number } | null;
+        parent: string | null;
+    };
+    /** M4: 署名鍵のフィンガープリント (QR帯域外照合用) */
+    getRelayKeyFingerprint: () => string | null;
     myId: string | null;
 
     // 画面共有
@@ -211,7 +226,7 @@ export interface UseWebRTCReturn {
     getPeerStats: () => Promise<{ peerId: string; type: string; kind: string; bytes: number }[]>;
 }
 
-export function useWebRTC(options?: { signalingUrl?: string; turnConfig?: TurnConfig }): UseWebRTCReturn {
+export function useWebRTC(options?: { signalingUrl?: string; turnConfig?: TurnConfig; treeFanout?: number }): UseWebRTCReturn {
     const { connectionState, setConnectionState, setRoomCode, setError, reset } = useConnectionStore();
 
     const targetSignalingUrl = options?.signalingUrl || DEFAULT_SIGNALING_URL;
@@ -316,11 +331,34 @@ export function useWebRTC(options?: { signalingUrl?: string; turnConfig?: TurnCo
     // 受信側: ストリーム毎に最後に検証したseqを追跡し、後戻りするチャンク
     // (リプレイ/再注入) を破棄する (M3: 署名はseqにバインド済み)
     const relayLastSeqRef = useRef<Record<string, number>>({});
+
+    // === 配信木 (計画書M2/M3) ===
+    // 自分が木のどの位置にいるか: 'none'=非リレー/未確定, 'host'=根, 'relay'=中継者
+    const treeRoleRef = useRef<'none' | 'host' | 'relay'>('none');
+    // 中継者: 自分の内蔵サーバーへ接続した子クライアント + その接続
+    const treeClientRef = useRef<SignalingClient | null>(null);
+    const treeChildrenRef = useRef<Set<string>>(new Set());
+    const treeSelfAddrRef = useRef<{ host: string; port: number } | null>(null);
+    // 子へ転送するためにキャッシュする下流派生物 (鍵・許可状態)
+    const cachedKeyRef = useRef<unknown>(null);
+    const cachedControlRef = useRef<unknown>(null);
+    // 親 (チャンクの供給元) のクライアントID — 自分の接続先サーバー上のID
+    const parentTargetIdRef = useRef<string | null>(null);
+    // ホスト側コーディネータの状態
+    const treeCoordinatorRef = useRef<{
+        root: ReturnType<typeof import('../lib/treeAssign').createRoot>;
+        promotePending: string | null;
+        overCapacity: Set<string>;
+    } | null>(null);
+    const treeFanoutRef = useRef<number>(options?.treeFanout ?? 4);
+    useEffect(() => {
+        if (options?.treeFanout) treeFanoutRef.current = options.treeFanout;
+    }, [options?.treeFanout]);
     const lanIpRef = useRef<string | null>(null);
 
     // === WSリレーモード (LinuxのWebKitGTK等 WebRTC非対応エンジン向けフォールバック) ===
     const relayModeRef = useRef<boolean>(!SUPPORTS_WEBRTC);
-    const [isRelayMode] = useState<boolean>(!SUPPORTS_WEBRTC);
+    const [isRelayMode, setIsRelayModeState] = useState<boolean>(!SUPPORTS_WEBRTC);
     // ホスト側: WSリレーでフレームを受信する視聴者
     const relaySubscribersRef = useRef<Set<string>>(new Set());
     const relayVideoRef = useRef<HTMLVideoElement | null>(null);
@@ -568,7 +606,12 @@ export function useWebRTC(options?: { signalingUrl?: string; turnConfig?: TurnCo
                             const ts = Date.now();
                             const keys = relayKeysRef.current;
                             const sig = keys ? signChunk(keys.secretKeyB64, seq, ts, chunkDataFromB64(d)) : undefined;
-                            for (const peerId of mseSubs) {
+                            // 送信先は毎フレーム relayCapsRef から再取得する
+                            // (onBoxはエンコーダ生成時に凍結されるため、生成時のリストを
+                            //  使うと後から参加した視聴者に映像が届かない)
+                            const targets = Array.from(relayCapsRef.current.entries())
+                                .filter(([, c]) => c.mse).map(([id]) => id);
+                            for (const peerId of targets) {
                                 signalingRef.current?.sendRelay(peerId, 'h264', sig
                                     ? { seq, ts, d, sig }
                                     : { seq, d });
@@ -1051,6 +1094,123 @@ export function useWebRTC(options?: { signalingUrl?: string; turnConfig?: TurnCo
         return true;
     };
 
+    // === 配信木 (M2/M3): ホスト側コーディネータ + 中継者ロジック ===
+
+    /**
+     * ホスト側: 新しいリレー視聴者を木に登録する (§3.1: 幅優先・深さ≤3)。
+     * ホスト直結が上限を超えたら最古の直結視聴者を中継へ昇格し、
+     * 準備ができたら (relay_ready) 超過分をその中継へ割り当てる。
+     */
+    const coordinateTree = (newSubId: string) => {
+        const myId = myIdRef.current;
+        if (!myId) return;
+        if (treeRoleRef.current === 'none') treeRoleRef.current = 'host';
+        const c = treeCoordinatorRef.current ??= {
+            root: createTreeRoot(myId, treeFanoutRef.current),
+            promotePending: null,
+            overCapacity: new Set<string>(),
+        };
+        if (findTreeNode(c.root, newSubId)) return;
+
+        const parent = pickTreeParent(c.root, 3);
+        if (parent) {
+            const node = treeAttach(c.root, { id: newSubId, addr: null, depth: 0, fanout: 0, children: [] });
+            if (node && parent !== c.root && parent.addr) {
+                // 中継ノードの下へ配置 → 視聴者を中継のサーバーへ誘導
+                console.log(`[Tree] ${newSubId} を中継 ${parent.id} (${parent.addr.host}:${parent.addr.port}) へ割り当て`);
+                signalingRef.current?.sendRelay(newSubId, 'tree:assign', { addr: parent.addr });
+            }
+            return;
+        }
+
+        // ホスト直結が満杯: 最古の直結視聴者 (中継未昇格) を昇格する
+        c.overCapacity.add(newSubId);
+        const candidate = c.root.children.find((ch: { addr: unknown; id: string }) => !ch.addr && ch.id !== c.promotePending);
+        if (candidate && !c.promotePending) {
+            console.log(`[Tree] 直結満員 → ${candidate.id} を中継へ昇格指示`);
+            c.promotePending = candidate.id;
+            signalingRef.current?.sendRelay(candidate.id, 'tree:promote', { code: roomCodeRef.current });
+        }
+    };
+
+    /** ホスト側: 昇格した中継者からの準備完了報告 */
+    const handleTreeRelayReady = (senderId: string, p: Record<string, unknown>) => {
+        const c = treeCoordinatorRef.current;
+        const addr = p.addr as { host: string; port: number } | undefined;
+        if (!c || !addr) return;
+        const node = findTreeNode(c.root, senderId);
+        if (node) treePromote(node, addr);
+        console.log(`[Tree] 中継 ${senderId} が準備完了: ${addr.host}:${addr.port}`);
+        // 満杯で待っていた視聴者を中継へ割り当てる
+        for (const id of c.overCapacity) {
+            signalingRef.current?.sendRelay(id, 'tree:assign', { addr });
+        }
+        c.overCapacity.clear();
+        c.promotePending = null;
+    };
+
+    /** ゲスト側: 中継へ昇格 — 自分の内蔵サーバーを起動し子を受け付ける (M2) */
+    const handleTreePromote = (hostId: string) => {
+        if (treeClientRef.current) return; // 既に中継
+        void (async () => {
+            try {
+                const port = await invoke<number>('embedded_server_start', { port: null, host: null });
+                const ip = await invoke<string | null>('get_local_lan_address');
+                treeSelfAddrRef.current = { host: ip || '127.0.0.1', port };
+                treeRoleRef.current = 'relay';
+                console.log(`[Tree] 中継に昇格: 内蔵サーバー ${treeSelfAddrRef.current.host}:${port}`);
+
+                // 自分のサーバーへ接続 (子の subscribe/chat を受け取る面)
+                const tc = new SignalingClient(`ws://127.0.0.1:${port}`);
+                treeClientRef.current = tc;
+                tc.on('onRelayMessage', (childId, t2, p2) => {
+                    if (t2 === 'subscribe') {
+                        console.log(`[Tree] 子の接続: ${childId}`);
+                        treeChildrenRef.current.add(childId);
+                        // 下流派生物をキャッシュから即配布 (鍵 → 許可状態)
+                        if (cachedKeyRef.current) tc.sendRelay(childId, 'key', cachedKeyRef.current);
+                        if (cachedControlRef.current) tc.sendRelay(childId, 'control_allowed', cachedControlRef.current);
+                        return;
+                    }
+                    if (t2 === 'unsubscribe') {
+                        treeChildrenRef.current.delete(childId);
+                        return;
+                    }
+                    if (t2 === 'chat') {
+                        // 子からのチャット: ローカル表示 + 上流 (ホスト) へ中継
+                        const msg = p2 as unknown as ChatMessageData;
+                        if (msg?.id) setChatMessages(prev => prev.some(m => m.id === msg.id) ? prev : [...prev, msg]);
+                        const up = parentTargetIdRef.current;
+                        if (up) signalingRef.current?.sendRelay(up, 'chat', p2);
+                        return;
+                    }
+                    if (t2 === 'input') {
+                        // 子からのリモート操作入力: ホストへ中継するだけ (計画書§2)
+                        const up = parentTargetIdRef.current;
+                        if (up) signalingRef.current?.sendRelay(up, 'input', p2);
+                        return;
+                    }
+                });
+                await tc.connect();
+                tc.createRoom(roomNameRef.current, roomCodeRef.current || undefined);
+                // ホストへ準備完了 → 以後の参加者をここへ割り当ててもらう
+                signalingRef.current?.sendRelay(hostId, 'tree:relay_ready', { addr: treeSelfAddrRef.current });
+            } catch (e) {
+                console.error('[Tree] 中継への昇格に失敗:', e);
+                treeRoleRef.current = 'none';
+            }
+        })();
+    };
+
+    /** 中継者: 受け取ったチャンク/鍵/許可状態/チャットを子へパススルー転送 (§3.2) */
+    const forwardToTreeChildren = (type: string, payload: unknown): void => {
+        const tc = treeClientRef.current;
+        if (!tc || treeChildrenRef.current.size === 0) return;
+        for (const child of treeChildrenRef.current) {
+            tc.sendRelay(child, type, payload);
+        }
+    };
+
     /**
      * 送信経路の選択 (M2)。WSが生きていれば従来通りサーバーへ、
      * 死んでいればDataChannel (直結 or 中継1ホップ) で届ける。
@@ -1324,6 +1484,9 @@ export function useWebRTC(options?: { signalingUrl?: string; turnConfig?: TurnCo
 
             // **Full Mesh Logic**: 既存の参加者全員に対して Initiator となり接続開始
             // リレーモード (WebRTC非対応エンジン) ではPCを作らず、リレー購読だけ行う
+            // 配信木: チャンク供給元 (=自分の接続先サーバーの部屋主) を記録。
+            // 子からの chat/input を上流へ中継する宛先になる
+            parentTargetIdRef.current = existingParticipants[0]?.id ?? null;
             existingParticipants.forEach(p => {
                 if (relayModeRef.current) {
                     signalingRef.current?.sendRelay(p.id, 'subscribe', detectRelayCapabilities());
@@ -1358,6 +1521,14 @@ export function useWebRTC(options?: { signalingUrl?: string; turnConfig?: TurnCo
         signaling.on('onPeerLeft', (peerId) => {
             console.log(`[WebRTC] Peer退出: ${peerId}`);
             applyDepart(rosterRef.current, peerId, Date.now());
+            {
+                // 配信木: 中継者が消えた場合、subtreeの解放+孤児は各自 parent_lost
+                // 経由で再参加する (親が消えた時点で子のWSも落ちるため)
+                const c = treeCoordinatorRef.current;
+                if (c && detachSubtree(c.root, peerId).length > 0) {
+                    console.log(`[Tree] 中継 ${peerId} が消失 — subtreeを解放`);
+                }
+            }
             setParticipants(prev => {
                 const next = new Map(prev);
                 next.delete(peerId);
@@ -1402,7 +1573,10 @@ export function useWebRTC(options?: { signalingUrl?: string; turnConfig?: TurnCo
                 const p = (payload || {}) as Record<string, unknown>;
                 if (typeof p.pub === 'string') {
                     relayPubKeyRef.current = p.pub;
+                    cachedKeyRef.current = p;
                     console.log('[Relay] 署名検証用の公開鍵を受信');
+                    // 中継者: 子へも配布
+                    forwardToTreeChildren('key', p);
                 }
                 return;
             }
@@ -1439,12 +1613,16 @@ export function useWebRTC(options?: { signalingUrl?: string; turnConfig?: TurnCo
                 if (relayKeysRef.current) {
                     signalingRef.current?.sendRelay(senderId, 'key', { pub: relayKeysRef.current.publicKeyB64 });
                 }
+                // 配信木: ホスト直結の上限管理 (超過時は中継へ昇格/割り当て)
+                coordinateTree(senderId);
                 console.log(`[Relay] 視聴者登録: ${senderId} (mse=${caps.mse} webmAudio=${caps.webmAudio}, 計${relaySubscribersRef.current.size}人)`);
                 return;
             }
             if (type === 'h264') {
                 // ゲスト側: fMP4のbox (init/fragment) を順にappend
                 if (!verifyRelayChunk(p, 'video')) return;
+                // M2: 中継者は検証済みペイロードを無改変で子へパススルー (再エンコードなし)
+                forwardToTreeChildren('h264', p);
                 relayStatsRef.current.h264Chunks++;
                 ensureRelayVideoSink();
                 const sb = relayVideoSbRef.current;
@@ -1458,6 +1636,7 @@ export function useWebRTC(options?: { signalingUrl?: string; turnConfig?: TurnCo
             }
             if (type === 'audio') {
                 if (!verifyRelayChunk(p, 'audio')) return;
+                forwardToTreeChildren('audio', p);
                 relayStatsRef.current.audioChunks++;
                 ensureRelayAudioSink();
                 const sb = relayAudioSbRef.current;
@@ -1472,10 +1651,43 @@ export function useWebRTC(options?: { signalingUrl?: string; turnConfig?: TurnCo
             if (type === 'unsubscribe') {
                 relaySubscribersRef.current.delete(senderId);
                 maybeStopRelayLoop();
+                // 配信木: 登録解除 (子を持つ中継者の消失なら subtreeごと外れる)
+                const c = treeCoordinatorRef.current;
+                if (c && detachSubtree(c.root, senderId).length > 0) {
+                    console.log(`[Tree] 中継 ${senderId} が離脱 — subtreeを解放`);
+                }
+                return;
+            }
+            if (type === 'tree:promote') {
+                // 中継者への昇格指示 (ホストのコーディネータ)
+                handleTreePromote(senderId);
+                return;
+            }
+            if (type === 'tree:relay_ready') {
+                handleTreeRelayReady(senderId, p);
+                return;
+            }
+            if (type === 'tree:assign') {
+                // 割り当てられた中継 (の内蔵サーバー) へ付け替える
+                const addr = p.addr as { host: string; port: number } | undefined;
+                if (addr?.host && addr.port) {
+                    console.log(`[Tree] 中継 ${addr.host}:${addr.port} へ移動します`);
+                    void switchSignalingRef.current(`ws://${addr.host}:${addr.port}`).catch((e) => {
+                        console.error('[Tree] 中継への移動に失敗:', e);
+                    });
+                }
+                return;
+            }
+            if (type === 'tree:parent_lost') {
+                // 中継者が消えた: 孤児になった子を再登録する
+                coordinateTree(senderId);
                 return;
             }
             if (type === 'control_allowed') {
                 setPeerControlAllowed(prev => new Map(prev).set(senderId, !!p.allowed));
+                // 中継者: 子へも配布 (ホストの許可状態を下流へ伝播)
+                cachedControlRef.current = p;
+                forwardToTreeChildren('control_allowed', p);
                 return;
             }
             if (type === 'chat') {
@@ -1483,6 +1695,8 @@ export function useWebRTC(options?: { signalingUrl?: string; turnConfig?: TurnCo
                 if (msg?.id) {
                     setChatMessages(prev => prev.some(m => m.id === msg.id) ? prev : [...prev, msg]);
                 }
+                // 中継者: 下流の子へも転送
+                forwardToTreeChildren('chat', p);
                 return;
             }
             if (type === 'input') {
@@ -1642,6 +1856,16 @@ export function useWebRTC(options?: { signalingUrl?: string; turnConfig?: TurnCo
         relayKeysRef.current = null;
         relayPubKeyRef.current = null;
         relayLastSeqRef.current = {};
+        // 配信木の状態リセット (中継者は内蔵サーバーとの接続も切る)
+        treeClientRef.current?.dispose();
+        treeClientRef.current = null;
+        treeChildrenRef.current.clear();
+        treeRoleRef.current = 'none';
+        treeSelfAddrRef.current = null;
+        treeCoordinatorRef.current = null;
+        parentTargetIdRef.current = null;
+        cachedKeyRef.current = null;
+        cachedControlRef.current = null;
 
         // リレーの後片付け
         stopRelayLoop();
@@ -2241,6 +2465,19 @@ export function useWebRTC(options?: { signalingUrl?: string; turnConfig?: TurnCo
         clearError: () => setError(null),
         // レンデブー最小化 (M1): 名簿ゴシップの状態 (E2E収束検証用)
         getRoster: () => rosterEntries(rosterRef.current),
+        // 配信木 (E2E検証用): 自ノードの状態
+        setRelayMode: (v: boolean) => {
+            relayModeRef.current = v;
+            setIsRelayModeState(v);
+        },
+        getTreeInfo: () => ({
+            role: treeRoleRef.current,
+            children: [...treeChildrenRef.current],
+            addr: treeSelfAddrRef.current,
+            parent: parentTargetIdRef.current,
+        }),
+        /** M4: 署名鍵のフィンガープリント (QR帯域外照合用) */
+        getRelayKeyFingerprint: () => relayKeysRef.current ? keyFingerprint(relayKeysRef.current.publicKeyB64) : null,
         participants,
         myId,
 
