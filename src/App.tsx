@@ -72,7 +72,8 @@ function App() {
         try {
             const u = new URL(signalingUrl.trim());
             if (u.protocol !== 'ws:') return null;
-            const h = u.hostname;
+            // IPv6はブラケット付きで返る ([::1]) ので剥がしてから判定
+            const h = u.hostname.replace(/^\[/, '').replace(/\]$/, '');
             const isLocalOrPrivate = h === 'localhost' || h === '::1' || h.endsWith('.local') ||
                 /^127\./.test(h) || /^10\./.test(h) || /^192\.168\./.test(h) ||
                 /^172\.(1[6-9]|2\d|3[01])\./.test(h) ||

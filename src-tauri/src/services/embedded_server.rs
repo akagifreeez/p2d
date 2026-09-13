@@ -20,6 +20,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
+use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 use tokio_tungstenite::tungstenite::Message as WsMessage;
 
 /// 内蔵サーバーの既定ポート
@@ -91,19 +92,22 @@ fn normalize_code(c: String) -> Option<String> {
 }
 
 /// 内蔵サーバーを起動する (既に起動済みならそのポートを返す)
+/// host: 既定は 0.0.0.0 (LAN公開)。LAN内限定にしたい場合は 127.0.0.1 等を指定
 #[tauri::command]
 pub async fn embedded_server_start(
     state: tauri::State<'_, EmbeddedServerState>,
     port: Option<u16>,
+    host: Option<String>,
 ) -> Result<u16, String> {
     if let Some(handle) = state.0.lock().map_err(|e| e.to_string())?.as_ref() {
         return Ok(handle.port);
     }
     let want_port = port.unwrap_or(DEFAULT_EMBEDDED_PORT);
+    let want_host = host.unwrap_or_else(|| "0.0.0.0".to_string());
 
-    let listener = TcpListener::bind(("0.0.0.0", want_port))
+    let listener = TcpListener::bind((want_host.as_str(), want_port))
         .await
-        .map_err(|e| format!("ポート{want_port}をlistenできません: {e}"))?;
+        .map_err(|e| format!("{want_host}:{want_port}をlistenできません: {e}"))?;
 
     let (shutdown_tx, mut shutdown_rx) = mpsc::unbounded_channel::<()>();
     let shared: SharedState = Arc::new(Mutex::new(ServerStateInner::default()));
@@ -165,8 +169,26 @@ pub fn get_local_lan_address() -> Option<String> {
     Some(addr.ip().to_string())
 }
 
+/// 同時接続の上限 (1ルーム=最大8人想定×接続ならせ分の余裕)
+const MAX_CONNECTIONS: usize = 64;
+
 async fn handle_connection(stream: TcpStream, state: SharedState) {
-    let ws = match tokio_tungstenite::accept_async(stream).await {
+    // 接続数上限 (DoS防御)。超過分は即座に切断する
+    {
+        let st = state.lock().unwrap();
+        if st.clients.len() >= MAX_CONNECTIONS {
+            println!("[Embedded] 接続数上限 ({MAX_CONNECTIONS}) を超えた接続を拒否");
+            return;
+        }
+    }
+
+    // 巨大フレームによるメモリ枯渇を防ぐ (シグナリング/リレーチャンクは数百KB程度)
+    let config = WebSocketConfig {
+        max_message_size: Some(4 * 1024 * 1024),
+        max_frame_size: Some(1024 * 1024),
+        ..Default::default()
+    };
+    let ws = match tokio_tungstenite::accept_async_with_config(stream, Some(config)).await {
         Ok(ws) => ws,
         Err(e) => {
             println!("[Embedded] WSハンドシェイク失敗: {e}");

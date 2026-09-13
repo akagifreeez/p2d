@@ -313,6 +313,9 @@ export function useWebRTC(options?: { signalingUrl?: string; turnConfig?: TurnCo
     const relayKeysRef = useRef<RelayKeyPair | null>(null);
     const relayPubKeyRef = useRef<string | null>(null);
     const relayChunkSeqRef = useRef(0);
+    // 受信側: ストリーム毎に最後に検証したseqを追跡し、後戻りするチャンク
+    // (リプレイ/再注入) を破棄する (M3: 署名はseqにバインド済み)
+    const relayLastSeqRef = useRef<Record<string, number>>({});
     const lanIpRef = useRef<string | null>(null);
 
     // === WSリレーモード (LinuxのWebKitGTK等 WebRTC非対応エンジン向けフォールバック) ===
@@ -373,6 +376,19 @@ export function useWebRTC(options?: { signalingUrl?: string; turnConfig?: TurnCo
             }
         });
     }, []);
+
+    // M1: 定周期ゴシップsync — 変化通知の取りこぼし (DC開通前の参加など) を
+    // 10秒ごとに回収し、全員の名簿を収束させる
+    useEffect(() => {
+        const t = window.setInterval(() => {
+            if (!isConnectedRef.current) return;
+            broadcastData('roster:sync', {
+                entries: rosterEntries(rosterRef.current),
+                tombstones: [...rosterRef.current.tombstones.values()],
+            });
+        }, 10000);
+        return () => window.clearInterval(t);
+    }, [broadcastData]);
 
     /**
      * DataChannel設定
@@ -1005,9 +1021,17 @@ export function useWebRTC(options?: { signalingUrl?: string; turnConfig?: TurnCo
      * リレーチャンクの署名検証 (M3)。公開鍵を受信済みなら無署名/不正署名の
      * チャンクは破棄する。鍵が届く前の初期チャンクは通す (WS順序で鍵が先行するのが正常系)。
      */
-    const verifyRelayChunk = (p: Record<string, unknown>): boolean => {
+    const verifyRelayChunk = (p: Record<string, unknown>, streamKey: string): boolean => {
         const pub = relayPubKeyRef.current;
         const sig = typeof p.sig === 'string' ? p.sig : null;
+        const seq = Number(p.seq) || 0;
+        // リプレイ検知: seqの後戻りは再注入なので破棄 (WSは順序保証あり=正常系は単調増加)
+        const lastSeq = relayLastSeqRef.current[streamKey] || 0;
+        if (seq > 0 && seq <= lastSeq) {
+            relayStatsRef.current.sigInvalid++;
+            console.warn(`[Relay] seq後戻り (${seq} <= ${lastSeq}) — リプレイとして破棄`);
+            return false;
+        }
         if (!sig) {
             if (pub) {
                 relayStatsRef.current.sigInvalid++;
@@ -1016,12 +1040,13 @@ export function useWebRTC(options?: { signalingUrl?: string; turnConfig?: TurnCo
             }
             return true;
         }
-        const ok = verifyChunk(pub!, Number(p.seq) || 0, Number(p.ts) || 0, chunkDataFromB64(String(p.d || '')), sig);
+        const ok = verifyChunk(pub!, seq, Number(p.ts) || 0, chunkDataFromB64(String(p.d || '')), sig);
         if (!ok) {
             relayStatsRef.current.sigInvalid++;
             console.warn('[Relay] 署名検証失敗 — チャンクを破棄 (改ざん/偽装の可能性)');
             return false;
         }
+        relayLastSeqRef.current[streamKey] = seq;
         relayStatsRef.current.sigVerified++;
         return true;
     };
@@ -1306,12 +1331,16 @@ export function useWebRTC(options?: { signalingUrl?: string; turnConfig?: TurnCo
                     createPeerConnection(p.id, true); // Initiator = true
                 }
             });
+            broadcastRosterSync();
         });
 
         // 他の誰かが参加通知
         signaling.on('onPeerJoined', (peerId, name) => {
             console.log(`[WebRTC] Peer参加: ${peerId}`);
             mergeEntry(rosterRef.current, { id: peerId, name, joinedAt: Date.now() });
+            // M1: 新ピアの参加をゴシップで全体へ (サーバー死亡時、DCしか持たない
+            // ピアが新ピアを発見できる唯一の経路)
+            broadcastRosterSync();
             setParticipants(prev => {
                 const next = new Map(prev);
                 next.set(peerId, { id: peerId, name, joinedAt: Date.now() });
@@ -1415,7 +1444,7 @@ export function useWebRTC(options?: { signalingUrl?: string; turnConfig?: TurnCo
             }
             if (type === 'h264') {
                 // ゲスト側: fMP4のbox (init/fragment) を順にappend
-                if (!verifyRelayChunk(p)) return;
+                if (!verifyRelayChunk(p, 'video')) return;
                 relayStatsRef.current.h264Chunks++;
                 ensureRelayVideoSink();
                 const sb = relayVideoSbRef.current;
@@ -1428,7 +1457,7 @@ export function useWebRTC(options?: { signalingUrl?: string; turnConfig?: TurnCo
                 return;
             }
             if (type === 'audio') {
-                if (!verifyRelayChunk(p)) return;
+                if (!verifyRelayChunk(p, 'audio')) return;
                 relayStatsRef.current.audioChunks++;
                 ensureRelayAudioSink();
                 const sb = relayAudioSbRef.current;
@@ -1530,7 +1559,11 @@ export function useWebRTC(options?: { signalingUrl?: string; turnConfig?: TurnCo
             : null;
         hostEndpointRef.current = endpoint;
         try {
-            await connect();
+            // 3秒で中央に繋がらなければサーバーレスfallbackへ (TCPタイムアウト待ちを避ける)
+            await Promise.race([
+                connect(),
+                new Promise((_, rej) => setTimeout(() => rej(new Error('connect timeout')), 3000)),
+            ]);
             signalingRef.current?.createRoom(name, localCode, endpoint ?? undefined);
         } catch (e) {
             // M4: 中央サーバー無しで部屋を作る (LAN完全サーバーレス)
@@ -1608,6 +1641,7 @@ export function useWebRTC(options?: { signalingUrl?: string; turnConfig?: TurnCo
         rosterRef.current = initRoster();
         relayKeysRef.current = null;
         relayPubKeyRef.current = null;
+        relayLastSeqRef.current = {};
 
         // リレーの後片付け
         stopRelayLoop();

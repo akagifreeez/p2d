@@ -26,9 +26,12 @@ const clients = new Map<string, WebSocket>();
 const roomManager = new RoomManager();
 
 // WebSocketサーバー作成
+// maxPayload: シグナリング/リレーチャンク (base64 H264ボックス) は数百KB程度。
+// 既定の100MBのままにすると巨大フレームによるメモリ枯渇DoSを受けるため上限を設ける
 const wss = new WebSocketServer({
     port: PORT,
     host: HOST,
+    maxPayload: 4 * 1024 * 1024, // 4MB
 });
 
 console.log(`🚀 P2D シグナリングサーバー起動: ws://${HOST}:${PORT}`);
