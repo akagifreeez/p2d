@@ -50,3 +50,4 @@ signaling-server/dist/
 *.tmp
 *.temp
 error.log
+signaling-worker/.wrangler/

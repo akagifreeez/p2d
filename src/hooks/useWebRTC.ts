@@ -1800,11 +1800,14 @@ export function useWebRTC(options?: { signalingUrl?: string; turnConfig?: TurnCo
     // 毎レンダーで最新のクロージャへ差し替え (setupDataChannel/e2eDepsRefと同じ規約)
     wireSignalingRef.current = wireSignaling;
 
-    const connect = useCallback(async () => {
+    const connect = useCallback(async (roomCode?: string) => {
         if (signalingRef.current) return;
 
         setConnectionState('connecting');
-        const signaling = new SignalingClient(targetSignalingUrl);
+        // Cloudflare Workers版: ?room=コード でルームDOへルーティングされる
+        // (Node/内蔵サーバーはクエリを無視するため互換)
+        const url = roomCode ? `${targetSignalingUrl}?room=${roomCode}` : targetSignalingUrl;
+        const signaling = new SignalingClient(url);
         signalingRef.current = signaling;
         wireSignalingRef.current(signaling);
 
@@ -1864,7 +1867,7 @@ export function useWebRTC(options?: { signalingUrl?: string; turnConfig?: TurnCo
         try {
             // 3秒で中央に繋がらなければサーバーレスfallbackへ (TCPタイムアウト待ちを避ける)
             await Promise.race([
-                connect(),
+                connect(localCode),
                 new Promise((_, rej) => setTimeout(() => rej(new Error('connect timeout')), 3000)),
             ]);
             signalingRef.current?.createRoom(name, localCode, endpoint ?? undefined);
@@ -1878,7 +1881,7 @@ export function useWebRTC(options?: { signalingUrl?: string; turnConfig?: TurnCo
     }, [connect]);
 
     const joinRoom = useCallback(async (code: string, name?: string) => {
-        await connect();
+        await connect(code);
         roomNameRef.current = name;
         signalingRef.current?.joinRoom(code, name);
     }, [connect]);

@@ -14,8 +14,8 @@ It features multi-peer screen sharing, voice chat (microphone), text chat, and a
 
 ## Architecture (Full Mesh P2P - Updated 2026-09-12)
 
-### 1. Signaling Server (`signaling-server/`)
-*   **Server**: Node.js WebSocket server.
+### 1. Signaling Server (`signaling-server/` + `signaling-worker/` Cloudflare Workers版)
+*   **Server**: Node.js WebSocket server。**Cloudflare Workers版は `signaling-worker/`** (1ルーム=1 DO、同一プロトコル、単体テスト7件。常設VPS不要の電話帳。`wss://<ワーカー>?room=コード` で接続。詳細は signaling-worker/README.md)
 *   **Protocol**: JSON-based messages.
 *   **Key Messages**:
     *   `room:create` / `room:created`: ルーム作成
