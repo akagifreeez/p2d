@@ -149,12 +149,20 @@ signaling-server/
 *   **Discord招待 (F-052 v1)**: QRモーダルの「Discord招待文をコピー」で `p2d://join/<code>` 付き招待文をクリップボードへ (RPC経由のjoin secret受信はdiscord-rich-presenceクレートの制約で未対応、将来discord-sdk置換で対応)
 *   **Linux検証 (2026-09-13)**: pve上にUbuntu 24.04 VM (192.168.11.16) をcloud-initで自動構築しネイティブビルド。`tauri build` で **deb/rpm/AppImage生成✅**・起動✅・M3 UI描画✅(Noto CJK)・履歴機能✅・シグナリング参加✅。ただし**P2P本体は不可** — Ubuntu/Debian系公式WebKitGTKはWebRTC無効ビルドで`RTCPeerConnection`が未定義 (実証: python-giプローブNO_RTCPC + tcpdumpでメディアパケット0 + offer受信後もanswer不出力)。詳細はKnown Issues
 
+*   **WSリレーモード (2026-09-13実装)**: WebRTC非対応エンジン(Linux WebKitGTK)向けフォールバック。ホストが画面共有をcanvas→JPEG化し `relay:frame` でWS送信、ゲストは `<img>` 描画。チャット(`relay:chat`)・リモート操作入力(`relay:input`)・操作許可バッジ(`relay:control_allowed`)もWSにフォールバック。**視聴者がsubscribeした時だけフレーム送信する**ので全員WebRTC対応なら零コスト。音声リレーは未対応(MVP)。自動判定: `typeof RTCPeerConnection === 'undefined'`
+
 ### 🔄 In Progress / TODO
 *   F-052のRPC完全対応 (join secret + ACTIVITY_JOIN受信)
 *   macOSテスト (Apple Silicon実機必須。Linuxは2026-09-13検証済み — Known Issuesのプラットフォーム制約あり)
 
+### 📐 配送方式ロードマップ (2026-09-13 本人確認済みの計画)
+1. **現状: Full Mesh P2P** — 1対1・少人数の主用途。送信者上り=視聴者数×ビットレートなので多人数で線形増
+2. **✅実装済(2026-09-13): ホストリレー(WS)** — Linux受信用。1対1のLAN想定・MVPは映像+チャット+リモ操作(音声なし)
+3. **将来: 自前リレー/SFUノード** — マルチビューアの帯域問題(送信者上りN倍)が実害になったら。信頼モデルは自前サーバーで無傷
+4. **さらに先: 配信木(オーバーレイマルチキャスト)** — 視聴者が子を担当してインフラゼロでスケール。離脱時の再接続(サブツリー付け替え)が勝負所。インフラゼロ哲学を貫る場合のみ
+
 ### ⚠️ Known Issues
-*   **Linux (Ubuntu/Debian系) はP2P不可**: ディストリ公式WebKitGTKがWebRTC無効ビルド (`typeof RTCPeerConnection === 'undefined'`)。GStreamerプラグイン(webrtc/dtls/nice等)を入れても回復しない=エンジン層の欠如。ビルド・起動・UI・シグナリング参加・履歴は正常。将来の選択肢: メディアリレーフォールバック / CEF評価 / 独自ビルドWebKit配布(非現実的)
+*   **Linux (Ubuntu/Debian系) はWebRTC不可 → WSリレーモードで対応**: ディストリ公式WebKitGTKがWebRTC無効ビルド (`typeof RTCPeerConnection === 'undefined'`)。GStreamerプラグイン追加でも回復しない=エンジン層の欠如。リレーモードで映像受信・チャット・リモート操作は可能(音声のみ未対応)。MSEでのH264リレーが次の品質向上候補
 *   複数音声トラック (マイク+システム音声) のリモート再生はChromiumのメディア要素ミキシング挙動に依存
 *   システム音声共有はスピーカー出力を丸ごと拾うため、相手の音声もループする (エコー防止はヘッドホン推奨・UIのツールチップに記載済み)
 *   Discord Rich Presenceは有効なApplication IDが無いと表示されない (偽IDではIPC接続後にActivity送信で切断される。動作自体は正常=ログ `[Discord] IPC接続成功`)

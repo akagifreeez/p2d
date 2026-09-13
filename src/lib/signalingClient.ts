@@ -16,7 +16,14 @@ export type MessageType =
     | 'peer:offer'
     | 'peer:answer'
     | 'peer:ice'
-    | 'error';
+    | 'error'
+    // WSリレー (WebRTC非対応エンジン向けフォールバック経路)
+    | 'relay:frame'
+    | 'relay:subscribe'
+    | 'relay:unsubscribe'
+    | 'relay:chat'
+    | 'relay:input'
+    | 'relay:control_allowed';
 
 export interface SignalingMessage {
     type: MessageType;
@@ -47,6 +54,8 @@ export interface SignalingEvents {
     onAnswer: (senderId: string, sdp: RTCSessionDescriptionInit) => void;
     onIceCandidate: (senderId: string, candidate: RTCIceCandidateInit) => void;
     onError: (code: string, message: string) => void;
+    // WSリレー: relay:* をすべて1つのハンドラへ集約 (type は 'relay:' を除去したもの)
+    onRelayMessage?: (senderId: string, type: string, payload: unknown) => void;
 }
 
 export class SignalingClient {
@@ -119,8 +128,14 @@ export class SignalingClient {
      * メッセージをハンドル
      */
     private handleMessage(message: SignalingMessage): void {
-        if (message.type !== 'peer:ice') {
+        if (message.type !== 'peer:ice' && message.type !== 'relay:frame') {
             console.log('[Signaling] 受信:', message.type);
+        }
+
+        // WSリレー: peer系ハンドラと独立した経路
+        if (message.type.startsWith('relay:')) {
+            this.events.onRelayMessage?.(message.senderId || '', message.type.slice('relay:'.length), message.payload);
+            return;
         }
 
         switch (message.type) {
@@ -216,6 +231,17 @@ export class SignalingClient {
     leaveRoom(): void {
         this.send({
             type: 'room:leave',
+        });
+    }
+
+    /**
+     * WSリレーメッセージを特定ピアへ送信 (type は 'relay:' を除いたもの)
+     */
+    sendRelay(targetId: string, type: string, payload: unknown): void {
+        this.send({
+            type: `relay:${type}` as MessageType,
+            targetId,
+            payload,
         });
     }
 

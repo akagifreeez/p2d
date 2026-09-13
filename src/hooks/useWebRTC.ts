@@ -15,6 +15,14 @@ import { startSystemAudioCapture, type SystemAudioSession } from '../lib/systemA
 import { BandwidthMonitor, type BandwidthStats } from '../lib/bandwidthMonitor';
 import { AdaptiveController } from '../lib/adaptiveController';
 
+// WebRTC APIの有無 (Ubuntu等のWebKitGTKはWebRTC無効ビルドで RTCPeerConnection が存在しない)
+export const SUPPORTS_WEBRTC = typeof RTCPeerConnection !== 'undefined';
+
+// WSリレーの画質パラメータ (JPEG+canvas方式。LAN想定)
+const RELAY_MAX_WIDTH = 1600;
+const RELAY_INTERVAL_MS = 80; // 約12.5fps
+const RELAY_JPEG_QUALITY = 0.6;
+
 // Helper to prioritize specific codecs
 function prioritizeCodecs(pc: RTCPeerConnection, preferredCodec: 'auto' | 'av1' | 'vp9' | 'h264' | 'vp8') {
     if (preferredCodec === 'auto') {
@@ -103,6 +111,11 @@ export interface UseWebRTCReturn {
     setRemoteControlAllowed: (allowed: boolean) => void;
     peerControlAllowed: Map<string, boolean>;
     sendInputToPeer: (peerId: string, type: string, payload: unknown) => void;
+
+    // WSリレーモード (WebRTC非対応エンジン: Linux等)
+    isRelayMode: boolean;
+    relayFrame: string | null;
+    getRelayStats: () => { frames: number; bytes: number; lastFrameAt: number; subscribers: number };
 
     // マイク
     startMicrophone: () => Promise<void>;
@@ -230,6 +243,21 @@ export function useWebRTC(options?: { signalingUrl?: string; turnConfig?: TurnCo
     const roomNameRef = useRef<string | undefined>(undefined);
     // ICE restartのグレア対策 (offerを送る側を決める) に使う自分のID
     const myIdRef = useRef<string | null>(null);
+
+    // === WSリレーモード (LinuxのWebKitGTK等 WebRTC非対応エンジン向けフォールバック) ===
+    const relayModeRef = useRef<boolean>(!SUPPORTS_WEBRTC);
+    const [isRelayMode] = useState<boolean>(!SUPPORTS_WEBRTC);
+    // ホスト側: WSリレーでフレームを受信する視聴者
+    const relaySubscribersRef = useRef<Set<string>>(new Set());
+    const relayVideoRef = useRef<HTMLVideoElement | null>(null);
+    const relayLoopRef = useRef<number | null>(null);
+    const relayFrameSeqRef = useRef(0);
+    const [relayFrame, setRelayFrame] = useState<string | null>(null);
+    const relayStatsRef = useRef({ frames: 0, bytes: 0, lastFrameAt: 0 });
+    const relayLastRenderRef = useRef(0);
+    // リレーモードのチャット配送先 (参加者一覧のrefミラー)
+    const participantsRef = useRef<Map<string, ParticipantInfo>>(new Map());
+    useEffect(() => { participantsRef.current = participants; }, [participants]);
     // ピアごとのSDP処理直列化キュー (オファー/アンサーの同時着によるstate競合を防ぐ)
     const pcOpsRef = useRef(new WeakMap<RTCPeerConnection, Promise<void>>());
     const enqueueSdpOp = useCallback((pc: RTCPeerConnection, op: () => Promise<void>) => {
@@ -351,6 +379,10 @@ export function useWebRTC(options?: { signalingUrl?: string; turnConfig?: TurnCo
         remoteControlAllowedRef.current = allowed;
         setRemoteControlAllowedState(allowed);
         broadcastData('control:remote_allowed', { allowed });
+        // WSリレー視聴者にも通知
+        relaySubscribersRef.current.forEach(peerId => {
+            signalingRef.current?.sendRelay(peerId, 'control_allowed', { allowed });
+        });
         console.log('[RemoteControl] 許可状態:', allowed);
     }, [broadcastData]);
 
@@ -361,8 +393,73 @@ export function useWebRTC(options?: { signalingUrl?: string; turnConfig?: TurnCo
         const dc = dataChannelsRef.current.get(peerId);
         if (dc && dc.readyState === 'open') {
             dc.send(JSON.stringify({ type, payload, timestamp: Date.now() }));
+        } else if (relayModeRef.current) {
+            // DataChannelが使えないエンジン (Linux等) はWSリレーへフォールバック
+            signalingRef.current?.sendRelay(peerId, 'input', { type, payload });
         }
     }, []);
+
+    /**
+     * ホスト側: WSリレーのフレーム送信ループを開始 (視聴者がいる時だけ動く)
+     */
+    const ensureRelayLoop = useCallback(() => {
+        if (relayLoopRef.current || !SUPPORTS_WEBRTC) return;
+        const stream = localStreamsRef.current.values().next().value || localStreamRef.current;
+        const videoTrack = stream?.getVideoTracks?.()[0];
+        if (!videoTrack) return; // 画面共有開始時に再度呼ばれる
+
+        const video = document.createElement('video');
+        video.srcObject = new MediaStream([videoTrack]);
+        video.muted = true;
+        video.playsInline = true;
+        void video.play().catch(() => { });
+        const canvas = document.createElement('canvas');
+
+        relayVideoRef.current = video;
+        relayLoopRef.current = window.setInterval(() => {
+            if (relaySubscribersRef.current.size === 0) return;
+            if (!video.videoWidth) return;
+            if (video.readyState < 2) return;
+            const w = Math.min(RELAY_MAX_WIDTH, video.videoWidth);
+            const h = Math.round(video.videoHeight * (w / video.videoWidth));
+            if (canvas.width !== w || canvas.height !== h) {
+                canvas.width = w;
+                canvas.height = h;
+            }
+            const ctx = canvas.getContext('2d');
+            if (!ctx) return;
+            ctx.drawImage(video, 0, 0, w, h);
+            const dataUrl = canvas.toDataURL('image/jpeg', RELAY_JPEG_QUALITY);
+            const b64 = dataUrl.slice(dataUrl.indexOf(',') + 1);
+            relayFrameSeqRef.current++;
+            for (const peerId of relaySubscribersRef.current) {
+                signalingRef.current?.sendRelay(peerId, 'frame', { seq: relayFrameSeqRef.current, w, h, d: b64 });
+            }
+        }, RELAY_INTERVAL_MS);
+        console.log('[Relay] フレーム送信ループ開始');
+    }, []);
+
+    /**
+     * ホスト側: フレーム送信ループを停止
+     */
+    const stopRelayLoop = useCallback(() => {
+        if (relayLoopRef.current) {
+            clearInterval(relayLoopRef.current);
+            relayLoopRef.current = null;
+            relayVideoRef.current = null;
+            relaySubscribersRef.current.clear();
+            console.log('[Relay] フレーム送信ループ停止');
+        }
+    }, []);
+
+    /**
+     * ホスト側: 視聴者がいなくなったらループを止める
+     */
+    const maybeStopRelayLoop = useCallback(() => {
+        if (relayLoopRef.current && relaySubscribersRef.current.size === 0) {
+            stopRelayLoop();
+        }
+    }, [stopRelayLoop]);
 
     /**
      * PeerConnection作成
@@ -671,8 +768,13 @@ export function useWebRTC(options?: { signalingUrl?: string; turnConfig?: TurnCo
             setParticipants(pMap);
 
             // **Full Mesh Logic**: 既存の参加者全員に対して Initiator となり接続開始
+            // リレーモード (WebRTC非対応エンジン) ではPCを作らず、リレー購読だけ行う
             existingParticipants.forEach(p => {
-                createPeerConnection(p.id, true); // Initiator = true
+                if (relayModeRef.current) {
+                    signalingRef.current?.sendRelay(p.id, 'subscribe', {});
+                } else {
+                    createPeerConnection(p.id, true); // Initiator = true
+                }
             });
         });
 
@@ -684,6 +786,10 @@ export function useWebRTC(options?: { signalingUrl?: string; turnConfig?: TurnCo
                 next.set(peerId, { id: peerId, name, joinedAt: Date.now() });
                 return next;
             });
+            if (relayModeRef.current) {
+                signalingRef.current?.sendRelay(peerId, 'subscribe', {});
+                return;
+            }
             // 相手からのOfferを待つ (Initiator = false)
             createPeerConnection(peerId, false);
         });
@@ -695,6 +801,9 @@ export function useWebRTC(options?: { signalingUrl?: string; turnConfig?: TurnCo
                 next.delete(peerId);
                 return next;
             });
+            // リレー視聴者が退出したら購読を外す
+            relaySubscribersRef.current.delete(peerId);
+            maybeStopRelayLoop();
             // PC cleanup
             const pc = peerConnectionsRef.current.get(peerId);
             if (pc) {
@@ -712,6 +821,7 @@ export function useWebRTC(options?: { signalingUrl?: string; turnConfig?: TurnCo
         });
 
         signaling.on('onOffer', (senderId, sdp) => {
+            if (relayModeRef.current) return; // リレーモードではWebRTC経路を使わない
             const pc = createPeerConnection(senderId, false); // PC取得または作成(受信側)
             return enqueueSdpOp(pc, async () => {
                 try {
@@ -733,6 +843,7 @@ export function useWebRTC(options?: { signalingUrl?: string; turnConfig?: TurnCo
         });
 
         signaling.on('onAnswer', (senderId, sdp) => {
+            if (relayModeRef.current) return;
             const pc = peerConnectionsRef.current.get(senderId);
             if (!pc) return;
             return enqueueSdpOp(pc, async () => {
@@ -755,8 +866,58 @@ export function useWebRTC(options?: { signalingUrl?: string; turnConfig?: TurnCo
             }
         });
 
+        // WSリレー (WebRTC非対応エンジンのフォールバック経路)
+        signaling.on('onRelayMessage', (senderId, type, payload) => {
+            const p = (payload || {}) as Record<string, unknown>;
+            if (type === 'frame') {
+                // ゲスト側: 最新フレームを保持 (setStateは描画レートに合わせて間引く)
+                relayStatsRef.current.frames++;
+                relayStatsRef.current.bytes += typeof p.d === 'string' ? p.d.length : 0;
+                relayStatsRef.current.lastFrameAt = Date.now();
+                const now = Date.now();
+                if (now - relayLastRenderRef.current >= 100) {
+                    relayLastRenderRef.current = now;
+                    setRelayFrame(`data:image/jpeg;base64,${String(p.d || '')}`);
+                }
+                return;
+            }
+            if (type === 'subscribe') {
+                // ホスト側: 視聴者登録 → フレーム送信を開始し、許可状態も即通知
+                relaySubscribersRef.current.add(senderId);
+                ensureRelayLoop();
+                signalingRef.current?.sendRelay(senderId, 'control_allowed', { allowed: remoteControlAllowedRef.current });
+                console.log(`[Relay] 視聴者登録: ${senderId} (${relaySubscribersRef.current.size}人)`);
+                return;
+            }
+            if (type === 'unsubscribe') {
+                relaySubscribersRef.current.delete(senderId);
+                maybeStopRelayLoop();
+                return;
+            }
+            if (type === 'control_allowed') {
+                setPeerControlAllowed(prev => new Map(prev).set(senderId, !!p.allowed));
+                return;
+            }
+            if (type === 'chat') {
+                const msg = p as unknown as ChatMessageData;
+                if (msg?.id) {
+                    setChatMessages(prev => prev.some(m => m.id === msg.id) ? prev : [...prev, msg]);
+                }
+                return;
+            }
+            if (type === 'input') {
+                // ホスト側: 許可時のみリモート操作を適用 (F-022と同じゲート)
+                const inputType = typeof p.type === 'string' ? p.type : '';
+                if (remoteControlAllowedRef.current && inputType.startsWith('input:')) {
+                    void applyInputEvent(inputType, p.payload);
+                }
+                return;
+            }
+        });
+
         await signaling.connect();
-    }, [setConnectionState, setRoomCode, createPeerConnection, targetSignalingUrl]);
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, [setConnectionState, setRoomCode, createPeerConnection, targetSignalingUrl, ensureRelayLoop, maybeStopRelayLoop]);
 
     /**
      * ルーム作成・参加
@@ -778,6 +939,7 @@ export function useWebRTC(options?: { signalingUrl?: string; turnConfig?: TurnCo
     // 両側が初期接続と同じ(実績のある)経路で fresh なPCを張り直す。
     const lastRebuildAtRef = useRef(0);
     const rebuildConnections = useCallback(() => {
+        if (relayModeRef.current) return; // リレーモードではPCを再構築しない (WSは自動再接続される)
         const now = Date.now();
         if (now - lastRebuildAtRef.current < 15000) return; // 再構築ループ防止
         const code = roomCodeRef.current;
@@ -803,6 +965,10 @@ export function useWebRTC(options?: { signalingUrl?: string; turnConfig?: TurnCo
         signalingRef.current?.disconnect();
         signalingRef.current = null;
 
+        // リレーの後片付け
+        stopRelayLoop();
+        setRelayFrame(null);
+
         peerConnectionsRef.current.forEach(pc => pc.close());
         peerConnectionsRef.current.clear();
         dataChannelsRef.current.clear();
@@ -822,7 +988,7 @@ export function useWebRTC(options?: { signalingUrl?: string; turnConfig?: TurnCo
         setParticipants(new Map());
         setRemoteStreams(new Map());
         reset();
-    }, [reset]);
+    }, [reset, stopRelayLoop]);
 
     /**
      * 画面共有停止
@@ -892,7 +1058,9 @@ export function useWebRTC(options?: { signalingUrl?: string; turnConfig?: TurnCo
             adaptiveControllerRef.current = null;
             setConnectionQuality(null);
         }
-    }, [setConnectionState]);
+        // 共有が止まったらリレー送信も止める
+        stopRelayLoop();
+    }, [setConnectionState, stopRelayLoop]);
 
     /**
      * 画面共有
@@ -1089,6 +1257,9 @@ export function useWebRTC(options?: { signalingUrl?: string; turnConfig?: TurnCo
             localStreamsRef.current.set(streamId, stream);
             setIsScreenSharing(true);
 
+            // WSリレー視聴者が既にいればフレーム送信を開始
+            if (relaySubscribersRef.current.size > 0) ensureRelayLoop();
+
             peerConnectionsRef.current.forEach(async (pc, peerId) => {
                 pc.addTrack(videoTrack, stream);
 
@@ -1124,7 +1295,14 @@ export function useWebRTC(options?: { signalingUrl?: string; turnConfig?: TurnCo
             isHost: false
         };
         broadcastData('chat', msg);
-        setChatMessages(prev => [...prev, msg]);
+        // WSリレー: DataChannelを持たない視聴者 (Linux等) へも届ける
+        if (relayModeRef.current || relaySubscribersRef.current.size > 0) {
+            const targets = relayModeRef.current
+                ? Array.from(participantsRef.current.keys()).filter(id => id !== myId)
+                : Array.from(relaySubscribersRef.current);
+            targets.forEach(t => signalingRef.current?.sendRelay(t, 'chat', msg));
+        }
+        setChatMessages(prev => prev.some(m => m.id === msg.id) ? prev : [...prev, msg]);
     }, [broadcastData, myId]);
 
     // マイク機能
@@ -1333,6 +1511,14 @@ export function useWebRTC(options?: { signalingUrl?: string; turnConfig?: TurnCo
         return out;
     }, []);
 
+    /**
+     * E2E/デバッグ用: WSリレーの受信統計
+     */
+    const getRelayStats = useCallback(() => ({
+        ...relayStatsRef.current,
+        subscribers: relaySubscribersRef.current.size,
+    }), []);
+
     // クリーンアップ
     useEffect(() => {
         return () => {
@@ -1359,6 +1545,11 @@ export function useWebRTC(options?: { signalingUrl?: string; turnConfig?: TurnCo
         error: useConnectionStore(s => s.error),
         participants,
         myId,
+
+        // WSリレーモード (WebRTC非対応エンジン向け)
+        isRelayMode,
+        relayFrame,
+        getRelayStats,
 
         startScreenShare,
         startCustomScreenShare,

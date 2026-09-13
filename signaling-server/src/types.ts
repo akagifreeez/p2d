@@ -14,7 +14,14 @@ export type MessageType =
     | 'peer:offer'       // SDP Offer
     | 'peer:answer'      // SDP Answer
     | 'peer:ice'         // ICE候補
-    | 'error';           // エラー
+    | 'error'            // エラー
+    // WSリレー (WebRTC非対応エンジン向けフォールバック経路・targetId指定で転送)
+    | 'relay:frame'
+    | 'relay:subscribe'
+    | 'relay:unsubscribe'
+    | 'relay:chat'
+    | 'relay:input'
+    | 'relay:control_allowed';
 
 // 基本メッセージ
 export interface SignalingMessage {

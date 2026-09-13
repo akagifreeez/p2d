@@ -83,7 +83,7 @@ function handleMessage(clientId: string, message: SignalingMessage): void {
     const ws = clients.get(clientId);
     if (!ws) return;
 
-    if (message.type !== 'peer:ice') { // ICEは大量に来るのでログ除外
+    if (message.type !== 'peer:ice' && message.type !== 'relay:frame') { // ICEとフレームは大量に来るのでログ除外
         console.log(`[Server] メッセージ受信 (${clientId}): ${message.type}`);
     }
 
@@ -112,8 +112,14 @@ function handleMessage(clientId: string, message: SignalingMessage): void {
             handleIceCandidate(clientId, message as IceCandidateMessage);
             break;
 
-        default:
+        default: {
+            // WSリレー: relay:* は targetId 宛てにそのまま転送
+            if (message.type.startsWith('relay:')) {
+                handleRelayForward(clientId, message);
+                break;
+            }
             sendError(ws, 'UNKNOWN_TYPE', `不明なメッセージタイプ: ${message.type}`);
+        }
     }
 }
 
@@ -283,6 +289,23 @@ function handleIceCandidate(clientId: string, message: IceCandidateMessage): voi
         // console.error(`[Server] ICE: targetIdがありません`);
         return;
     }
+
+    const targetWs = clients.get(targetId);
+    if (targetWs) {
+        sendMessage(targetWs, {
+            ...message,
+            senderId: clientId,
+            timestamp: Date.now(),
+        });
+    }
+}
+
+/**
+ * WSリレー転送ハンドラ (relay:* / WebRTC非対応エンジン向けフォールバック経路)
+ */
+function handleRelayForward(clientId: string, message: SignalingMessage): void {
+    const targetId = message.targetId;
+    if (!targetId) return;
 
     const targetWs = clients.get(targetId);
     if (targetWs) {

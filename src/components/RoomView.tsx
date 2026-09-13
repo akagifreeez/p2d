@@ -26,16 +26,19 @@ interface RemoteControlBinding {
 
 function VideoGridItem({
     stream,
+    frameSrc,
     label,
     isLocal = false,
     control
 }: {
     stream?: MediaStream | null;
+    frameSrc?: string | null; // WSリレーのJPEGフレーム (WebRTC非対応エンジン向け)
     label?: string;
     isLocal?: boolean;
     control?: RemoteControlBinding;
 }) {
     const videoRef = useRef<HTMLVideoElement>(null);
+    const frameRef = useRef<HTMLImageElement>(null);
     const lastMoveSentRef = useRef(0);
 
     useEffect(() => {
@@ -44,9 +47,52 @@ function VideoGridItem({
         }
     }, [stream]);
 
+    // リモート操作ハンドラ (video/img 共通)。el は座標基準のメディア要素。
+    const pointerHandlers = (el: () => HTMLElement | null) => ({
+        onMouseMove: (e: React.MouseEvent) => {
+            if (!control?.allowed) return;
+            const media = el();
+            if (!media) return;
+            const now = Date.now();
+            if (now - lastMoveSentRef.current < 16) return; // ~60イベント/sにスロットル
+            lastMoveSentRef.current = now;
+            const rect = media.getBoundingClientRect();
+            const x = Math.min(1, Math.max(0, (e.clientX - rect.left) / rect.width));
+            const y = Math.min(1, Math.max(0, (e.clientY - rect.top) / rect.height));
+            control.send('input:mouse_move', { x, y });
+        },
+        onMouseDown: (e: React.MouseEvent) => {
+            if (!control?.allowed) return;
+            const button = e.button === 2 ? 'right' : e.button === 1 ? 'middle' : 'left';
+            control.send('input:mouse_button', { button, direction: 'down' });
+        },
+        onMouseUp: (e: React.MouseEvent) => {
+            if (!control?.allowed) return;
+            const button = e.button === 2 ? 'right' : e.button === 1 ? 'middle' : 'left';
+            control.send('input:mouse_button', { button, direction: 'up' });
+        },
+        onContextMenu: (e: React.MouseEvent) => {
+            if (control?.allowed) e.preventDefault();
+        },
+        onWheel: (e: React.WheelEvent) => {
+            if (!control?.allowed) return;
+            control.send('input:scroll', { deltaX: e.deltaX, deltaY: e.deltaY });
+        },
+        onMouseEnter: () => control?.onHoverChange(control.peerId),
+        onMouseLeave: () => control?.onHoverChange(null),
+    });
+
     return (
         <div className="relative aspect-video overflow-hidden group rounded-xl bg-[var(--md-surface-lowest,var(--md-surface))] border border-[var(--md-outline-variant)]/50">
-            {stream ? (
+            {frameSrc ? (
+                <img
+                    ref={frameRef}
+                    src={frameSrc}
+                    alt={label || 'relay screen'}
+                    className={`w-full h-full object-contain ${control?.allowed ? 'cursor-crosshair' : ''}`}
+                    {...pointerHandlers(() => frameRef.current)}
+                />
+            ) : stream ? (
                 <video
                     ref={videoRef}
                     autoPlay
@@ -149,6 +195,10 @@ export function RoomView({ onLeave, signalingUrl, turnConfig, e2eConfig, onOpenS
         setAdaptiveModeEnabled,
         // E2Eテスト用統計
         getPeerStats,
+        // WSリレーモード (WebRTC非対応エンジン: Linux等)
+        isRelayMode,
+        relayFrame,
+        getRelayStats,
     } = useWebRTC({ signalingUrl, turnConfig });
 
     // E2E自己テストランナー (P2D_E2E_ROLE 環境変数がある起動でのみ動作)
@@ -159,6 +209,7 @@ export function RoomView({ onLeave, signalingUrl, turnConfig, e2eConfig, onOpenS
         startCustomScreenShare, stopScreenShare: () => stopScreenShare(),
         setRemoteControlAllowed, startSystemAudio, stopSystemAudio,
         sendChatMessage, getPeerStats,
+        isRelayMode, getRelayStats,
     };
     const e2eStartedRef = useRef(false);
     useEffect(() => {
@@ -560,8 +611,26 @@ export function RoomView({ onLeave, signalingUrl, turnConfig, e2eConfig, onOpenS
                             />
                         ))}
 
+                        {/* WSリレー (WebRTC非対応エンジン: Linux等からの受信) */}
+                        {isRelayMode && relayFrame && (() => {
+                            const hostPeer = Array.from(participants.keys()).find(id => id !== myId) || '';
+                            return (
+                                <VideoGridItem
+                                    key="relay-frame"
+                                    frameSrc={relayFrame}
+                                    label={`${participants.get(hostPeer)?.name || 'Host'} (リレー)`}
+                                    control={{
+                                        peerId: hostPeer,
+                                        allowed: peerControlAllowed.get(hostPeer) === true,
+                                        send: (type, payload) => sendInputToPeer(hostPeer, type, payload),
+                                        onHoverChange: setControlPeer,
+                                    }}
+                                />
+                            );
+                        })()}
+
                         {/* Empty State if no streams */}
-                        {!localStream && localStreams.size === 0 && remoteStreams.size === 0 && (
+                        {!localStream && localStreams.size === 0 && remoteStreams.size === 0 && !relayFrame && (
                             <div className="col-span-full h-96 flex flex-col items-center justify-center text-[var(--md-on-surface-variant)] border-2 border-dashed border-[var(--md-outline-variant)] rounded-xl bg-[var(--md-surface-low)]">
                                 <svg className="w-12 h-12 mb-4 opacity-40" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1} d="M15 10l4.553-2.276A1 1 0 0121 8.618v6.764a1 1 0 01-1.447.894L15 14M5 18h8a2 2 0 002-2V8a2 2 0 00-2-2H5a2 2 0 00-2 2v8a2 2 0 002 2z" /></svg>
                                 <p className="text-base font-medium">まだ共有はありません</p>
