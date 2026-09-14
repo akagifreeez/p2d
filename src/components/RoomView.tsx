@@ -27,13 +27,34 @@ interface RemoteControlBinding {
     onHoverChange: (peerId: string | null) => void;
 }
 
+/** M5 フェーズB: リンク健康バッジ (mesh/配信木で共通の見え方) */
+function LinkHealthBadge({ level, via }: { level: 'ok' | 'degraded' | 'stalled' | 'idle'; via: 'direct' | 'relay' }) {
+    if (level === 'idle') return null;
+    const color = level === 'stalled'
+        ? 'bg-red-500/90 text-white'
+        : level === 'degraded'
+            ? 'bg-yellow-500/90 text-black'
+            : 'bg-green-600/80 text-white';
+    const dot = level === 'stalled' ? 'bg-white animate-pulse' : level === 'degraded' ? 'bg-black/70' : 'bg-white';
+    const text = level === 'stalled'
+        ? '再接続中...'
+        : `${via === 'relay' ? '中継経由' : '直結'}${level === 'degraded' ? ' (不安定)' : ''}`;
+    return (
+        <div className={`absolute top-2 right-2 z-10 flex items-center gap-1.5 px-2 py-1 rounded-md text-[10px] font-medium ${color}`}>
+            <span className={`w-1.5 h-1.5 rounded-full ${dot}`} />
+            {text}
+        </div>
+    );
+}
+
 function VideoGridItem({
     stream,
     frameSrc,
     mseUrl,
     label,
     isLocal = false,
-    control
+    control,
+    link
 }: {
     stream?: MediaStream | null;
     frameSrc?: string | null; // WSリレーのJPEGフレーム (低遅延フォールバック)
@@ -41,6 +62,7 @@ function VideoGridItem({
     label?: string;
     isLocal?: boolean;
     control?: RemoteControlBinding;
+    link?: { level: 'ok' | 'degraded' | 'stalled' | 'idle'; via: 'direct' | 'relay' } | null;
 }) {
     const videoRef = useRef<HTMLVideoElement>(null);
     const frameRef = useRef<HTMLImageElement>(null);
@@ -89,6 +111,7 @@ function VideoGridItem({
 
     return (
         <div className="relative aspect-video overflow-hidden group rounded-xl bg-[var(--md-surface-lowest,var(--md-surface))] border border-[var(--md-outline-variant)]/50">
+            {link && <LinkHealthBadge level={link.level} via={link.via} />}
             {mseUrl ? (
                 <video
                     ref={videoRef}
@@ -237,6 +260,9 @@ export function RoomView({ onLeave, signalingUrl, turnConfig, e2eConfig, onOpenS
         // リモート操作 (F-022 / issue#8: 視聴者ごとの明示承認・期限付き)
         setRemoteControlAllowed,
         debugStallRelay,
+        // M5 フェーズB/C: リンク健康バッジ + 木の健康マップ
+        linkHealth,
+        treeHealth,
         grantRemoteControl,
         revokeRemoteControl,
         controlGrants,
@@ -325,6 +351,20 @@ export function RoomView({ onLeave, signalingUrl, turnConfig, e2eConfig, onOpenS
         void runE2E(e2eConfig, liveDeps);
         // eslint-disable-next-line react-hooks/exhaustive-deps
     }, [e2eConfig]);
+
+    // M5 フェーズB: リンク停滞/回復のトースト (level遷移を監視)
+    const prevLinkLevelRef = useRef(linkHealth.level);
+    const [linkToast, setLinkToast] = useState<string | null>(null);
+    useEffect(() => {
+        const prev = prevLinkLevelRef.current;
+        if (prev !== linkHealth.level) {
+            prevLinkLevelRef.current = linkHealth.level;
+            if (linkHealth.level === 'stalled') setLinkToast('接続が不安定です。自動的に再接続します...');
+            if (prev === 'stalled' && (linkHealth.level === 'ok' || linkHealth.level === 'degraded')) setLinkToast('接続を回復しました');
+            const t = window.setTimeout(() => setLinkToast(null), 4000);
+            return () => window.clearTimeout(t);
+        }
+    }, [linkHealth.level]);
 
     // issue#8: 許可の残り時間表示用に1秒ごとに再描画 (期限付きグラントがある間だけ)
     const [nowMs, setNowMs] = useState(Date.now());
@@ -637,6 +677,11 @@ export function RoomView({ onLeave, signalingUrl, turnConfig, e2eConfig, onOpenS
         .filter((w): w is string => !!w);
     return (
         <div className="fixed inset-0 w-full h-full flex flex-col bg-[var(--md-surface)] overflow-hidden z-50">
+            {linkToast && (
+                <div className="absolute top-20 left-1/2 -translate-x-1/2 z-40 bg-[var(--md-surface-high)] border border-[var(--md-outline-variant)] rounded-lg px-4 py-2 text-xs shadow-lg" role="status">
+                    {linkToast}
+                </div>
+            )}
             {insecureUrls.length > 0 && (
                 <div className="bg-[var(--md-error)]/12 border-b border-[var(--md-error)]/40 text-[var(--md-error)] text-xs px-4 py-2 flex items-start gap-2 shrink-0" role="alert">
                     <span className="shrink-0">⚠</span>
@@ -769,6 +814,22 @@ export function RoomView({ onLeave, signalingUrl, turnConfig, e2eConfig, onOpenS
                                     </div>
                                 );
                             })}
+                            {isHost && treeHealth.size > 0 && (
+                                <div className="mt-3 pt-3 border-t border-[var(--md-outline-variant)]/40">
+                                    <div className="text-[10px] text-[var(--md-on-surface-variant)] mb-1.5">中継の健康 (M5)</div>
+                                    {Array.from(treeHealth).map(([id, m]) => {
+                                        const fresh = Date.now() - m.at < 20000;
+                                        const dotColor = !fresh ? 'bg-gray-400' : m.upstreamSilentMs > 4000 ? 'bg-[var(--md-error)]' : 'bg-green-500';
+                                        return (
+                                            <div key={id} className="text-[10px] flex items-center gap-1.5 text-[var(--md-on-surface-variant)]">
+                                                <span className={`w-1.5 h-1.5 rounded-full ${dotColor}`} />
+                                                <span className="font-mono">{id.slice(0, 8)}</span>
+                                                <span>子{m.children}人・上流{Math.round(m.upstreamSilentMs / 1000)}秒無音{!fresh ? ' (未更新)' : ''}</span>
+                                            </div>
+                                        );
+                                    })}
+                                </div>
+                            )}
                         </div>
                     </div>
 
@@ -823,6 +884,12 @@ export function RoomView({ onLeave, signalingUrl, turnConfig, e2eConfig, onOpenS
                                 key={peerId}
                                 stream={stream}
                                 label={participants.get(peerId)?.name || peerId}
+                                link={{
+                                    level: !connectionQuality ? 'idle'
+                                        : connectionQuality.qualityLevel === 'excellent' || connectionQuality.qualityLevel === 'good' ? 'ok'
+                                            : 'degraded',
+                                    via: 'direct',
+                                }}
                                 control={{
                                     peerId,
                                     allowed: peerControlAllowed.get(peerId) === true,
@@ -841,6 +908,7 @@ export function RoomView({ onLeave, signalingUrl, turnConfig, e2eConfig, onOpenS
                                     frameSrc={relayVideoUrl ? undefined : relayFrame}
                                     mseUrl={relayVideoUrl}
                                     label={`${participants.get(hostPeer)?.name || 'Host'} (リレー)`}
+                                    link={{ level: linkHealth.level === 'idle' ? 'ok' : linkHealth.level, via: linkHealth.via }}
                                     control={{
                                         peerId: hostPeer,
                                         allowed: peerControlAllowed.get(hostPeer) === true,

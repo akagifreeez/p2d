@@ -134,6 +134,28 @@ export function checkWatchdog(
     return { state: next, action: 'notify_parent_lost' };
 }
 
+/** リンク健康レベル (見える化用。mesh/配信木で共通のバッジに使う) */
+export type LinkLevel = 'ok' | 'degraded' | 'stalled' | 'idle';
+
+/**
+ * 現在のリンク健康を判定する (フェーズB)。
+ * - ok: 無音が警告しきい値 (停滞しきい値の半分) 未満
+ * - degraded: 警告しきい値以上・停滞しきい値未満 (切替はしない。バッジ黄)
+ * - stalled: 停滞しきい値以上 (parent_lost送信対象。バッジ赤)
+ * - idle: まだ受信していない / 共有停止で監視解除中
+ */
+export function classifyLink(
+    state: WatchdogState,
+    now: number,
+    defaults = WATCHDOG_DEFAULTS,
+): LinkLevel {
+    if (state.phase === 'idle') return 'idle';
+    const silentFor = now - state.lastActivityAt;
+    if (silentFor >= defaults.tickStaleMs) return 'stalled';
+    if (silentFor >= defaults.tickStaleMs / 2) return 'degraded';
+    return 'ok';
+}
+
 /** 切替 (assign受理/強制再接続) を記録する */
 export function noteSwitch(state: WatchdogState, now: number): WatchdogState {
     return {

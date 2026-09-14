@@ -217,3 +217,22 @@ test('detachNode: 深い位置の葉を取り除ける (根・中継は壊さな
     assert.equal(detachNode(root, 'host'), false, '根は取り除けない');
     assert.equal(detachNode(root, 'unknown'), false);
 });
+
+test('M5§7: pickParent/attach の skip で不健康な中継を親候補から外せる', () => {
+    const root = createRoot('host');
+    const relay = attach(root, { id: 'relay', addr: null, depth: 0, fanout: 0, children: [] });
+    assert.ok(relay);
+    promote(relay, { host: 'h', port: 1 });
+    // root直結 (fanout4) を中継1 + 直結2でほぼ満員にする (残り1枠)
+    for (const id of ['g1', 'g2']) attachUnder(root, 'host', { id, addr: null, depth: 0, fanout: 0, children: [] });
+    attachUnder(root, 'host', { id: 'g3', addr: null, depth: 0, fanout: 0, children: [] });
+    assert.equal(root.children.length, 4, 'root直結は満員');
+
+    // skip無し → 幅優先で中継が選ばれる
+    const p2 = pickParent(root, 3);
+    assert.equal(p2?.id, 'relay');
+
+    // 中継を不健康扱いする skip → 候補ゼロ (他に空きがない)
+    const p1 = pickParent(root, 3, (n) => n.id === 'relay');
+    assert.equal(p1, null);
+});

@@ -5,7 +5,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
-    initWatchdogState, noteActivity, disarmWatchdog, checkWatchdog, noteSwitch,
+    initWatchdogState, noteActivity, disarmWatchdog, checkWatchdog, noteSwitch, classifyLink,
     WATCHDOG_DEFAULTS, type WatchdogState,
 } from '../src/lib/relayWatchdog.js';
 
@@ -91,4 +91,14 @@ test('join直後 (未受信) は監視しない', () => {
     const st = initWatchdogState(T0);
     const r = checkWatchdog(st, T0 + 60_000);
     assert.equal(r.action, 'none');
+});
+
+test('classifyLink: 無音時間を ok/degraded/stalled に分類する (フェーズB)', () => {
+    let st = armed(T0);
+    assert.equal(classifyLink(st, T0 + 1000), 'ok');
+    assert.equal(classifyLink(st, T0 + D.tickStaleMs / 2), 'degraded', '警告しきい値で黄');
+    assert.equal(classifyLink(st, T0 + D.tickStaleMs), 'stalled', '停滞しきい値で赤');
+    // 解除済み (共有停止) は idle
+    st = disarmWatchdog(st, T0 + 1000);
+    assert.equal(classifyLink(st, T0 + 60_000), 'idle');
 });

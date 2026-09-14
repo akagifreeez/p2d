@@ -35,7 +35,7 @@ import {
 } from '../lib/signalRouter';
 import { generateRelayKeyPair, signChunk, verifyChunk, chunkDataFromB64, keyFingerprint, acceptKeyCandidate, type RelayKeyPair } from '../lib/relaySign';
 import { isControlAllowed, pruneExpired, resolveInputOrigin, CONTROL_TTL_OPTIONS, type ControlGrant, type ControlTtlKey } from '../lib/controlGrant';
-import { initWatchdogState, noteActivity, noteSwitch, armWatchdog, disarmWatchdog, checkWatchdog, type WatchdogState } from '../lib/relayWatchdog';
+import { initWatchdogState, noteActivity, noteSwitch, armWatchdog, disarmWatchdog, checkWatchdog, classifyLink, type WatchdogState, type LinkLevel } from '../lib/relayWatchdog';
 
 // WebRTC APIの有無 (Ubuntu等のWebKitGTKはWebRTC無効ビルドで RTCPeerConnection が存在しない)
 export const SUPPORTS_WEBRTC = typeof RTCPeerConnection !== 'undefined';
@@ -161,6 +161,10 @@ export interface UseWebRTCReturn {
         addr: { host: string; port: number } | null;
         parent: string | null;
     };
+    /** M5 フェーズB: 視聴者側のリンク健康 (バッジ用) */
+    linkHealth: { level: LinkLevel; via: 'direct' | 'relay' };
+    /** M5 フェーズC: 木の健康マップ (中継ごとの子数・上流無音時間) */
+    treeHealth: Map<string, { at: number; upstreamSilentMs: number; children: number }>;
     /** M4: 署名鍵のフィンガープリント (QR帯域外照合用) */
     getRelayKeyFingerprint: () => string | null;
     /** issue#11: 招待 (;fp=) から受けた鍵指紋を設定し、受信鍵との照合を強制する */
@@ -419,6 +423,13 @@ export function useWebRTC(options?: { signalingUrl?: string; turnConfig?: TurnCo
     // M5 フェーズA: 親からの受信停滞を監視するウォッチドッグ (配信木計画書§7)。
     // 判定ロジックは relayWatchdog.ts (純粋関数) で、ここでは着信を記録するだけ
     const relayWatchdogRef = useRef<WatchdogState>(initWatchdogState(Date.now()));
+    // M5 フェーズB: 視聴者側のリンク健康バッジ用 (mesh/配信木で共通の見え方)
+    const [linkHealth, setLinkHealth] = useState<{ level: LinkLevel; via: 'direct' | 'relay' }>({ level: 'idle', via: 'direct' });
+    const connectedViaRef = useRef<'direct' | 'relay'>('direct');
+    // M5 フェーズC: 中継からのメトリクス (ホストが木の健康を把握する)
+    const treeHealthRef = useRef<Map<string, { at: number; upstreamSilentMs: number; children: number }>>(new Map());
+    const [treeHealth, setTreeHealth] = useState<Map<string, { at: number; upstreamSilentMs: number; children: number }>>(new Map());
+    const relayMetricsTimerRef = useRef<number | null>(null);
     // M5 E2E用の故障注入: 指定時刻まで着信メッセージを握りつぶし、親停滞を再現する
     const relaySuppressUntilRef = useRef(0);
     const suppressLoggedRef = useRef(false);
@@ -1312,9 +1323,15 @@ export function useWebRTC(options?: { signalingUrl?: string; turnConfig?: TurnCo
         };
         if (findTreeNode(c.root, newSubId)) return;
 
-        const parent = pickTreeParent(c.root, 3);
+        // M5 フェーズC: 上流が停滞している中継には新しい子を割り当てない
+        const isUnhealthy = (node: { id: string; addr: unknown }) => {
+            if (!node.addr) return false;
+            const m = treeHealthRef.current.get(node.id);
+            return !!m && Date.now() - m.at < 20000 && m.upstreamSilentMs > 4000;
+        };
+        const parent = pickTreeParent(c.root, 3, isUnhealthy);
         if (parent) {
-            const node = treeAttach(c.root, { id: newSubId, addr: null, depth: 0, fanout: 0, children: [] });
+            const node = treeAttach(c.root, { id: newSubId, addr: null, depth: 0, fanout: 0, children: [] }, 3, isUnhealthy);
             if (node && parent !== c.root && parent.addr) {
                 // 中継ノードの下へ配置 → 視聴者を中継のサーバーへ誘導
                 console.log(`[Tree] ${newSubId} を中継 ${parent.id} (${parent.addr.host}:${parent.addr.port}) へ割り当て`);
@@ -1461,6 +1478,17 @@ export function useWebRTC(options?: { signalingUrl?: string; turnConfig?: TurnCo
                 tc.createRoom(roomNameRef.current, roomCodeRef.current || undefined);
                 // ホストへ準備完了 → 以後の参加者をここへ割り当ててもらう
                 signalingRef.current?.sendRelay(hostId, 'tree:relay_ready', { addr: treeSelfAddrRef.current });
+                // M5 フェーズC: 5秒毎に自分の健康 (配下の子数・上流の無音時間) を報告。
+                // ホストはこれをもとに、不健康な中継へ新しい子を割り当てない
+                if (relayMetricsTimerRef.current) clearInterval(relayMetricsTimerRef.current);
+                relayMetricsTimerRef.current = window.setInterval(() => {
+                    const up = treeRootIdRef.current;
+                    if (!up || !signalingRef.current?.isConnected) return;
+                    signalingRef.current?.sendRelay(up, 'tree:metrics', {
+                        children: treeChildrenRef.current.size,
+                        upstreamSilentMs: Date.now() - relayWatchdogRef.current.lastActivityAt,
+                    });
+                }, 5000);
             } catch (e) {
                 console.error('[Tree] 中継への昇格に失敗:', e);
                 treeRoleRef.current = 'none';
@@ -2074,9 +2102,27 @@ export function useWebRTC(options?: { signalingUrl?: string; turnConfig?: TurnCo
                     // 「今のホスト部屋でのID」に対して行われるので、それを凍結する
                     controlIdRef.current = myIdRef.current;
                     controlIdFrozenRef.current = true;
+                    connectedViaRef.current = 'relay';
                     void switchSignalingRef.current(`ws://${addr.host}:${addr.port}`).catch((e) => {
                         console.error('[Tree] 中継への移動に失敗:', e);
                     });
+                }
+                return;
+            }
+            if (type === 'tree:metrics') {
+                // M5 フェーズC: 中継からの定周期メトリクスを記録し、
+                // 新規割り当ての親選定に使う
+                if (isHostRef.current) {
+                    const c = treeCoordinatorRef.current;
+                    const node = c ? findTreeNode(c.root, senderId) : null;
+                    if (node && node.addr) {
+                        treeHealthRef.current.set(senderId, {
+                            at: Date.now(),
+                            upstreamSilentMs: Number(p.upstreamSilentMs) || 0,
+                            children: Number(p.children) || 0,
+                        });
+                        setTreeHealth(new Map(treeHealthRef.current));
+                    }
                 }
                 return;
             }
@@ -2341,6 +2387,12 @@ export function useWebRTC(options?: { signalingUrl?: string; turnConfig?: TurnCo
         controlIdFrozenRef.current = false;
         // M5§7: ウォッチドッグも初期化
         relayWatchdogRef.current = initWatchdogState(Date.now());
+        if (relayMetricsTimerRef.current) {
+            clearInterval(relayMetricsTimerRef.current);
+            relayMetricsTimerRef.current = null;
+        }
+        treeHealthRef.current.clear();
+        setTreeHealth(new Map());
         if (relayTickTimerRef.current) {
             clearInterval(relayTickTimerRef.current);
             relayTickTimerRef.current = null;
@@ -2937,8 +2989,14 @@ export function useWebRTC(options?: { signalingUrl?: string; turnConfig?: TurnCo
     useEffect(() => {
         const t = window.setInterval(() => {
             if (!relayModeRef.current) return;
-            const r = checkWatchdog(relayWatchdogRef.current, Date.now());
+            const now = Date.now();
+            const r = checkWatchdog(relayWatchdogRef.current, now);
             relayWatchdogRef.current = r.state;
+            // フェーズB: バッジ用の健康レベル (変化したときだけsetState)
+            const level = classifyLink(r.state, now);
+            setLinkHealth(prev => (prev.level === level && prev.via === connectedViaRef.current)
+                ? prev
+                : { level, via: connectedViaRef.current });
             if (r.action === 'none') return;
             const parent = parentTargetIdRef.current;
             if (r.action === 'notify_parent_lost') {
@@ -2977,6 +3035,8 @@ export function useWebRTC(options?: { signalingUrl?: string; turnConfig?: TurnCo
             relayModeRef.current = v;
             setIsRelayModeState(v);
         },
+        /** M5 フェーズC: 木の健康マップ (ホスト表示用) */
+        treeHealth,
         getTreeInfo: () => ({
             role: treeRoleRef.current,
             children: [...treeChildrenRef.current],
@@ -2994,6 +3054,8 @@ export function useWebRTC(options?: { signalingUrl?: string; turnConfig?: TurnCo
 
         // WSリレーモード (WebRTC非対応エンジン向け)
         isRelayMode,
+        /** M5 フェーズB: 視聴者側のリンク健康 (バッジ用。mesh/配信木共通) */
+        linkHealth,
         relayFrame,
         relayVideoUrl,
         relayAudioUrl,

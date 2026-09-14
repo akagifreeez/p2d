@@ -57,14 +57,20 @@ export function flatten(root: TreeNode): TreeNode[] {
 /**
  * 新ノードの親を幅優先で決める (空きスロットのある最浅ノード)。
  * 同一深さでは children 追加順 (古いノード優先)。
- * 見つからない (満杯/深さ上限) なら null。
+ * skip を渡すと「不健康なノード」を候補から除外できる (M5§7 フェーズC:
+ * 上流が停滞している中継に新しい子を割り当てない)。
+ * 見つからない (満杯/深さ上限/全てskip) なら null。
  */
-export function pickParent(root: TreeNode, maxDepth = MAX_DEPTH): TreeNode | null {
+export function pickParent(
+    root: TreeNode,
+    maxDepth = MAX_DEPTH,
+    skip?: (node: TreeNode) => boolean,
+): TreeNode | null {
     const queue: TreeNode[] = [root];
     while (queue.length > 0) {
         const node = queue.shift()!;
         if (node.children.length < node.fanout && node.depth + 1 <= maxDepth) {
-            return node;
+            if (!skip?.(node)) return node;
         }
         queue.push(...node.children);
     }
@@ -80,8 +86,9 @@ export function attach(
     root: TreeNode,
     newNode: TreeNode,
     maxDepth = MAX_DEPTH,
+    skip?: (node: TreeNode) => boolean,
 ): TreeNode | null {
-    const parent = pickParent(root, maxDepth);
+    const parent = pickParent(root, maxDepth, skip);
     if (!parent) return null;
     // 新ノードは fanout=0 (視聴者) で加入 — promoteされて初めて子を引き受ける
     const node: TreeNode = { ...newNode, depth: parent.depth + 1, fanout: 0 };
