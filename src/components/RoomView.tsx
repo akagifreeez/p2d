@@ -270,6 +270,8 @@ export function RoomView({ onLeave, signalingUrl, turnConfig, e2eConfig, onOpenS
         // M5: 自動再接続打ち切り後の手動再参加
         rejoinRequired,
         rejoinAfterGiveUp,
+        // M4: mesh⇔tree自動切替
+        setAutoTreeSwitchEnabled,
         grantRemoteControl,
         revokeRemoteControl,
         controlGrants,
@@ -320,7 +322,7 @@ export function RoomView({ onLeave, signalingUrl, turnConfig, e2eConfig, onOpenS
         getRelayKeyFingerprint,
         // issue#11: 招待の鍵指紋を設定し受信鍵と照合する
         setExpectedKeyFingerprint,
-    } = useWebRTC({ signalingUrl, turnConfig, treeFanout: e2eConfig?.treeFanout ?? undefined });
+    } = useWebRTC({ signalingUrl, turnConfig, treeFanout: e2eConfig?.treeFanout ?? undefined, treeSwitchUp: e2eConfig?.treeSwitchUp ?? undefined, treeSwitchDown: e2eConfig?.treeSwitchDown ?? undefined });
 
     /** 招待経路の共通参加: 鍵指紋があれば設定してから参加する (issue#11) */
     const joinWithInvite = (invite: { code: string; endpoint: string | null; fingerprint: string | null }, name?: string) => {
@@ -390,6 +392,9 @@ export function RoomView({ onLeave, signalingUrl, turnConfig, e2eConfig, onOpenS
         const t = window.setInterval(() => setNowMs(Date.now()), 1000);
         return () => window.clearInterval(t);
     }, [controlGrants]);
+
+    // M4: 自動切替のUI状態 (既定ON)
+    const [autoTreeSwitch, setAutoTreeSwitch] = useState<boolean>(localStorage.getItem('p2d_auto_tree_switch') !== '0');
 
     // 入力ステート
     const [inputCode, setInputCode] = useState('');
@@ -1150,6 +1155,24 @@ export function RoomView({ onLeave, signalingUrl, turnConfig, e2eConfig, onOpenS
                                         許可は参加者リストの各行から、視聴者ごとに期限付きで行います
                                         (既定OFF。取り消すまで自動的には有効になりません)。
                                     </div>
+                                </div>
+
+                                {/* M4: mesh⇔tree自動切替 (F-022と同じswitch UI) */}
+                                <div className="flex items-center justify-between mt-5">
+                                    <div>
+                                        <div className="text-sm font-medium">配信モード自動切替</div>
+                                        <div className="text-xs text-[var(--md-on-surface-variant)]">参加者が増えたら自動で配信木モード(中継)へ切り替えます (しきい値は起動時設定)</div>
+                                    </div>
+                                    <button
+                                        role="switch"
+                                        aria-checked={autoTreeSwitch}
+                                        onClick={() => {
+                                            const next = !autoTreeSwitch;
+                                            setAutoTreeSwitch(next);
+                                            setAutoTreeSwitchEnabled(next);
+                                        }}
+                                        className={`md-switch ${autoTreeSwitch ? 'on' : ''}`}
+                                    />
                                 </div>
 
                                 {/* リレー品質 (WSリレー配信のホスト側エンコード設定) */}

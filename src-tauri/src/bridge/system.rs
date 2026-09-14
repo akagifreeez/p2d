@@ -171,6 +171,10 @@ pub struct E2eConfig {
     pub force_relay: bool,
     /// 配信木コーディネータのホスト直結上限 (既定4。E2Eでは小さくして昇格を誘発)
     pub tree_fanout: Option<u16>,
+    /// M4: mesh⇔tree自動切替の昇格しきい値 (参加者数。既定5。E2Eでは小さくする)
+    pub tree_switch_up: Option<u16>,
+    /// M4: mesh⇔tree自動切替の降格しきい値 (既定2。ヒステリシスのため昇格より小さい)
+    pub tree_switch_down: Option<u16>,
 }
 
 /// E2E設定を起動引数 / 環境変数から取得
@@ -185,9 +189,15 @@ pub fn get_e2e_config() -> E2eConfig {
         .unwrap_or(false);
     let tree_fanout = e2e_opt("--p2d-tree-fanout=", "P2D_TREE_FANOUT")
         .and_then(|v| v.parse::<u16>().ok());
+    let tree_switch_up = e2e_opt("--p2d-tree-switch-up=", "P2D_TREE_SWITCH_UP")
+        .and_then(|v| v.parse::<u16>().ok());
+    let tree_switch_down = e2e_opt("--p2d-tree-switch-down=", "P2D_TREE_SWITCH_DOWN")
+        .and_then(|v| v.parse::<u16>().ok());
     E2eConfig {
         force_relay,
         tree_fanout,
+        tree_switch_up,
+        tree_switch_down,
         enabled: role.is_some(),
         role,
         sync_path: e2e_opt("--p2d-e2e-sync=", "P2D_E2E_SYNC"),

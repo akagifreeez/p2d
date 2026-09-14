@@ -165,6 +165,8 @@ export interface UseWebRTCReturn {
     linkHealth: { level: LinkLevel; via: 'direct' | 'relay'; cause?: 'host-load' | 'route' | null };
     /** M5: 自動再接続が打ち切られ、手動再参加が必要 */
     rejoinRequired: boolean;
+    /** M4: mesh⇔tree自動切替の有効/無効を設定 (設定UI用) */
+    setAutoTreeSwitchEnabled: (v: boolean) => void;
     /** M5: 打ち切り後の手動再参加 */
     rejoinAfterGiveUp: () => Promise<void>;
     /** M5 フェーズC: 木の健康マップ (中継ごとの子数・上流無音時間・RTT) */
@@ -256,7 +258,7 @@ export interface UseWebRTCReturn {
     getPeerStats: () => Promise<{ peerId: string; type: string; kind: string; bytes: number }[]>;
 }
 
-export function useWebRTC(options?: { signalingUrl?: string; turnConfig?: TurnConfig; treeFanout?: number }): UseWebRTCReturn {
+export function useWebRTC(options?: { signalingUrl?: string; turnConfig?: TurnConfig; treeFanout?: number; treeSwitchUp?: number; treeSwitchDown?: number }): UseWebRTCReturn {
     const { connectionState, setConnectionState, setRoomCode, setError, reset } = useConnectionStore();
 
     const targetSignalingUrl = options?.signalingUrl || DEFAULT_SIGNALING_URL;
@@ -415,11 +417,23 @@ export function useWebRTC(options?: { signalingUrl?: string; turnConfig?: TurnCo
     useEffect(() => {
         if (options?.treeFanout) treeFanoutRef.current = options.treeFanout;
     }, [options?.treeFanout]);
+    // M4: mesh⇔tree自動切替のしきい値 (既定: 昇格5人/降格2人。設定UIでON/OFF)
+    const treeSwitchUpRef = useRef<number>(options?.treeSwitchUp ?? 5);
+    const treeSwitchDownRef = useRef<number>(options?.treeSwitchDown ?? 2);
+    const autoTreeSwitchRef = useRef<boolean>(localStorage.getItem('p2d_auto_tree_switch') !== '0');
+    useEffect(() => {
+        if (options?.treeSwitchUp) treeSwitchUpRef.current = options.treeSwitchUp;
+        if (options?.treeSwitchDown) treeSwitchDownRef.current = options.treeSwitchDown;
+    }, [options?.treeSwitchUp, options?.treeSwitchDown]);
     const lanIpRef = useRef<string | null>(null);
 
     // === WSリレーモード (LinuxのWebKitGTK等 WebRTC非対応エンジン向けフォールバック) ===
     const relayModeRef = useRef<boolean>(!SUPPORTS_WEBRTC);
     const [isRelayMode, setIsRelayModeState] = useState<boolean>(!SUPPORTS_WEBRTC);
+    const applyRelayMode = useCallback((v: boolean) => {
+        relayModeRef.current = v;
+        setIsRelayModeState(v);
+    }, []);
     // ホスト側: WSリレーでフレームを受信する視聴者
     const relaySubscribersRef = useRef<Set<string>>(new Set());
     const relayVideoRef = useRef<HTMLVideoElement | null>(null);
@@ -605,8 +619,9 @@ export function useWebRTC(options?: { signalingUrl?: string; turnConfig?: TurnCo
                         relayStatsRef.current.inputsRejected++;
                         warnRejectThrottled(peerId);
                     }
-                } else if (data.type === 'roster:sync' || data.type === 'roster:depart' || data.type === 'tunnel:sig') {
-                    // レンデブー最小化 (M1/M2): 名簿ゴシップ + DC中継シグナリング
+                } else if (data.type === 'roster:sync' || data.type === 'roster:depart' || data.type === 'tunnel:sig' || data.type === 'mode:relay') {
+                    // レンデブー最小化 (M1/M2): 名簿ゴシップ + DC中継シグナリング。
+                    // M4: モード切替の指示もDCで届く
                     dcDispatchRef.current(data.type, data.payload, peerId);
                 }
                 // 他のメッセージタイプ（controlなど）は必要に応じて追加
@@ -1728,6 +1743,17 @@ export function useWebRTC(options?: { signalingUrl?: string; turnConfig?: TurnCo
             handleTunnelEnvelope(payload as TunnelEnvelope);
             return;
         }
+        if (type === 'mode:relay') {
+            // M4: ホストが配信木モードへ切替 — 自分もWSリレー購読へ移行する
+            if (relayModeRef.current) return;
+            console.log('[M4] ホストの指示で配信木モードへ切替 (購読を開始)');
+            applyRelayMode(true);
+            for (const id of participantsRef.current.keys()) {
+                if (id === myIdRef.current) continue;
+                signalingRef.current?.sendRelay(id, 'subscribe', detectRelayCapabilities());
+            }
+            return;
+        }
     };
 
     /**
@@ -2010,6 +2036,20 @@ export function useWebRTC(options?: { signalingUrl?: string; turnConfig?: TurnCo
                     highStreak: Number(p.highStreak) || 0,
                 };
                 forwardToTreeChildren('tick', p);
+                return;
+            }
+            if (type === 'mode:mesh') {
+                // M4: ホストがmeshモードへ切替 — WS購読を外し、WebRTCを張り直す
+                if (!relayModeRef.current) return;
+                console.log('[M4] ホストの指示でmeshモードへ切替 (WebRTCを再構築)');
+                applyRelayMode(false);
+                const parent = parentTargetIdRef.current;
+                if (parent) signalingRef.current?.sendRelay(parent, 'unsubscribe', {});
+                for (const id of participantsRef.current.keys()) {
+                    if (id === myIdRef.current) continue;
+                    if (peerConnectionsRef.current.has(id)) continue;
+                    createPeerConnection(id, shouldInitiateTo(myIdRef.current || '', id));
+                }
                 return;
             }
             if (type === 'ping') {
@@ -3089,6 +3129,47 @@ export function useWebRTC(options?: { signalingUrl?: string; turnConfig?: TurnCo
         }
     }, [isSpeaking, broadcastData]);
 
+    // M4: mesh⇔tree自動モード切替 (ホスト, 2秒毎)。しきい値はヒステリシス付き
+    // (昇格: 参加者>=up / 降格: 参加者<=down)。昇格は配信中いつでも可能、
+    // 降格は「自分が自動昇格した場合」に限り (forceRelay等の手動設定を壊さない)
+    const autoSwitchedRef = useRef(false);
+    const lastM4DiagRef = useRef(0);
+    useEffect(() => {
+        const t = window.setInterval(() => {
+            const sharing = relayLoopRef.current !== null || localStreamsRef.current.size > 0;
+            if (Date.now() - lastM4DiagRef.current >= 10000) {
+                lastM4DiagRef.current = Date.now();
+                console.log(`[M4-diag] host=${isHostRef.current} auto=${autoTreeSwitchRef.current} sharing=${sharing} count=${participantsRef.current.size} relay=${relayModeRef.current} up=${treeSwitchUpRef.current} down=${treeSwitchDownRef.current}`);
+            }
+            if (!isHostRef.current || !autoTreeSwitchRef.current) return;
+            if (!sharing) return;
+            // participantsRef は自分を含まないため、しきい値判定には自分を加算する
+            const count = participantsRef.current.size + 1;
+            if (!relayModeRef.current && count >= treeSwitchUpRef.current) {
+                console.log(`[M4] 視聴者${count}人 (しきい値${treeSwitchUpRef.current}) — meshから配信木へ自動切替`);
+                autoSwitchedRef.current = true;
+                applyRelayMode(true);
+                // DC開通の遅い視聴者に漏れないよう数回再送する
+                broadcastData('mode:relay', { by: myIdRef.current ?? '' });
+                window.setTimeout(() => broadcastData('mode:relay', { by: myIdRef.current ?? '' }), 3000);
+                window.setTimeout(() => broadcastData('mode:relay', { by: myIdRef.current ?? '' }), 8000);
+                window.setTimeout(() => broadcastData('mode:relay', { by: myIdRef.current ?? '' }), 15000);
+            } else if (relayModeRef.current && autoSwitchedRef.current && count <= treeSwitchDownRef.current) {
+                // WebRTC非対応視聴者 (MSE不可) がいる場合はmeshへ戻さない
+                const hasNonMse = Array.from(relayCapsRef.current.values()).some(c => !c.mse);
+                if (hasNonMse) return;
+                console.log(`[M4] 視聴者${count}人 (しきい値${treeSwitchDownRef.current}以下) — 配信木からmeshへ自動切替`);
+                autoSwitchedRef.current = false;
+                applyRelayMode(false);
+                for (const peerId of relaySubscribersRef.current) {
+                    signalingRef.current?.sendRelay(peerId, 'mode:mesh', {});
+                }
+                stopRelayLoop();
+            }
+        }, 2000);
+        return () => window.clearInterval(t);
+    }, []);
+
     // M5 フェーズC: 降格 — 上流停滞中継の配下の子を健康な親へ移動する (ホスト, 5秒毎)
     useEffect(() => {
         const t = window.setInterval(() => {
@@ -3183,10 +3264,7 @@ export function useWebRTC(options?: { signalingUrl?: string; turnConfig?: TurnCo
         // レンデブー最小化 (M1): 名簿ゴシップの状態 (E2E収束検証用)
         getRoster: () => rosterEntries(rosterRef.current),
         // 配信木 (E2E検証用): 自ノードの状態
-        setRelayMode: (v: boolean) => {
-            relayModeRef.current = v;
-            setIsRelayModeState(v);
-        },
+        setRelayMode: applyRelayMode,
         /** M5 フェーズC: 木の健康マップ (ホスト表示用) */
         treeHealth,
         getTreeInfo: () => ({
@@ -3212,6 +3290,11 @@ export function useWebRTC(options?: { signalingUrl?: string; turnConfig?: TurnCo
         rejoinRequired,
         /** M5: 打ち切り後の手動再参加 (根の部屋へ再接続して自動で戻る) */
         rejoinAfterGiveUp,
+        /** M4: 自動切替の有効/無効設定 */
+        setAutoTreeSwitchEnabled: (v: boolean) => {
+            autoTreeSwitchRef.current = v;
+            localStorage.setItem('p2d_auto_tree_switch', v ? '1' : '0');
+        },
         relayFrame,
         relayVideoUrl,
         relayAudioUrl,
