@@ -326,6 +326,15 @@ export function useWebRTC(options?: { signalingUrl?: string; turnConfig?: TurnCo
     const syncGrantsState = useCallback(() => {
         setControlGrants(new Map(controlGrantsRef.current));
     }, []);
+    // 入力破棄の警告は高頻度になり得る (未許可クライアントの入力ストリーム等) ので
+    // 最大1秒に1回に抑制する (件数自体は inputsRejected カウンタで追跡)
+    const lastRejectWarnRef = useRef(0);
+    const warnRejectThrottled = useCallback((peerId: string) => {
+        const now = Date.now();
+        if (now - lastRejectWarnRef.current < 1000) return;
+        lastRejectWarnRef.current = now;
+        console.warn(`[RemoteControl] 未許可の視聴者 (${peerId}) からの入力を破棄 (直近1秒分は省略)`);
+    }, []);
     // issue#8: 視聴者側の制御上の同一性 (ホスト部屋で知られた自分のID)。
     // tree:assign で中継のサーバーへ移ると myId が変わるが、入力の発信者検証は
     // ホストが知っている旧ID (originId) で行うため、移動時に凍結する
@@ -547,11 +556,10 @@ export function useWebRTC(options?: { signalingUrl?: string; turnConfig?: TurnCo
                     // DCは直接1対1なので senderId = peerId
                     if (isControlAllowed(controlGrantsRef.current, peerId, Date.now())) {
                         relayStatsRef.current.inputsApplied++;
-                        console.log(`[RemoteControl] applied(DC) from ${peerId} now=${Date.now()} exp=${controlGrantsRef.current.get(peerId)?.expiresAt}`);
                         void applyInputEvent(data.type, data.payload);
                     } else {
                         relayStatsRef.current.inputsRejected++;
-                        console.warn(`[RemoteControl] 未許可の視聴者 (${peerId}) からの入力を破棄`);
+                        warnRejectThrottled(peerId);
                     }
                 } else if (data.type === 'roster:sync' || data.type === 'roster:depart' || data.type === 'tunnel:sig') {
                     // レンデブー最小化 (M1/M2): 名簿ゴシップ + DC中継シグナリング
@@ -2020,11 +2028,10 @@ export function useWebRTC(options?: { signalingUrl?: string; turnConfig?: TurnCo
                 if (!inputType.startsWith('input:')) return;
                 if (isControlAllowed(controlGrantsRef.current, originId, Date.now())) {
                     relayStatsRef.current.inputsApplied++;
-                    console.log(`[RemoteControl] applied from ${originId} now=${Date.now()} exp=${controlGrantsRef.current.get(originId)?.expiresAt}`);
                     void applyInputEvent(inputType, inputPayload);
                 } else {
                     relayStatsRef.current.inputsRejected++;
-                    console.warn(`[RemoteControl] 未許可の視聴者 (${originId}) からの入力を破棄`);
+                    warnRejectThrottled(originId);
                 }
                 return;
             }
