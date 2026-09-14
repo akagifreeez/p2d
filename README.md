@@ -84,6 +84,12 @@ SFチックな "Cyberpunk Glass/Neon" デザインを採用し、没入感のあ
    npm run tauri dev
    ```
 
+### ☁️ Cloudflare Workers版シグナリング (Optional・常設サーバー不要)
+
+シグナリングサーバーをCloudflare Workers (無料枠) で動かす選択肢もあります。
+VPSやDockerの運用が不要で、`wrangler deploy` 1コマンドで公開URL (`wss://...workers.dev`) が発行されます。
+デプロイ手順・アーキテクチャは [signaling-worker/README.md](./signaling-worker/README.md) を参照してください。
+
 ### 🐳 Dockerによるサーバーデプロイ (Optional)
 
 本番環境やLAN外からの接続用に、シグナリングサーバーとTURNサーバーをDockerで簡単に起動できます。

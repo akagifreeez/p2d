@@ -314,6 +314,10 @@ Signaling Server (Node.js/WebSocket)
 ├── Session Handler            # セッション管理
 ├── SDP Relay                  # SDP (Session Description Protocol) 中継
 └── ICE Candidate Relay        # ICE候補の中継
+
+Cloudflare Workers版 (signaling-worker/) も選択可能:
+└── 1ルーム=1 Durable Object。同一プロトコル、常設サーバー不要
+    (接続URL: wss://<ワーカー>/?room=コード。2026-09-14デプロイ済み)
 ```
 
 ### 4.3 通信フロー

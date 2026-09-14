@@ -1,6 +1,7 @@
 # P2D Docker Deployment
 
 Signaling ServerとTURNサーバーをDockerで起動できます。
+なお、シグナリングのみならDocker不要の**Cloudflare Workers版** (`signaling-worker/`) もあります (TURNと併用する場合やオフライン環境では本Docker構成を使用)。
 
 ## クイックスタート (LAN向け)
 
