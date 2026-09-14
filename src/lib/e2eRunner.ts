@@ -387,14 +387,14 @@ export async function runE2E(cfg: E2eConfig, deps: E2eDeps): Promise<void> {
                     // 9秒間着信を握りつぶす (しきい値4秒 + parent_lost送信の余裕)。
                     // ホストは再割当/rejoin指示を返し、メディアが再開すれば回復成功。
                     // meshモードではウォッチドッグは停止しているため除外
-                    deps.debugStallRelay(9000);
-                    await sleep(9500);
+                    deps.debugStallRelay(15000);
+                    await sleep(15500);
                     const wd0 = deps.getRelayStats();
                     const recovered = await waitFor(() => {
                         const s = deps.getRelayStats();
                         return (s.frames + s.h264Chunks + s.audioChunks) - (wd0.frames + wd0.h264Chunks + wd0.audioChunks) > 0;
                     }, 20000, 'watchdog recovery');
-                    step('watchdog_recovery', recovered, { stallMs: 9000 });
+                    step('watchdog_recovery', recovered, { stallMs: 15000 });
                 } else {
                     step('watchdog_recovery', true, { skipped: 'mesh mode (watchdogはリレー経路専用)' });
                 }

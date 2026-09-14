@@ -3180,7 +3180,9 @@ export function useWebRTC(options?: { signalingUrl?: string; turnConfig?: TurnCo
             for (const [relayId, m] of treeHealthRef.current) {
                 if (now - m.at >= 20000) continue; // 古い報告は無視 (死亡は各自のwatchdogが扱う)
                 const node = findTreeNode(c.root, relayId);
-                const unhealthy = m.upstreamSilentMs > 8000;
+                // しきい値は割当skipと同じ「劣化>4秒」: 停滞(子のウォッチドッグ発動)
+                // を待たずに、劣化段階で先回りして子を健康な親へ移す
+                const unhealthy = m.upstreamSilentMs > 4000;
                 const demoted = demotedRelaysRef.current.has(relayId);
                 if (unhealthy && !demoted && node && node.children.length > 0) {
                     demotedRelaysRef.current.add(relayId);
