@@ -236,6 +236,7 @@ export function RoomView({ onLeave, signalingUrl, turnConfig, e2eConfig, onOpenS
         chatMessages,
         // リモート操作 (F-022 / issue#8: 視聴者ごとの明示承認・期限付き)
         setRemoteControlAllowed,
+        debugStallRelay,
         grantRemoteControl,
         revokeRemoteControl,
         controlGrants,
@@ -304,7 +305,7 @@ export function RoomView({ onLeave, signalingUrl, turnConfig, e2eConfig, onOpenS
         chatMessages, peerControlAllowed,
         startCustomScreenShare, stopScreenShare: () => stopScreenShare(),
         setRemoteControlAllowed, startSystemAudio, stopSystemAudio,
-        sendInputToPeer, grantRemoteControl, revokeRemoteControl,
+        sendInputToPeer, grantRemoteControl, revokeRemoteControl, debugStallRelay,
         sendChatMessage, getPeerStats,
         isRelayMode, getRelayStats,
         getRoster, getTreeInfo,

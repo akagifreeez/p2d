@@ -122,6 +122,23 @@ export function handleNodeLoss(root: TreeNode, lostId: string): TreeNode[] {
 }
 
 /**
+ * 木から任意の1ノードを取り除く (M5§7: 親停滞での再割り当て用)。
+ * subtreeは壊さない (取り除くのは葉=視聴者を想定)。取り除けたらtrue。
+ */
+export function detachNode(root: TreeNode, id: string): boolean {
+    if (root.id === id) return false; // 根は取り除けない
+    const detach = (node: TreeNode): boolean => {
+        const idx = node.children.findIndex(c => c.id === id);
+        if (idx >= 0) {
+            node.children.splice(idx, 1);
+            return true;
+        }
+        return node.children.some(detach);
+    };
+    return detach(root);
+}
+
+/**
  * 昇格候補を幅優先で探す (issue #7 のfan-out強制対応)。
  * root直結に限らず、木全体から「最浅の未昇格ノード」を返す。
  * これがないとroot直結が全て昇格済みになった時点で候補ゼロとなり、

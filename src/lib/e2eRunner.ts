@@ -54,6 +54,8 @@ export interface E2eDeps {
     sendInputToPeer: (peerId: string, type: string, payload: unknown) => void;
     grantRemoteControl: (peerId: string, ttlMs?: number) => void;
     revokeRemoteControl: (peerId: string) => void;
+    // M5§7: 親停滞の故障注入とウォッチドッグ回復の検証
+    debugStallRelay: (ms: number) => void;
     // レンデブー最小化 (M1): 名簿ゴシップのエントリ一覧 (収束検証)
     getRoster: () => { id: string }[];
     // 配信木 (M2/M3): 自ノードの状態
@@ -375,6 +377,18 @@ export async function runE2E(cfg: E2eConfig, deps: E2eDeps): Promise<void> {
                     await sleep(600);
                 }
                 step('control_input_stream', true, { target: ctrlTarget });
+
+                // M5§7: 親停滞の故障注入 → ウォッチドッグが検知して回復するか。
+                // 9秒間着信を握りつぶす (しきい値4秒 + parent_lost送信の余裕)。
+                // ホストは再割当/rejoin指示を返し、メディアが再開すれば回復成功
+                deps.debugStallRelay(9000);
+                await sleep(9500);
+                const wd0 = deps.getRelayStats();
+                const recovered = await waitFor(() => {
+                    const s = deps.getRelayStats();
+                    return (s.frames + s.h264Chunks + s.audioChunks) - (wd0.frames + wd0.h264Chunks + wd0.audioChunks) > 0;
+                }, 20000, 'watchdog recovery');
+                step('watchdog_recovery', recovered, { stallMs: 9000 });
             } else {
                 step('control_input_stream', false, { reason: 'no control target' });
             }

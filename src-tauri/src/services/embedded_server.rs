@@ -306,10 +306,11 @@ fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
-/// メディア (h264/frame/audio) は送れなければ間引いてよい。制御メッセージは
-/// 間引きが致命的なので、キュー満杯=低速クライアントとして即kickする
+/// メディア (h264/frame/audio) は送れなければ間引いてよい。tick (M5の生存信号) も
+/// 1秒周期なので間引きを許容する。制御メッセージは間引きが致命的なので、
+/// キュー満杯=低速クライアントとして即kickする
 fn is_media_relay(msg_type: &str) -> bool {
-    matches!(msg_type, "relay:h264" | "relay:frame" | "relay:audio")
+    matches!(msg_type, "relay:h264" | "relay:frame" | "relay:audio" | "relay:tick")
 }
 
 /// 送信の共通部。ロック保持者から呼ぶ。戻り値は「届いた見込みがあるか」

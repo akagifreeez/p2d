@@ -27,6 +27,7 @@ import {
     createRoot as createTreeRoot, attach as treeAttach, promote as treePromote,
     pickParent as pickTreeParent, findNode as findTreeNode, handleNodeLoss,
     findPromoteCandidate as findTreePromoteCandidate, findDownlinkRelay,
+    detachNode,
 } from '../lib/treeAssign';
 import {
     chooseSignalRoute, makeEnvelope, forwardEnvelope,
@@ -34,6 +35,7 @@ import {
 } from '../lib/signalRouter';
 import { generateRelayKeyPair, signChunk, verifyChunk, chunkDataFromB64, keyFingerprint, acceptKeyCandidate, type RelayKeyPair } from '../lib/relaySign';
 import { isControlAllowed, pruneExpired, resolveInputOrigin, CONTROL_TTL_OPTIONS, type ControlGrant, type ControlTtlKey } from '../lib/controlGrant';
+import { initWatchdogState, noteActivity, noteSwitch, armWatchdog, disarmWatchdog, checkWatchdog, type WatchdogState } from '../lib/relayWatchdog';
 
 // WebRTC APIの有無 (Ubuntu等のWebKitGTKはWebRTC無効ビルドで RTCPeerConnection が存在しない)
 export const SUPPORTS_WEBRTC = typeof RTCPeerConnection !== 'undefined';
@@ -199,6 +201,8 @@ export interface UseWebRTCReturn {
         sigVerified: number; sigInvalid: number;
         inputsApplied: number; inputsRejected: number;
     };
+    /** M5 E2E用: 着信握りつぶし (親停滞の再現) */
+    debugStallRelay: (ms: number) => void;
 
     // マイク
     startMicrophone: () => Promise<void>;
@@ -412,6 +416,14 @@ export function useWebRTC(options?: { signalingUrl?: string; turnConfig?: TurnCo
     const relaySubscribersRef = useRef<Set<string>>(new Set());
     const relayVideoRef = useRef<HTMLVideoElement | null>(null);
     const relayLoopRef = useRef<number | null>(null);
+    // M5 フェーズA: 親からの受信停滞を監視するウォッチドッグ (配信木計画書§7)。
+    // 判定ロジックは relayWatchdog.ts (純粋関数) で、ここでは着信を記録するだけ
+    const relayWatchdogRef = useRef<WatchdogState>(initWatchdogState(Date.now()));
+    // M5 E2E用の故障注入: 指定時刻まで着信メッセージを握りつぶし、親停滞を再現する
+    const relaySuppressUntilRef = useRef(0);
+    const suppressLoggedRef = useRef(false);
+    const relayTickTimerRef = useRef<number | null>(null);
+    const lastKnownServerUrlRef = useRef<string | null>(null);
     const relayFrameSeqRef = useRef(0);
     const [relayFrame, setRelayFrame] = useState<string | null>(null);
     const relayStatsRef = useRef({ frames: 0, bytes: 0, lastFrameAt: 0, h264Chunks: 0, audioChunks: 0, sigVerified: 0, sigInvalid: 0, inputsApplied: 0, inputsRejected: 0 });
@@ -721,6 +733,17 @@ export function useWebRTC(options?: { signalingUrl?: string; turnConfig?: TurnCo
         const canvas = document.createElement('canvas');
 
         relayVideoRef.current = video;
+        // M5§7.3: 共有中の生存信号。視聴者は tick/メディア のどちらか新しい方を監視し、
+        // 4秒無音で停滞 (親切替) を発動する。静止画でメディア出力が減る正常系と
+        // リンク停滞を区別するため、メディアと独立した1秒周期で送る
+        for (const peerId of relaySubscribersRef.current) {
+            signalingRef.current?.sendRelay(peerId, 'share_state', { active: true });
+        }
+        relayTickTimerRef.current = window.setInterval(() => {
+            for (const peerId of relaySubscribersRef.current) {
+                signalingRef.current?.sendRelay(peerId, 'tick', { ts: Date.now() });
+            }
+        }, 1000);
         relayLoopRef.current = window.setInterval(() => {
             const mseSubs = Array.from(relayCapsRef.current.entries()).filter(([, c]) => c.mse).map(([id]) => id);
             // 診断: ループ停滞の切り分け (60秒毎)
@@ -808,6 +831,15 @@ export function useWebRTC(options?: { signalingUrl?: string; turnConfig?: TurnCo
             clearInterval(relayLoopRef.current);
             relayLoopRef.current = null;
             relayVideoRef.current = null;
+            // M5§7.3: 共有の正常終了を視聴者へ通知 (視聴者は監視を解除し、
+            // 停滞と誤検知しない)。購読者がいる間だけ送ればよい
+            for (const peerId of relaySubscribersRef.current) {
+                signalingRef.current?.sendRelay(peerId, 'share_state', { active: false });
+            }
+            if (relayTickTimerRef.current) {
+                clearInterval(relayTickTimerRef.current);
+                relayTickTimerRef.current = null;
+            }
             relaySubscribersRef.current.clear();
             relayCapsRef.current.clear();
             relayEncoderRef.current?.close();
@@ -1216,6 +1248,12 @@ export function useWebRTC(options?: { signalingUrl?: string; turnConfig?: TurnCo
         });
     };
 
+    /** M5§7: メディア/tick着信をウォッチドッグへ記録 (初回受信で監視を開始する) */
+    const noteRelayActivity = () => {
+        const wd = relayWatchdogRef.current;
+        relayWatchdogRef.current = wd.phase === 'idle' ? armWatchdog(wd, Date.now()) : noteActivity(wd, Date.now());
+    };
+
     /**
      * リレーチャンクの署名検証 (M3 / issue#11 fail-closed化)。公開鍵を受信する
      * 前 のチャンクは正規ホスト産と証明できないため破棄する (ホストはsubscribe
@@ -1261,7 +1299,7 @@ export function useWebRTC(options?: { signalingUrl?: string; turnConfig?: TurnCo
      * ホスト直結が上限を超えたら最古の直結視聴者を中継へ昇格し、
      * 準備ができたら (relay_ready) 超過分をその中継へ割り当てる。
      */
-    const coordinateTree = (newSubId: string) => {
+    const coordinateTree = (newSubId: string, opts?: { reassignHost?: boolean }) => {
         const myId = myIdRef.current;
         if (!myId) return;
         // コーディネータはホスト (根) のみが務める。視聴者は自らをhost役に
@@ -1281,6 +1319,13 @@ export function useWebRTC(options?: { signalingUrl?: string; turnConfig?: TurnCo
                 // 中継ノードの下へ配置 → 視聴者を中継のサーバーへ誘導
                 console.log(`[Tree] ${newSubId} を中継 ${parent.id} (${parent.addr.host}:${parent.addr.port}) へ割り当て`);
                 signalingRef.current?.sendRelay(newSubId, 'tree:assign', { addr: parent.addr });
+            } else if (node && parent === c.root && opts?.reassignHost) {
+                // M5§7: 親停滞からの再割当でroot直結に戻す場合、視聴者は停滞した
+                // 親のサーバーにまだ繋がっているので、自分の接続先への再ダイヤル
+                // (rejoin) を指示する。中央経由の構成では中央への再接続になり、
+                // サーバーレス構成ではホストの内蔵サーバー (部屋は常設) に戻る
+                console.log(`[Tree] ${newSubId} をroot直結へ再割り当て (親停滞) — rejoin指示`);
+                signalingRef.current?.sendRelay(newSubId, 'tree:assign', { rejoin: true });
             }
             return;
         }
@@ -1383,6 +1428,20 @@ export function useWebRTC(options?: { signalingUrl?: string; turnConfig?: TurnCo
                         if (msg?.id) setChatMessages(prev => prev.some(m => m.id === msg.id) ? prev : [...prev, msg]);
                         const up = parentTargetIdRef.current;
                         if (up) signalingRef.current?.sendRelay(up, 'chat', p2);
+                        return;
+                    }
+                    if (t2 === 'tick' || t2 === 'share_state') {
+                        // M5§7: ホストの生存信号/共有状態を子へパススルー
+                        forwardToTreeChildren(t2, p2);
+                        return;
+                    }
+                    if (t2 === 'tree:parent_lost') {
+                        // M5§7: 子からの停滞報告 → originIdを付けて上流 (ホスト) へ転送
+                        const up = parentTargetIdRef.current;
+                        if (up) {
+                            const lost = (p2 || {}) as Record<string, unknown>;
+                            signalingRef.current?.sendRelay(up, 'tree:parent_lost', { ...lost, originId: childId });
+                        }
                         return;
                     }
                     if (t2 === 'input') {
@@ -1816,6 +1875,15 @@ export function useWebRTC(options?: { signalingUrl?: string; turnConfig?: TurnCo
 
         // WSリレー (WebRTC非対応エンジンのフォールバック経路)
         signaling.on('onRelayMessage', (senderId, type, payload) => {
+            // M5 E2E故障注入: この間の着信を握りつぶし (ウォッチドッグ停滞テスト)
+            if (Date.now() < relaySuppressUntilRef.current) {
+                if (!suppressLoggedRef.current) {
+                    suppressLoggedRef.current = true;
+                    console.log('[M5] suppress発動中: 着信を破棄します');
+                }
+                return;
+            }
+            suppressLoggedRef.current = false;
             // 監査#1: 参加者リスト外のpeerからのリレーメッセージは破棄。
             // relay:key も同様に参加者限定 (issue#11)
             if (!participantsRef.current.has(senderId)) {
@@ -1840,10 +1908,28 @@ export function useWebRTC(options?: { signalingUrl?: string; turnConfig?: TurnCo
                 return;
             }
             const p = (payload || {}) as Record<string, unknown>;
+            if (type === 'tick') {
+                // M5§7: ホストの生存信号。中継は下流へパススルー
+                noteRelayActivity();
+                forwardToTreeChildren('tick', p);
+                return;
+            }
+            if (type === 'share_state') {
+                // M5§7: ホストの共有開始/停止。停止時は停滞監視を解除する
+                if (p.active) {
+                    relayWatchdogRef.current = armWatchdog(relayWatchdogRef.current, Date.now());
+                } else {
+                    relayWatchdogRef.current = disarmWatchdog(relayWatchdogRef.current, Date.now());
+                    console.log('[Watchdog] 共有が終了したため停滞監視を解除');
+                }
+                forwardToTreeChildren('share_state', p);
+                return;
+            }
             if (type === 'frame') {
                 // ゲスト側: JPEGフォールバックも h264/audio と同じ検証を掛ける (issue#11)。
                 // ホストはframeにもseq+Ed25519署名を付与済みなので検証コスト以外の変更なし
                 if (!verifyRelayChunk(p, 'frame')) return;
+                noteRelayActivity();
                 // 検証済みフレームだけを子へパススルー (中継者)
                 forwardToTreeChildren('frame', p);
                 // 最新フレームを保持 (setStateは描画レートに合わせて間引く)
@@ -1887,6 +1973,7 @@ export function useWebRTC(options?: { signalingUrl?: string; turnConfig?: TurnCo
             if (type === 'h264') {
                 // ゲスト側: fMP4のbox (init/fragment) を順にappend
                 if (!verifyRelayChunk(p, 'video')) return;
+                noteRelayActivity();
                 // M2: 中継者は検証済みペイロードを無改変で子へパススルー (再エンコードなし)
                 forwardToTreeChildren('h264', p);
                 relayStatsRef.current.h264Chunks++;
@@ -1902,6 +1989,7 @@ export function useWebRTC(options?: { signalingUrl?: string; turnConfig?: TurnCo
             }
             if (type === 'audio') {
                 if (!verifyRelayChunk(p, 'audio')) return;
+                noteRelayActivity();
                 forwardToTreeChildren('audio', p);
                 relayStatsRef.current.audioChunks++;
                 ensureRelayAudioSink();
@@ -1956,9 +2044,32 @@ export function useWebRTC(options?: { signalingUrl?: string; turnConfig?: TurnCo
                     console.warn(`[Tree] 非ホスト (${senderId}) からの割り当てを破棄 — 接続先は変更しない`);
                     return;
                 }
-                const addr = p.addr as { host: string; port: number } | undefined;
+                if (p.rejoin === true) {
+                    // M5§7: root直結への復帰指示。現在の接続先 (中央 or ホスト内蔵)
+                    // へ再ダイヤルして fresh な部屋参加を作り直す
+                    relayWatchdogRef.current = noteSwitch(relayWatchdogRef.current, Date.now());
+                    const url = lastKnownServerUrlRef.current;
+                    if (url) {
+                        console.log(`[Tree] rejoin指示 — ${url} へ再ダイヤルします`);
+                        void switchSignalingRef.current(url).catch((e) => {
+                            console.error('[Tree] rejoin再ダイヤルに失敗:', e);
+                        });
+                    }
+                    return;
+                }
+                // addrは {host,port} (中継) または "host:port" 文字列 (ホスト直結へ戻す) 両対応
+                const addrRaw = p.addr as { host?: unknown; port?: unknown } | string | undefined;
+                const addr = typeof addrRaw === 'string'
+                    ? (() => {
+                        const [h, portStr] = addrRaw.split(':');
+                        const port = Number(portStr);
+                        return h && Number.isFinite(port) && port > 0 ? { host: h, port } : undefined;
+                    })()
+                    : (addrRaw as { host: string; port: number } | undefined);
                 if (addr?.host && addr.port) {
-                    console.log(`[Tree] 中継 ${addr.host}:${addr.port} へ移動します`);
+                    console.log(`[Tree] ${addr.host}:${addr.port} へ移動します`);
+                    // M5§7: 切替を記録し、ウォッチドッグのクールダウンを起動
+                    relayWatchdogRef.current = noteSwitch(relayWatchdogRef.current, Date.now());
                     // issue#8: 移動先のサーバーでは myId が変わる。ホストの承認は
                     // 「今のホスト部屋でのID」に対して行われるので、それを凍結する
                     controlIdRef.current = myIdRef.current;
@@ -1970,8 +2081,21 @@ export function useWebRTC(options?: { signalingUrl?: string; turnConfig?: TurnCo
                 return;
             }
             if (type === 'tree:parent_lost') {
-                // 中継者が消えた: 孤児になった子を再登録する
-                coordinateTree(senderId);
+                // M5§7: 親からの受信停滞を視聴者が検知 → ホストが再割り当てする。
+                // 中継経由の場合は中継が originId (実際の視聴者ID) を付けて転送する
+                const originId = typeof p.originId === 'string' && p.originId ? p.originId : senderId;
+                if (!isHostRef.current) {
+                    console.warn(`[Tree] 非ホストがparent_lostを無視 (${originId})`);
+                    return;
+                }
+                const c = treeCoordinatorRef.current;
+                if (!c || !findTreeNode(c.root, originId)) {
+                    console.warn(`[Tree] parent_lost: ${originId} は木に居ないため無視`);
+                    return;
+                }
+                console.log(`[Tree] 親停滞の報告: ${originId} を再割り当てします`);
+                detachNode(c.root, originId);
+                coordinateTree(originId, { reassignHost: true });
                 return;
             }
             if (type === 'tree:child_lost') {
@@ -2047,6 +2171,7 @@ export function useWebRTC(options?: { signalingUrl?: string; turnConfig?: TurnCo
         // Cloudflare Workers版: ?room=コード でルームDOへルーティングされる
         // (Node/内蔵サーバーはクエリを無視するため互換)
         const url = roomCode ? `${targetSignalingUrl}?room=${roomCode}` : targetSignalingUrl;
+        lastKnownServerUrlRef.current = url;
         const signaling = new SignalingClient(url);
         signalingRef.current = signaling;
         wireSignalingRef.current(signaling);
@@ -2060,6 +2185,7 @@ export function useWebRTC(options?: { signalingUrl?: string; turnConfig?: TurnCo
      * 旧クライアントはdisposeして再接続ループを止める。
      */
     const switchSignaling = async (url: string) => {
+        lastKnownServerUrlRef.current = url;
         const old = signalingRef.current;
         if (old) {
             old.dispose();
@@ -2213,6 +2339,12 @@ export function useWebRTC(options?: { signalingUrl?: string; turnConfig?: TurnCo
         setPeerControlAllowed(new Map());
         controlIdRef.current = null;
         controlIdFrozenRef.current = false;
+        // M5§7: ウォッチドッグも初期化
+        relayWatchdogRef.current = initWatchdogState(Date.now());
+        if (relayTickTimerRef.current) {
+            clearInterval(relayTickTimerRef.current);
+            relayTickTimerRef.current = null;
+        }
         setRemoteControlAllowedState(false);
 
         // リレーの後片付け
@@ -2800,6 +2932,33 @@ export function useWebRTC(options?: { signalingUrl?: string; turnConfig?: TurnCo
         }
     }, [isSpeaking, broadcastData]);
 
+    // M5§7: リレー受信の停滞ウォッチドッグ (1秒毎)。リレーモード専用
+    // (meshには既存のconnectionQuality/再構築経路がある)。判定はrelayWatchdog.ts
+    useEffect(() => {
+        const t = window.setInterval(() => {
+            if (!relayModeRef.current) return;
+            const r = checkWatchdog(relayWatchdogRef.current, Date.now());
+            relayWatchdogRef.current = r.state;
+            if (r.action === 'none') return;
+            const parent = parentTargetIdRef.current;
+            if (r.action === 'notify_parent_lost') {
+                if (parent) {
+                    console.log('[Watchdog] 親からの受信が停滞 — 再割り当てを要求します');
+                    signalingRef.current?.sendRelay(parent, 'tree:parent_lost', {});
+                }
+                return;
+            }
+            if (r.action === 'force_reconnect') {
+                const url = lastKnownServerUrlRef.current;
+                if (url) {
+                    console.log(`[Watchdog] 再割当が来ないため同一親へ強制再接続: ${url}`);
+                    void switchSignalingRef.current(url).catch(() => { /* 次の周期で再試行 */ });
+                }
+            }
+        }, 1000);
+        return () => window.clearInterval(t);
+    }, []);
+
     return {
         localStream,
         remoteStreams,
@@ -2839,6 +2998,8 @@ export function useWebRTC(options?: { signalingUrl?: string; turnConfig?: TurnCo
         relayVideoUrl,
         relayAudioUrl,
         getRelayStats,
+        /** M5 E2E用: 指定ミリ秒、リレー着信を握りつぶして親停滞を再現する */
+        debugStallRelay: (ms: number) => { relaySuppressUntilRef.current = Date.now() + ms; console.log(`[M5] debugStallRelay: 着信を${ms}ms間握りつぶします (ref=${relaySuppressUntilRef.current})`); },
 
         startScreenShare,
         startCustomScreenShare,

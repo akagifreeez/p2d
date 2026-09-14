@@ -199,3 +199,21 @@ test('findDownlinkRelay: 直結ノードは自分自身、深い場所は深さ1
     assert.equal(findDownlinkRelay(root, 'unknown'), null);
     assert.ok(v1);
 });
+
+// === M5§7: 親停滞の再割り当て用 detachNode ===
+import { detachNode } from '../src/lib/treeAssign.js';
+
+test('detachNode: 深い位置の葉を取り除ける (根・中継は壊さない)', () => {
+    const root = createRoot('host');
+    const relay = attach(root, { id: 'relay', addr: null, depth: 0, fanout: 0, children: [] });
+    assert.ok(relay);
+    promote(relay, { host: 'h', port: 1 });
+    const grandchild = attachUnder(root, 'relay', { id: 'gc', addr: null, depth: 0, fanout: 0, children: [] });
+    assert.ok(grandchild);
+
+    assert.equal(detachNode(root, 'gc'), true);
+    assert.equal(findNode(root, 'gc'), null);
+    assert.equal(findNode(root, 'relay') !== null, true, '中継は残る');
+    assert.equal(detachNode(root, 'host'), false, '根は取り除けない');
+    assert.equal(detachNode(root, 'unknown'), false);
+});
