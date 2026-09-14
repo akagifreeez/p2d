@@ -8,7 +8,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
     createRoot, attach, attachUnder, promote, pickParent, detachSubtree, reassignOrphans,
-    validateInvariants, findNode, flatten, findPromoteCandidate,
+    validateInvariants, findNode, flatten, findPromoteCandidate, findDownlinkRelay,
     ROOT_FANOUT, RELAY_FANOUT, MAX_DEPTH,
 } from '../src/lib/treeAssign.js';
 
@@ -177,4 +177,25 @@ test('issue#7: fanout=1でも鎖が深さ3まで構築され、以降は拒否�
     assert.equal(flatten(root).length, 4); // host + c1..c3 (深さ上限=3なのでc4以降は拒否)
     const inv = validateInvariants(root, 3);
     assert.ok(inv.ok);
+});
+
+// === issue#8: findDownlinkRelay (配信木経由の視聴者への通知経路) ===
+
+test('findDownlinkRelay: 直結ノードは自分自身、深い場所は深さ1の中継、root/不明はnull', () => {
+    const root = createRoot('host');
+    // 直結: r1(中継) と v1(視聴者)
+    const r1 = attach(root, { id: 'r1', addr: null, depth: 0, fanout: 0, children: [] })!;
+    promote(r1, { host: '10.0.0.2', port: 8090 });
+    const v1 = attach(root, { id: 'v1', addr: null, depth: 0, fanout: 0, children: [] });
+    // r1配下: r2(中継) とその子 v2
+    attachUnder(root, 'r1', { id: 'r2', addr: null, depth: 0, fanout: 0, children: [] });
+    attachUnder(root, 'r2', { id: 'v2', addr: null, depth: 0, fanout: 0, children: [] });
+
+    assert.equal(findDownlinkRelay(root, 'host'), null, 'root自身は通知不要');
+    assert.equal(findDownlinkRelay(root, 'r1')?.id, 'r1', '直結中継は自分自身');
+    assert.equal(findDownlinkRelay(root, 'v1')?.id, 'v1', '直結視聴者は自分自身 (直接送れる)');
+    assert.equal(findDownlinkRelay(root, 'v2')?.id, 'r1', '奥の視聴者への下りリンクは直結中継r1');
+    assert.equal(findDownlinkRelay(root, 'r2')?.id, 'r1', '奥の中継への下りリンクも直結中継r1');
+    assert.equal(findDownlinkRelay(root, 'unknown'), null);
+    assert.ok(v1);
 });

@@ -48,7 +48,12 @@ export interface E2eDeps {
         frames: number; bytes: number; lastFrameAt: number; h264Chunks: number; audioChunks: number;
         subscribers: number; mseSubscribers: number; audioSubscribers: number;
         sigVerified: number; sigInvalid: number;
+        inputsApplied: number; inputsRejected: number;
     };
+    // issue#8: 視聴者ごとのリモート操作許可 (peer単位+期限付き)
+    sendInputToPeer: (peerId: string, type: string, payload: unknown) => void;
+    grantRemoteControl: (peerId: string, ttlMs?: number) => void;
+    revokeRemoteControl: (peerId: string) => void;
     // レンデブー最小化 (M1): 名簿ゴシップのエントリ一覧 (収束検証)
     getRoster: () => { id: string }[];
     // 配信木 (M2/M3): 自ノードの状態
@@ -203,6 +208,38 @@ export async function runE2E(cfg: E2eConfig, deps: E2eDeps): Promise<void> {
             );
             step('chat_roundtrip', gotGuestChat, { received: deps.chatMessages.length });
 
+            // issue#8: 視聴者ごとの許可 + 期限切れの実走検証。
+            // ゲストはこの間ずっと入力を送り続けている (control_input_stream):
+            //   取り消し中は拒否 → 3秒TTLで再許可中は適用 → 期限切れ後は再び拒否
+            const guestId = [...deps.participants.keys()].find(id => id !== deps.myId) || '';
+            if (guestId) {
+                const stats = () => deps.getRelayStats();
+                const statsT = () => ({ ...stats(), t: Date.now() });
+                const c0 = statsT();
+                deps.revokeRemoteControl(guestId);
+                await sleep(2000);
+                const c1 = statsT(); // 取り消し中: rejected が増える
+                deps.grantRemoteControl(guestId, 3000); // T=許可時刻、T+3sで期限
+                await sleep(1200);
+                const c2 = statsT(); // T+1.2s 許可中: applied が増える
+                await sleep(2600);
+                const c2b = statsT(); // T+3.8s 期限 (T+3s) を確実にまたいだ直後のスナップショット
+                await sleep(1500);
+                const c3 = statsT(); // T+5.3s 期限切れ後: 再び rejected が増える
+                // 注意: c2→c3の窓は期限前後をまたぐため、期限後の判定は
+                // 「期限をまたいだ後に取った c2b」を基準にする (さもないと
+                // 期限前の適用が混ざり grantedNotApplied===0 が壊れる)
+                const revokedRejected = c1.inputsRejected - c0.inputsRejected;
+                const grantedApplied = c2.inputsApplied - c1.inputsApplied;
+                const expiredRejected = c3.inputsRejected - c2b.inputsRejected;
+                const grantedNotApplied = c3.inputsApplied - c2b.inputsApplied;
+                step('per_peer_control',
+                    revokedRejected > 0 && grantedApplied > 0 && expiredRejected > 0 && grantedNotApplied === 0,
+                    { revokedRejected, grantedApplied, expiredRejected, grantedNotApplied, t0: c0.t, t1: c1.t, t2: c2.t, t2b: c2b.t, t3: c3.t });
+            } else {
+                step('per_peer_control', false, { reason: 'no guest' });
+            }
+
             // 配信木: 昇格/割り当ての結果 (treeFanout超過時に中継が生まれる)
             step('tree_topology', true, { tree: deps.getTreeInfo() });
 
@@ -251,13 +288,20 @@ export async function runE2E(cfg: E2eConfig, deps: E2eDeps): Promise<void> {
 
             // 3. ホスト映像の受信
             if (deps.isRelayMode) {
-                // リレーモード: フレーム/H264チャンク着信数の増加で判定
-                await sleep(3000);
-                const s1 = deps.getRelayStats();
-                await sleep(3000);
-                const s2 = deps.getRelayStats();
-                const delta = (s2.frames + s2.h264Chunks) - (s1.frames + s1.h264Chunks);
-                step('video_receiving', delta > 0, { relayMediaDelta: delta, h264Chunks: s2.h264Chunks, jpegFrames: s2.frames });
+                // リレーモード: フレーム/H264チャンク着信数の増加で判定。
+                // デバッグビルドのエンコーダ起動は数秒かかるためポーリングする
+                // (音声ステップと同じ方式)
+                let relayMediaDelta = 0;
+                let lastStats = deps.getRelayStats();
+                for (let i = 0; i < 8 && relayMediaDelta <= 0; i++) {
+                    await sleep(3000);
+                    const s2 = deps.getRelayStats();
+                    relayMediaDelta = (s2.frames + s2.h264Chunks) - (lastStats.frames + lastStats.h264Chunks);
+                    lastStats = s2;
+                }
+                const finalStats = deps.getRelayStats();
+                step('video_receiving', relayMediaDelta > 0,
+                    { relayMediaDelta, h264Chunks: finalStats.h264Chunks, jpegFrames: finalStats.frames });
             } else {
                 const hasLiveVideo = await waitFor(
                     () => [...deps.remoteStreams.values()].some(s =>
@@ -319,6 +363,21 @@ export async function runE2E(cfg: E2eConfig, deps: E2eDeps): Promise<void> {
                 15000, 'host chat'
             );
             step('chat_roundtrip', gotHostChat, { received: deps.chatMessages.length });
+
+            // 7. issue#8: リモート操作入力ストリーム (無害なスクロール0/0)。
+            // ホストが revoke → TTL付き許可 → 期限切れ の検証をしている間、
+            // 継続的に入力を送り、適用/破棄カウンタの遷移をホスト側で判定する
+            const ctrlTarget = [...deps.participants.keys()].find(id => id !== deps.myId) || '';
+            if (ctrlTarget) {
+                const streamStart = Date.now();
+                while (Date.now() - streamStart < 15000) {
+                    deps.sendInputToPeer(ctrlTarget, 'input:scroll', { deltaX: 0, deltaY: 0 });
+                    await sleep(600);
+                }
+                step('control_input_stream', true, { target: ctrlTarget });
+            } else {
+                step('control_input_stream', false, { reason: 'no control target' });
+            }
         } else {
             throw new Error(`unknown role: ${cfg.role}`);
         }

@@ -14,6 +14,7 @@ import { MonitorPicker } from './MonitorPicker';
 import { QrModal, QrScannerModal } from './QrJoin';
 import { parseInvite } from '../lib/invite';
 import { plaintextUrlWarning } from '../lib/securityUrl';
+import { isControlAllowed, type ControlGrant, type ControlTtlKey } from '../lib/controlGrant';
 import { normalizeKeyName } from '../lib/dataChannel';
 import { addRecentRoom, getRecentRooms, RecentRoom } from '../lib/history';
 import { clearPresence, getStoredDiscordClientId, resolveDiscordClientId, setStoredDiscordClientId, updatePresence } from '../lib/discord';
@@ -163,6 +164,59 @@ import type { TurnConfig } from '../hooks/useWebRTC';
 import { runE2E, type E2eConfig, type E2eDeps } from '../lib/e2eRunner';
 import { applyRelayQuality, getRelayQualityKey, RELAY_QUALITY_PRESETS, type RelayQualityKey } from '../lib/relayQuality';
 
+/** issue#8: 視聴者ごとのリモート操作許可コントロール (既定OFF・期限付き) */
+function ControlGrantControl({ peerId, grant, nowMs, ttlOptions, onGrant, onRevoke }: {
+    peerId: string;
+    grant: ControlGrant | undefined;
+    nowMs: number;
+    ttlOptions: readonly { readonly key: ControlTtlKey; readonly label: string; readonly ms: number }[];
+    onGrant: (ttlMs: number) => void;
+    onRevoke: () => void;
+}) {
+    const [expanded, setExpanded] = useState(false);
+    const active = !!grant && isControlAllowed(new Map([[peerId, grant]]), peerId, nowMs);
+
+    if (active) {
+        const remain = grant!.expiresAt === 0
+            ? '無期限'
+            : `残り${Math.max(1, Math.ceil((grant!.expiresAt - nowMs) / 60000))}分`;
+        return (
+            <button
+                onClick={onRevoke}
+                className="text-[10px] px-1.5 py-0.5 rounded bg-[var(--md-error)]/15 text-[var(--md-error)] border border-[var(--md-error)]/40 shrink-0"
+                title={`この視聴者はあなたのマウス/キーボードを操作できます (${peerId.slice(0, 8)})。クリックで取り消し`}
+            >
+                操作許可中({remain}) ✕
+            </button>
+        );
+    }
+    if (!expanded) {
+        return (
+            <button
+                onClick={() => setExpanded(true)}
+                className="text-[10px] px-1.5 py-0.5 rounded border border-[var(--md-outline-variant)] text-[var(--md-on-surface-variant)] shrink-0"
+                title="この視聴者にあなたのマウス/キーボード操作を許可する (期限付き・既定OFF)"
+            >
+                操作許可
+            </button>
+        );
+    }
+    return (
+        <div className="flex items-center gap-1 shrink-0">
+            {ttlOptions.map(o => (
+                <button
+                    key={o.key}
+                    onClick={() => { onGrant(o.ms); setExpanded(false); }}
+                    className="text-[10px] px-1.5 py-0.5 rounded border border-[var(--md-primary)]/60 text-[var(--md-primary)]"
+                >
+                    {o.label}
+                </button>
+            ))}
+            <button onClick={() => setExpanded(false)} className="text-[10px] text-[var(--md-on-surface-variant)] px-0.5" title="閉じる">✕</button>
+        </div>
+    );
+}
+
 export function RoomView({ onLeave, signalingUrl, turnConfig, e2eConfig, onOpenSettings }: { onLeave: () => void; signalingUrl?: string; turnConfig?: TurnConfig; e2eConfig?: E2eConfig | null; onOpenSettings?: () => void }) {
     const {
         localStream,
@@ -180,9 +234,13 @@ export function RoomView({ onLeave, signalingUrl, turnConfig, e2eConfig, onOpenS
         isScreenSharing,
         localStreams,
         chatMessages,
-        // リモート操作 (F-022)
-        remoteControlAllowed,
+        // リモート操作 (F-022 / issue#8: 視聴者ごとの明示承認・期限付き)
         setRemoteControlAllowed,
+        grantRemoteControl,
+        revokeRemoteControl,
+        controlGrants,
+        controlTtlOptions,
+        isHost,
         peerControlAllowed,
         sendInputToPeer,
         sendChatMessage,
@@ -246,6 +304,7 @@ export function RoomView({ onLeave, signalingUrl, turnConfig, e2eConfig, onOpenS
         chatMessages, peerControlAllowed,
         startCustomScreenShare, stopScreenShare: () => stopScreenShare(),
         setRemoteControlAllowed, startSystemAudio, stopSystemAudio,
+        sendInputToPeer, grantRemoteControl, revokeRemoteControl,
         sendChatMessage, getPeerStats,
         isRelayMode, getRelayStats,
         getRoster, getTreeInfo,
@@ -265,6 +324,15 @@ export function RoomView({ onLeave, signalingUrl, turnConfig, e2eConfig, onOpenS
         void runE2E(e2eConfig, liveDeps);
         // eslint-disable-next-line react-hooks/exhaustive-deps
     }, [e2eConfig]);
+
+    // issue#8: 許可の残り時間表示用に1秒ごとに再描画 (期限付きグラントがある間だけ)
+    const [nowMs, setNowMs] = useState(Date.now());
+    useEffect(() => {
+        const hasTimed = [...controlGrants.values()].some(g => g.allowed && g.expiresAt > 0);
+        if (!hasTimed) return;
+        const t = window.setInterval(() => setNowMs(Date.now()), 1000);
+        return () => window.clearInterval(t);
+    }, [controlGrants]);
 
     // 入力ステート
     const [inputCode, setInputCode] = useState('');
@@ -684,8 +752,18 @@ export function RoomView({ onLeave, signalingUrl, turnConfig, e2eConfig, onOpenS
                                         {remoteStreams.has(id) && (
                                             <div className="text-[10px] text-[var(--md-on-surface-variant)]">映像</div>
                                         )}
+                                        {(isHost || isScreenSharing) && (
+                                            <ControlGrantControl
+                                                peerId={id}
+                                                grant={controlGrants.get(id)}
+                                                nowMs={nowMs}
+                                                ttlOptions={controlTtlOptions}
+                                                onGrant={(ttl) => grantRemoteControl(id, ttl)}
+                                                onRevoke={() => revokeRemoteControl(id)}
+                                            />
+                                        )}
                                         {peerControlAllowed.get(id) && (
-                                            <div className="text-[10px] text-[var(--md-error)]" title="このピアがあなたの画面をリモート操作できます">操作可</div>
+                                            <div className="text-[10px] text-[var(--md-error)]" title="このピアの画面をあなたがリモート操作できます">CTRL</div>
                                         )}
                                     </div>
                                 );
@@ -966,18 +1044,13 @@ export function RoomView({ onLeave, signalingUrl, turnConfig, e2eConfig, onOpenS
                                     />
                                 </div>
 
-                                {/* リモート操作許可 (F-022: デフォルトOFF) */}
-                                <div className="flex items-center justify-between mt-5">
-                                    <div>
-                                        <div className="text-sm font-medium">リモート操作を許可</div>
-                                        <div className="text-xs text-[var(--md-on-surface-variant)]">相手があなたのマウス/キーボードを操作できるようにする</div>
+                                {/* リモート操作許可 (F-022 / issue#8: 視聴者ごとの明示承認・期限付き) */}
+                                <div className="mt-5">
+                                    <div className="text-sm font-medium">リモート操作の許可</div>
+                                    <div className="text-xs text-[var(--md-on-surface-variant)] mt-1">
+                                        許可は参加者リストの各行から、視聴者ごとに期限付きで行います
+                                        (既定OFF。取り消すまで自動的には有効になりません)。
                                     </div>
-                                    <button
-                                        role="switch"
-                                        aria-checked={remoteControlAllowed}
-                                        onClick={() => setRemoteControlAllowed(!remoteControlAllowed)}
-                                        className={`md-switch ${remoteControlAllowed ? 'on' : ''}`}
-                                    />
                                 </div>
 
                                 {/* リレー品質 (WSリレー配信のホスト側エンコード設定) */}

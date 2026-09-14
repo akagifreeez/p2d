@@ -141,6 +141,23 @@ export function findPromoteCandidate(root: TreeNode, maxDepth = MAX_DEPTH): Tree
 }
 
 /**
+ * 指定ノードへの下りリンクで「ホスト直結 (深さ1) の中継ノード」を返す (issue#8)。
+ * 配信木経由の視聴者へ peer 単位の制御メッセージを届けるには、ホスト直結の
+ * 中継 (最初のホップ) 宛てに送り、経路中の中継が cachedControl 転送で届ける。
+ * - id が root → null (ホスト自身に制御は不要)
+ * - id が root直結 → そのノード自身 (直結視聴者/直結中継。サーバー経由で届く)
+ * - id が深い場所 → それを含む subtree を持つ深さ1の中継
+ * - 見つからない → null
+ */
+export function findDownlinkRelay(root: TreeNode, id: string): TreeNode | null {
+    if (root.id === id) return null;
+    for (const child of root.children) {
+        if (child.id === id || findNode(child, id)) return child;
+    }
+    return null;
+}
+
+/**
  * 中継ノードを昇格させる (子を引き受けられるようにする)。
  * fan-outは§3.1どおり中継視聴者は2。
  */

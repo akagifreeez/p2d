@@ -26,13 +26,14 @@ import {
 import {
     createRoot as createTreeRoot, attach as treeAttach, promote as treePromote,
     pickParent as pickTreeParent, findNode as findTreeNode, handleNodeLoss,
-    findPromoteCandidate as findTreePromoteCandidate,
+    findPromoteCandidate as findTreePromoteCandidate, findDownlinkRelay,
 } from '../lib/treeAssign';
 import {
     chooseSignalRoute, makeEnvelope, forwardEnvelope,
     type TunnelEnvelope, type SignalKind,
 } from '../lib/signalRouter';
 import { generateRelayKeyPair, signChunk, verifyChunk, chunkDataFromB64, keyFingerprint, acceptKeyCandidate, type RelayKeyPair } from '../lib/relaySign';
+import { isControlAllowed, pruneExpired, resolveInputOrigin, CONTROL_TTL_OPTIONS, type ControlGrant, type ControlTtlKey } from '../lib/controlGrant';
 
 // WebRTC APIの有無 (Ubuntu等のWebKitGTKはWebRTC無効ビルドで RTCPeerConnection が存在しない)
 export const SUPPORTS_WEBRTC = typeof RTCPeerConnection !== 'undefined';
@@ -163,6 +164,8 @@ export interface UseWebRTCReturn {
     /** issue#11: 招待 (;fp=) から受けた鍵指紋を設定し、受信鍵との照合を強制する */
     setExpectedKeyFingerprint: (fp: string | null) => void;
     myId: string | null;
+    /** 自分がこの部屋のホスト (操作許可UIを出す側) か (issue#8) */
+    isHost: boolean;
 
     // 画面共有
     startScreenShare: (config?: QualityConfig) => Promise<void>;
@@ -171,9 +174,17 @@ export interface UseWebRTCReturn {
     isScreenSharing: boolean;
     localStreams: Map<string, MediaStream>; // streamId -> Stream
 
-    // リモート操作 (F-022)
+    // リモート操作 (F-022 / issue#8: 視聴者ごとの明示承認・期限付き)
     remoteControlAllowed: boolean;
+    /** 互換API (一括許可/取消)。UIはpeer単位のgrant/revokeを使う */
     setRemoteControlAllowed: (allowed: boolean) => void;
+    /** 視聴者を個別に許可する。ttlMs=0は無期限 */
+    grantRemoteControl: (peerId: string, ttlMs?: number) => void;
+    /** 視聴者の許可を取り消す */
+    revokeRemoteControl: (peerId: string) => void;
+    /** 現在のグラント一覧 (UI表示用) */
+    controlGrants: Map<string, ControlGrant>;
+    controlTtlOptions: readonly { readonly key: ControlTtlKey; readonly label: string; readonly ms: number }[];
     peerControlAllowed: Map<string, boolean>;
     sendInputToPeer: (peerId: string, type: string, payload: unknown) => void;
 
@@ -186,6 +197,7 @@ export interface UseWebRTCReturn {
         frames: number; bytes: number; lastFrameAt: number; h264Chunks: number; audioChunks: number;
         subscribers: number; mseSubscribers: number; audioSubscribers: number;
         sigVerified: number; sigInvalid: number;
+        inputsApplied: number; inputsRejected: number;
     };
 
     // マイク
@@ -307,8 +319,20 @@ export function useWebRTC(options?: { signalingUrl?: string; turnConfig?: TurnCo
     const bandwidthMonitorRef = useRef<BandwidthMonitor | null>(null);
     const adaptiveControllerRef = useRef<AdaptiveController | null>(null);
 
-    // リモート操作 (F-022: ホスト側の許可ゲート。デフォルトOFF = 安全側)
-    const remoteControlAllowedRef = useRef(false);
+    // リモート操作 (F-022 / issue#8: 視聴者ごとの明示承認・期限付き)。
+    // デフォルトOFF = グラントが無い視聴者の入力は適用されない (安全側)
+    const controlGrantsRef = useRef<Map<string, ControlGrant>>(new Map());
+    const [controlGrants, setControlGrants] = useState<Map<string, ControlGrant>>(new Map());
+    const syncGrantsState = useCallback(() => {
+        setControlGrants(new Map(controlGrantsRef.current));
+    }, []);
+    // issue#8: 視聴者側の制御上の同一性 (ホスト部屋で知られた自分のID)。
+    // tree:assign で中継のサーバーへ移ると myId が変わるが、入力の発信者検証は
+    // ホストが知っている旧ID (originId) で行うため、移動時に凍結する
+    const controlIdRef = useRef<string | null>(null);
+    const controlIdFrozenRef = useRef(false);
+    // 視聴者側バッジの期限自動解除タイマー (peerId -> timer id)
+    const peerControlExpiryTimersRef = useRef<Map<string, number>>(new Map());
     // 再接続時の部屋再参加用 (Wi-Fi断等から WS が繋がり直ったときに入り直す)
     const roomCodeRef = useRef<string | null>(null);
     const roomNameRef = useRef<string | undefined>(undefined);
@@ -381,7 +405,7 @@ export function useWebRTC(options?: { signalingUrl?: string; turnConfig?: TurnCo
     const relayLoopRef = useRef<number | null>(null);
     const relayFrameSeqRef = useRef(0);
     const [relayFrame, setRelayFrame] = useState<string | null>(null);
-    const relayStatsRef = useRef({ frames: 0, bytes: 0, lastFrameAt: 0, h264Chunks: 0, audioChunks: 0, sigVerified: 0, sigInvalid: 0 });
+    const relayStatsRef = useRef({ frames: 0, bytes: 0, lastFrameAt: 0, h264Chunks: 0, audioChunks: 0, sigVerified: 0, sigInvalid: 0, inputsApplied: 0, inputsRejected: 0 });
     const relayLastRenderRef = useRef(0);
     // H264/MSE品質モード
     const relayCapsRef = useRef<Map<string, RelayViewerCaps>>(new Map()); // peerId -> caps
@@ -445,14 +469,41 @@ export function useWebRTC(options?: { signalingUrl?: string; turnConfig?: TurnCo
     }, [broadcastData]);
 
     /**
+     * 視聴者側: 操作許可バッジを更新する (issue#8)。
+     * expiresAt>0 (有期限) なら期限到来でバッジを自動的にOFFへ戻す
+     */
+    const setPeerControlBadge = useCallback((peerId: string, allowed: boolean, expiresAt: number) => {
+        const prevTimer = peerControlExpiryTimersRef.current.get(peerId);
+        if (prevTimer !== undefined) {
+            window.clearTimeout(prevTimer);
+            peerControlExpiryTimersRef.current.delete(peerId);
+        }
+        setPeerControlAllowed(prev => new Map(prev).set(peerId, allowed));
+        if (allowed && expiresAt > 0) {
+            const wait = Math.max(0, expiresAt - Date.now());
+            const t = window.setTimeout(() => {
+                peerControlExpiryTimersRef.current.delete(peerId);
+                setPeerControlAllowed(prev => new Map(prev).set(peerId, false));
+                console.log(`[RemoteControl] 許可の期限が切れました (バッジ更新): ${peerId}`);
+            }, wait);
+            peerControlExpiryTimersRef.current.set(peerId, t);
+        }
+    }, []);
+
+    /**
      * DataChannel設定
      */
     const setupDataChannel = useCallback((channel: RTCDataChannel, peerId: string) => {
         channel.onopen = () => {
             console.log(`[DataChannel] Open: ${peerId}`);
             dataChannelsRef.current.set(peerId, channel);
-            // 自分がホスト側の場合、リモート操作の許可状態を即通知
-            channel.send(JSON.stringify({ type: 'control:remote_allowed', payload: { allowed: remoteControlAllowedRef.current }, timestamp: Date.now() }));
+            // 自分がホスト側の場合、この視聴者へのリモート操作許可状態を即通知 (issue#8)
+            const grantNow = isControlAllowed(controlGrantsRef.current, peerId, Date.now());
+            channel.send(JSON.stringify({
+                type: 'control:remote_allowed',
+                payload: { allowed: grantNow, expiresAt: grantNow ? controlGrantsRef.current.get(peerId)?.expiresAt ?? 0 : 0 },
+                timestamp: Date.now(),
+            }));
             // M1: 名簿ゴシップ — 開通したDCへ自分の知る名簿をすべて渡す
             try {
                 channel.send(JSON.stringify({
@@ -487,16 +538,20 @@ export function useWebRTC(options?: { signalingUrl?: string; turnConfig?: TurnCo
                         return next;
                     });
                 } else if (data.type === 'control:remote_allowed') {
-                    // ピア(ホスト)からのリモート操作許可状態
-                    setPeerControlAllowed(prev => {
-                        const next = new Map(prev);
-                        next.set(peerId, !!data.payload?.allowed);
-                        return next;
-                    });
+                    // ピア(ホスト)からのリモート操作許可状態 (issue#8: 期限付き)
+                    const allowed = !!data.payload?.allowed;
+                    const expiresAt = typeof data.payload?.expiresAt === 'number' ? data.payload.expiresAt : 0;
+                    setPeerControlBadge(peerId, allowed, expiresAt);
                 } else if (typeof data.type === 'string' && data.type.startsWith('input:')) {
-                    // ホスト側: 自分が共有している画面へのリモート操作を適用 (許可時のみ・F-022)
-                    if (remoteControlAllowedRef.current) {
+                    // ホスト側: この視聴者のグラントを検証してから適用 (F-022 / issue#8)。
+                    // DCは直接1対1なので senderId = peerId
+                    if (isControlAllowed(controlGrantsRef.current, peerId, Date.now())) {
+                        relayStatsRef.current.inputsApplied++;
+                        console.log(`[RemoteControl] applied(DC) from ${peerId} now=${Date.now()} exp=${controlGrantsRef.current.get(peerId)?.expiresAt}`);
                         void applyInputEvent(data.type, data.payload);
+                    } else {
+                        relayStatsRef.current.inputsRejected++;
+                        console.warn(`[RemoteControl] 未許可の視聴者 (${peerId}) からの入力を破棄`);
                     }
                 } else if (data.type === 'roster:sync' || data.type === 'roster:depart' || data.type === 'tunnel:sig') {
                     // レンデブー最小化 (M1/M2): 名簿ゴシップ + DC中継シグナリング
@@ -507,7 +562,7 @@ export function useWebRTC(options?: { signalingUrl?: string; turnConfig?: TurnCo
                 console.error('[DataChannel] Parse error:', e);
             }
         };
-    }, [connectionState, setConnectionState]);
+    }, [connectionState, setConnectionState, setPeerControlBadge]);
 
     /**
      * 受信したリモート操作イベントをネイティブ入力として適用 (ホスト側)
@@ -544,29 +599,97 @@ export function useWebRTC(options?: { signalingUrl?: string; turnConfig?: TurnCo
     }, []);
 
     /**
-     * リモート操作の許可状態を切り替え、全ピアへ通知 (F-022)
+     * 1視聴者への許可状態変更を通知する (issue#8)。
+     * - 直結 (DC or リレー購読者): その peerId 宛てに直接送る
+     * - 配信木経由の視聴者: ホストの部屋にはもう居ないので、ホスト直結の中継へ
+     *   targetOriginId 付きで送り、経路中継のcached転送で下流へ届ける。
+     *   中継は転送のみで自分のバッジは変えない (視聴者側で宛先フィルタする)
      */
-    const setRemoteControlAllowed = useCallback((allowed: boolean) => {
-        remoteControlAllowedRef.current = allowed;
-        setRemoteControlAllowedState(allowed);
-        broadcastData('control:remote_allowed', { allowed });
-        // WSリレー視聴者にも通知
-        relaySubscribersRef.current.forEach(peerId => {
-            signalingRef.current?.sendRelay(peerId, 'control_allowed', { allowed });
-        });
-        console.log('[RemoteControl] 許可状態:', allowed);
-    }, [broadcastData]);
-
-    /**
-     * 特定ピアへ入力イベントを送信 (ビューア側)
-     */
-    const sendInputToPeer = useCallback((peerId: string, type: string, payload: unknown) => {
+    const notifyControlAllowed = useCallback((peerId: string, allowed: boolean, expiresAt: number) => {
         const dc = dataChannelsRef.current.get(peerId);
         if (dc && dc.readyState === 'open') {
-            dc.send(JSON.stringify({ type, payload, timestamp: Date.now() }));
+            dc.send(JSON.stringify({ type: 'control:remote_allowed', payload: { allowed, expiresAt }, timestamp: Date.now() }));
+        }
+        if (dc || relaySubscribersRef.current.has(peerId)) {
+            signalingRef.current?.sendRelay(peerId, 'control_allowed', { allowed, expiresAt });
+            return;
+        }
+        // 配信木経由: 下りリンクの最初のホップ (深さ1の中継) を探す
+        const c = treeCoordinatorRef.current;
+        const downlink = c ? findDownlinkRelay(c.root, peerId) : null;
+        if (downlink) {
+            signalingRef.current?.sendRelay(downlink.id, 'control_allowed', { allowed, expiresAt, targetOriginId: peerId });
+        } else {
+            console.warn(`[RemoteControl] ${peerId} への許可通知経路が無い (直結にも中継木にも居ない)`);
+        }
+    }, []);
+
+    /**
+     * 視聴者ごとにリモート操作を許可する (issue#8)。ttlMs=0は無期限。
+     * 既定はOFF (グラント無し) で、許可した視聴者だけが操作できる。
+     */
+    const grantRemoteControl = useCallback((peerId: string, ttlMs: number = 0) => {
+        if (!peerId) return;
+        const expiresAt = ttlMs > 0 ? Date.now() + ttlMs : 0;
+        controlGrantsRef.current.set(peerId, { allowed: true, expiresAt });
+        syncGrantsState();
+        notifyControlAllowed(peerId, true, expiresAt);
+        console.log(`[RemoteControl] 許可: ${peerId} (${expiresAt === 0 ? '無期限' : '〜' + new Date(expiresAt).toLocaleTimeString()})`);
+    }, [notifyControlAllowed, syncGrantsState]);
+
+    /** 視聴者のリモート操作許可を取り消す (issue#8) */
+    const revokeRemoteControl = useCallback((peerId: string) => {
+        if (!peerId) return;
+        controlGrantsRef.current.delete(peerId);
+        syncGrantsState();
+        notifyControlAllowed(peerId, false, 0);
+        console.log(`[RemoteControl] 取り消し: ${peerId}`);
+    }, [notifyControlAllowed, syncGrantsState]);
+
+    /**
+     * 互換API (E2Eランナー用): 全ての現参加者へ一括で許可/取消する。
+     * UIからは使わない。参加者ごとの許可は grantRemoteControl/revokeRemoteControl。
+     */
+    const setRemoteControlAllowed = useCallback((allowed: boolean) => {
+        const targets = new Set<string>([...dataChannelsRef.current.keys(), ...relaySubscribersRef.current]);
+        for (const peerId of targets) {
+            if (allowed) controlGrantsRef.current.set(peerId, { allowed: true, expiresAt: 0 });
+            else controlGrantsRef.current.delete(peerId);
+            notifyControlAllowed(peerId, allowed, 0);
+        }
+        syncGrantsState();
+        setRemoteControlAllowedState(allowed);
+        console.log(`[RemoteControl] 一括${allowed ? '許可' : '取消'} (${targets.size}人)`);
+    }, [notifyControlAllowed, syncGrantsState]);
+
+    // issue#8: 期限切れグラントの自動解除 (切れた視聴者へは許可解除を通知)
+    useEffect(() => {
+        const t = window.setInterval(() => {
+            const expired = pruneExpired(controlGrantsRef.current, Date.now());
+            if (expired.length === 0) return;
+            for (const id of expired) {
+                console.log(`[RemoteControl] 期限切れで自動解除: ${id}`);
+                notifyControlAllowed(id, false, 0);
+            }
+            syncGrantsState();
+        }, 1000);
+        return () => window.clearInterval(t);
+    }, [notifyControlAllowed, syncGrantsState]);
+
+    /**
+     * 特定ピアへ入力イベントを送信 (ビューア側)。
+     * issue#8: 発信者ID (originId) を封筒に載せる。直結なら senderId で判明するが、
+     * 配信木の中継経由では senderId が中継に変わるため、自分の (ホスト部屋での)
+     * ID を明示する。中継は転送のみで改変しない
+     */
+    const sendInputToPeer = useCallback((peerId: string, type: string, payload: unknown) => {
+        const originId = controlIdRef.current || myIdRef.current || '';
+        const dc = dataChannelsRef.current.get(peerId);
+        if (dc && dc.readyState === 'open') {
+            dc.send(JSON.stringify({ type, payload, originId, timestamp: Date.now() }));
         } else if (relayModeRef.current) {
             // DataChannelが使えないエンジン (Linux等) はWSリレーへフォールバック
-            signalingRef.current?.sendRelay(peerId, 'input', { type, payload });
+            signalingRef.current?.sendRelay(peerId, 'input', { type, payload, originId });
         }
     }, []);
 
@@ -1255,9 +1378,15 @@ export function useWebRTC(options?: { signalingUrl?: string; turnConfig?: TurnCo
                         return;
                     }
                     if (t2 === 'input') {
-                        // 子からのリモート操作入力: ホストへ中継するだけ (計画書§2)
+                        // 子からのリモート操作入力: 発信者ID (originId) を付けてホストへ中継。
+                        // 中継自身のグラントではなく子のグラントで検証される (issue#8)
                         const up = parentTargetIdRef.current;
-                        if (up) signalingRef.current?.sendRelay(up, 'input', p2);
+                        if (up) {
+                            const inp = (p2 || {}) as { type?: unknown; payload?: unknown };
+                            signalingRef.current?.sendRelay(up, 'input', {
+                                type: inp.type, payload: inp.payload, originId: childId,
+                            });
+                        }
                         return;
                     }
                 });
@@ -1542,6 +1671,9 @@ export function useWebRTC(options?: { signalingUrl?: string; turnConfig?: TurnCo
             roomCodeRef.current = code;
             myIdRef.current = myClientId;
             isConnectedRef.current = true;
+            // issue#8: 制御上の同一性 (originIdの素) は基本このIDに追従する。
+            // ただし tree:assign による移動 (凍結中) はホストが知っている旧IDを維持する
+            if (!controlIdFrozenRef.current) controlIdRef.current = myClientId;
             if (hostEndpoint) hostEndpointRef.current = hostEndpoint;
             if (hostId) hostIdRef.current = hostId;
             // M1: 移行 (サーバー付け替え) でクライアントIDが変わったとき、旧IDに墓石を
@@ -1727,7 +1859,14 @@ export function useWebRTC(options?: { signalingUrl?: string; turnConfig?: TurnCo
                 relayCapsRef.current.set(senderId, caps);
                 ensureRelayLoop();
                 startRelayAudioSend();
-                signalingRef.current?.sendRelay(senderId, 'control_allowed', { allowed: remoteControlAllowedRef.current });
+                // issue#8: この視聴者への許可状態だけを配布 (全員共通のboolではない)
+                {
+                    const gAllowed = isControlAllowed(controlGrantsRef.current, senderId, Date.now());
+                    signalingRef.current?.sendRelay(senderId, 'control_allowed', {
+                        allowed: gAllowed,
+                        expiresAt: gAllowed ? controlGrantsRef.current.get(senderId)?.expiresAt ?? 0 : 0,
+                    });
+                }
                 // M3: 署名検証用の公開鍵を配布 (ルーム毎のエフェメラル鍵)
                 if (relayKeysRef.current) {
                     signalingRef.current?.sendRelay(senderId, 'key', { pub: relayKeysRef.current.publicKeyB64 });
@@ -1812,6 +1951,10 @@ export function useWebRTC(options?: { signalingUrl?: string; turnConfig?: TurnCo
                 const addr = p.addr as { host: string; port: number } | undefined;
                 if (addr?.host && addr.port) {
                     console.log(`[Tree] 中継 ${addr.host}:${addr.port} へ移動します`);
+                    // issue#8: 移動先のサーバーでは myId が変わる。ホストの承認は
+                    // 「今のホスト部屋でのID」に対して行われるので、それを凍結する
+                    controlIdRef.current = myIdRef.current;
+                    controlIdFrozenRef.current = true;
                     void switchSignalingRef.current(`ws://${addr.host}:${addr.port}`).catch((e) => {
                         console.error('[Tree] 中継への移動に失敗:', e);
                     });
@@ -1843,9 +1986,21 @@ export function useWebRTC(options?: { signalingUrl?: string; turnConfig?: TurnCo
                     console.warn(`[Relay] 非権威 (${senderId}) からのcontrol_allowedを破棄`);
                     return;
                 }
-                setPeerControlAllowed(prev => new Map(prev).set(senderId, !!p.allowed));
+                // issue#8: 宛先指定 (配信木経由のpeer単位配布)。自分宛てでなければ
+                // バッジは更新せず、下流への転送のみ行う (中継は転送屋)
+                const targetOriginId = typeof p.targetOriginId === 'string' ? p.targetOriginId : '';
+                const myControlId = controlIdRef.current || myIdRef.current || '';
+                const allowed = !!p.allowed;
+                const expiresAt = typeof p.expiresAt === 'number' ? p.expiresAt : 0;
+                if (!targetOriginId || targetOriginId === myControlId) {
+                    setPeerControlBadge(senderId, allowed, expiresAt);
+                    // 中継者が子の既定値として使うのは「宛先なしのブロードキャスト」だけ
+                    // (最後に届いた特定視聴者向けの許可を既定値にしない)
+                    if (!targetOriginId) cachedControlRef.current = p;
+                } else {
+                    console.log(`[Relay] 他人宛てのcontrol_allowedを転送のみで処理: ${targetOriginId}`);
+                }
                 // 中継者: 子へも配布 (ホストの許可状態を下流へ伝播)
-                cachedControlRef.current = p;
                 forwardToTreeChildren('control_allowed', p);
                 return;
             }
@@ -1859,10 +2014,17 @@ export function useWebRTC(options?: { signalingUrl?: string; turnConfig?: TurnCo
                 return;
             }
             if (type === 'input') {
-                // ホスト側: 許可時のみリモート操作を適用 (F-022と同じゲート)
-                const inputType = typeof p.type === 'string' ? p.type : '';
-                if (remoteControlAllowedRef.current && inputType.startsWith('input:')) {
-                    void applyInputEvent(inputType, p.payload);
+                // ホスト側: 発信者を確定してグラントを検証してから適用 (F-022 / issue#8)。
+                // 配信木の中継経由では originId に実際の視聴者IDが載る (中継は転送のみ)
+                const { originId, type: inputType, payload: inputPayload } = resolveInputOrigin(senderId, p);
+                if (!inputType.startsWith('input:')) return;
+                if (isControlAllowed(controlGrantsRef.current, originId, Date.now())) {
+                    relayStatsRef.current.inputsApplied++;
+                    console.log(`[RemoteControl] applied from ${originId} now=${Date.now()} exp=${controlGrantsRef.current.get(originId)?.expiresAt}`);
+                    void applyInputEvent(inputType, inputPayload);
+                } else {
+                    relayStatsRef.current.inputsRejected++;
+                    console.warn(`[RemoteControl] 未許可の視聴者 (${originId}) からの入力を破棄`);
                 }
                 return;
             }
@@ -2016,6 +2178,8 @@ export function useWebRTC(options?: { signalingUrl?: string; turnConfig?: TurnCo
         hostEndpointRef.current = null;
         embeddedPortRef.current = null;
         // issue#9/#11: 認可・検証状態も退出と共にリセット
+        controlGrantsRef.current.clear();
+        setControlGrants(new Map());
         hostTokenRef.current = null;
         hostIdRef.current = null;
         expectedKeyFpRef.current = null;
@@ -2033,6 +2197,16 @@ export function useWebRTC(options?: { signalingUrl?: string; turnConfig?: TurnCo
         parentTargetIdRef.current = null;
         cachedKeyRef.current = null;
         cachedControlRef.current = null;
+        // issue#8: リモート操作の承認状態は退出と共に全消去。
+        // 期限タイマー・視聴者バッジ・制御上の同一性もリセットする
+        controlGrantsRef.current.clear();
+        syncGrantsState();
+        for (const t of peerControlExpiryTimersRef.current.values()) window.clearTimeout(t);
+        peerControlExpiryTimersRef.current.clear();
+        setPeerControlAllowed(new Map());
+        controlIdRef.current = null;
+        controlIdFrozenRef.current = false;
+        setRemoteControlAllowedState(false);
 
         // リレーの後片付け
         stopRelayLoop();
@@ -2649,6 +2823,8 @@ export function useWebRTC(options?: { signalingUrl?: string; turnConfig?: TurnCo
         setExpectedKeyFingerprint: (fp: string | null) => { expectedKeyFpRef.current = fp; },
         participants,
         myId,
+        /** 自分が部屋のホストか (操作許可UIを出す側, issue#8) */
+        isHost: isHostRef.current,
 
         // WSリレーモード (WebRTC非対応エンジン向け)
         isRelayMode,
@@ -2692,9 +2868,13 @@ export function useWebRTC(options?: { signalingUrl?: string; turnConfig?: TurnCo
         // リモートピア発話状態
         remoteSpeakingStates,
 
-        // リモート操作 (F-022)
+        // リモート操作 (F-022 / issue#8)
         remoteControlAllowed,
         setRemoteControlAllowed,
+        grantRemoteControl,
+        revokeRemoteControl,
+        controlGrants,
+        controlTtlOptions: CONTROL_TTL_OPTIONS,
         peerControlAllowed,
         sendInputToPeer,
 
