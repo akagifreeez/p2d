@@ -28,7 +28,7 @@ interface RemoteControlBinding {
 }
 
 /** M5 フェーズB: リンク健康バッジ (mesh/配信木で共通の見え方) */
-function LinkHealthBadge({ level, via }: { level: 'ok' | 'degraded' | 'stalled' | 'idle'; via: 'direct' | 'relay' }) {
+function LinkHealthBadge({ level, via, cause }: { level: 'ok' | 'degraded' | 'stalled' | 'idle'; via: 'direct' | 'relay'; cause?: 'host-load' | 'route' | null }) {
     if (level === 'idle') return null;
     const color = level === 'stalled'
         ? 'bg-red-500/90 text-white'
@@ -38,9 +38,13 @@ function LinkHealthBadge({ level, via }: { level: 'ok' | 'degraded' | 'stalled' 
     const dot = level === 'stalled' ? 'bg-white animate-pulse' : level === 'degraded' ? 'bg-black/70' : 'bg-white';
     const text = level === 'stalled'
         ? '再接続中...'
-        : `${via === 'relay' ? '中継経由' : '直結'}${level === 'degraded' ? ' (不安定)' : ''}`;
+        : cause === 'host-load'
+            ? '配信元が高負荷'
+            : cause === 'route'
+                ? '経路が不安定'
+                : `${via === 'relay' ? '中継経由' : '直結'}${level === 'degraded' ? ' (不安定)' : ''}`;
     return (
-        <div className={`absolute top-2 right-2 z-10 flex items-center gap-1.5 px-2 py-1 rounded-md text-[10px] font-medium ${color}`}>
+        <div className={`absolute top-2 right-2 z-10 flex items-center gap-1.5 px-2 py-1 rounded-md text-[10px] font-medium ${color}`} title={cause === 'host-load' ? '配信元のPCの負荷が高く、エンコードが追いついていません' : cause === 'route' ? 'ホストは送信しているのに受信が少なく、経路の劣化を検知しています' : undefined}>
             <span className={`w-1.5 h-1.5 rounded-full ${dot}`} />
             {text}
         </div>
@@ -62,7 +66,7 @@ function VideoGridItem({
     label?: string;
     isLocal?: boolean;
     control?: RemoteControlBinding;
-    link?: { level: 'ok' | 'degraded' | 'stalled' | 'idle'; via: 'direct' | 'relay' } | null;
+    link?: { level: 'ok' | 'degraded' | 'stalled' | 'idle'; via: 'direct' | 'relay'; cause?: 'host-load' | 'route' | null } | null;
 }) {
     const videoRef = useRef<HTMLVideoElement>(null);
     const frameRef = useRef<HTMLImageElement>(null);
@@ -111,7 +115,7 @@ function VideoGridItem({
 
     return (
         <div className="relative aspect-video overflow-hidden group rounded-xl bg-[var(--md-surface-lowest,var(--md-surface))] border border-[var(--md-outline-variant)]/50">
-            {link && <LinkHealthBadge level={link.level} via={link.via} />}
+            {link && <LinkHealthBadge level={link.level} via={link.via} cause={link.cause} />}
             {mseUrl ? (
                 <video
                     ref={videoRef}
@@ -354,6 +358,7 @@ export function RoomView({ onLeave, signalingUrl, turnConfig, e2eConfig, onOpenS
 
     // M5 フェーズB: リンク停滞/回復のトースト (level遷移を監視)
     const prevLinkLevelRef = useRef(linkHealth.level);
+    const prevCauseRef = useRef<string | null>(null);
     const [linkToast, setLinkToast] = useState<string | null>(null);
     useEffect(() => {
         const prev = prevLinkLevelRef.current;
@@ -364,7 +369,15 @@ export function RoomView({ onLeave, signalingUrl, turnConfig, e2eConfig, onOpenS
             const t = window.setTimeout(() => setLinkToast(null), 4000);
             return () => window.clearTimeout(t);
         }
-    }, [linkHealth.level]);
+        // 配信元の高負荷はレベルが変わらないこともあるので cause の遷移で通知
+        if (linkHealth.cause === 'host-load' && prevCauseRef.current !== 'host-load') {
+            setLinkToast('配信元のPCの負荷が高くなっています');
+            const t = window.setTimeout(() => setLinkToast(null), 4000);
+            prevCauseRef.current = 'host-load';
+            return () => window.clearTimeout(t);
+        }
+        if (linkHealth.cause !== 'host-load') prevCauseRef.current = null;
+    }, [linkHealth.level, linkHealth.cause]);
 
     // issue#8: 許可の残り時間表示用に1秒ごとに再描画 (期限付きグラントがある間だけ)
     const [nowMs, setNowMs] = useState(Date.now());
@@ -908,7 +921,7 @@ export function RoomView({ onLeave, signalingUrl, turnConfig, e2eConfig, onOpenS
                                     frameSrc={relayVideoUrl ? undefined : relayFrame}
                                     mseUrl={relayVideoUrl}
                                     label={`${participants.get(hostPeer)?.name || 'Host'} (リレー)`}
-                                    link={{ level: linkHealth.level === 'idle' ? 'ok' : linkHealth.level, via: linkHealth.via }}
+                                    link={{ level: linkHealth.level === 'idle' ? 'ok' : linkHealth.level, via: linkHealth.via, cause: linkHealth.cause }}
                                     control={{
                                         peerId: hostPeer,
                                         allowed: peerControlAllowed.get(hostPeer) === true,

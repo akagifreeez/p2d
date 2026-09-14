@@ -134,6 +134,40 @@ export function checkWatchdog(
     return { state: next, action: 'notify_parent_lost' };
 }
 
+/**
+ * 停滞・劣化の原因分類 (M5 フェーズB拡張: ホスト健康の可視化)。
+ * - 'host-load': 配信元PCが高負荷 (エンコード周期の超過が継続)
+ * - 'route'    : ホストは送っているのに受信が少ない (経路の輻輳・ロス)
+ * - null       : 原因なし (正常 / 静止画での送信減少という正常系)
+ *
+ * 判定の考え方: ホストがtickで「直近1秒に送ったメディア量」と「送信周期の
+ * 超過」を報告する。視聴者は自分の受信量と突き合わせ、
+ * 「送っているのに届いていない」なら経路、「そもそも送れていない」なら配信元、
+ * と切り分ける。これで「親が安定している」前提でも、停滞の*責任分界*を見せられる。
+ */
+export type LinkCause = 'host-load' | 'route' | null;
+
+/** ホスト高負荷とみなす連続tick数 (1秒周期なので3秒相当) */
+export const HOST_LOAD_STREAK = 3;
+/** 経路劣化とみなす最低送信量 (base64換算バイト/秒)。これ未満は静止画の正常系 */
+export const ROUTE_CHECK_MIN_SENT = 50_000;
+
+export function diagnoseLinkCause(opts: {
+    /** 直近のtickでホストが報告した周期超過 (load=high) */
+    tickLoadHigh: boolean;
+    /** load=high の連続回数 */
+    highStreak: number;
+    /** ホストが報告した直近1秒の送信量 (base64バイト) */
+    hostSentLastSec: number;
+    /** 視聴者の直近1秒の受信量 (同単位) */
+    receivedLastSec: number;
+}): LinkCause {
+    if (opts.tickLoadHigh && opts.highStreak >= HOST_LOAD_STREAK) return 'host-load';
+    if (opts.hostSentLastSec >= ROUTE_CHECK_MIN_SENT
+        && opts.receivedLastSec < opts.hostSentLastSec * 0.3) return 'route';
+    return null;
+}
+
 /** リンク健康レベル (見える化用。mesh/配信木で共通のバッジに使う) */
 export type LinkLevel = 'ok' | 'degraded' | 'stalled' | 'idle';
 

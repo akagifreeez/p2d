@@ -6,7 +6,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
     initWatchdogState, noteActivity, disarmWatchdog, checkWatchdog, noteSwitch, classifyLink,
-    WATCHDOG_DEFAULTS, type WatchdogState,
+    WATCHDOG_DEFAULTS, diagnoseLinkCause, type WatchdogState,
 } from '../src/lib/relayWatchdog.js';
 
 const T0 = 1_000_000_000_000;
@@ -101,4 +101,17 @@ test('classifyLink: 無音時間を ok/degraded/stalled に分類する (フェ�
     // 解除済み (共有停止) は idle
     st = disarmWatchdog(st, T0 + 1000);
     assert.equal(classifyLink(st, T0 + 60_000), 'idle');
+});
+
+test('diagnoseLinkCause: 配信元高負荷と経路劣化を切り分ける', () => {
+    // エンコード周期超過が3tick連続 → 配信元の高負荷
+    assert.equal(diagnoseLinkCause({ tickLoadHigh: true, highStreak: 3, hostSentLastSec: 0, receivedLastSec: 0 }), 'host-load');
+    // 2tick連続ではまだ判定しない (一瞬のスパイクを誤検知しない)
+    assert.equal(diagnoseLinkCause({ tickLoadHigh: true, highStreak: 2, hostSentLastSec: 0, receivedLastSec: 0 }), null);
+    // ホストは沢山送っているのに受信が3割未満 → 経路の劣化
+    assert.equal(diagnoseLinkCause({ tickLoadHigh: false, highStreak: 0, hostSentLastSec: 200_000, receivedLastSec: 40_000 }), 'route');
+    // ホストの送信自体が少ない (静止画の正常系) は経路劣化と判定しない
+    assert.equal(diagnoseLinkCause({ tickLoadHigh: false, highStreak: 0, hostSentLastSec: 20_000, receivedLastSec: 1_000 }), null);
+    // 受信が送信の3割以上あれば正常
+    assert.equal(diagnoseLinkCause({ tickLoadHigh: false, highStreak: 0, hostSentLastSec: 200_000, receivedLastSec: 100_000 }), null);
 });

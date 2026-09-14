@@ -35,7 +35,7 @@ import {
 } from '../lib/signalRouter';
 import { generateRelayKeyPair, signChunk, verifyChunk, chunkDataFromB64, keyFingerprint, acceptKeyCandidate, type RelayKeyPair } from '../lib/relaySign';
 import { isControlAllowed, pruneExpired, resolveInputOrigin, CONTROL_TTL_OPTIONS, type ControlGrant, type ControlTtlKey } from '../lib/controlGrant';
-import { initWatchdogState, noteActivity, noteSwitch, armWatchdog, disarmWatchdog, checkWatchdog, classifyLink, type WatchdogState, type LinkLevel } from '../lib/relayWatchdog';
+import { initWatchdogState, noteActivity, noteSwitch, armWatchdog, disarmWatchdog, checkWatchdog, classifyLink, diagnoseLinkCause, type WatchdogState, type LinkLevel, type LinkCause } from '../lib/relayWatchdog';
 
 // WebRTC APIの有無 (Ubuntu等のWebKitGTKはWebRTC無効ビルドで RTCPeerConnection が存在しない)
 export const SUPPORTS_WEBRTC = typeof RTCPeerConnection !== 'undefined';
@@ -162,7 +162,7 @@ export interface UseWebRTCReturn {
         parent: string | null;
     };
     /** M5 フェーズB: 視聴者側のリンク健康 (バッジ用) */
-    linkHealth: { level: LinkLevel; via: 'direct' | 'relay' };
+    linkHealth: { level: LinkLevel; via: 'direct' | 'relay'; cause?: 'host-load' | 'route' | null };
     /** M5 フェーズC: 木の健康マップ (中継ごとの子数・上流無音時間・RTT) */
     treeHealth: Map<string, { at: number; upstreamSilentMs: number; children: number; rttMs?: number }>;
     /** M4: 署名鍵のフィンガープリント (QR帯域外照合用) */
@@ -424,12 +424,19 @@ export function useWebRTC(options?: { signalingUrl?: string; turnConfig?: TurnCo
     // 判定ロジックは relayWatchdog.ts (純粋関数) で、ここでは着信を記録するだけ
     const relayWatchdogRef = useRef<WatchdogState>(initWatchdogState(Date.now()));
     // M5 フェーズB: 視聴者側のリンク健康バッジ用 (mesh/配信木で共通の見え方)
-    const [linkHealth, setLinkHealth] = useState<{ level: LinkLevel; via: 'direct' | 'relay' }>({ level: 'idle', via: 'direct' });
+    const [linkHealth, setLinkHealth] = useState<{ level: LinkLevel; via: 'direct' | 'relay'; cause?: LinkCause }>({ level: 'idle', via: 'direct' });
     const connectedViaRef = useRef<'direct' | 'relay'>('direct');
     // M5 フェーズC: 中継からのメトリクス (ホストが木の健康を把握する)
     const treeHealthRef = useRef<Map<string, { at: number; upstreamSilentMs: number; children: number; rttMs?: number }>>(new Map());
     const [treeHealth, setTreeHealth] = useState<Map<string, { at: number; upstreamSilentMs: number; children: number; rttMs?: number }>>(new Map());
     const relayMetricsTimerRef = useRef<number | null>(null);
+    // M5 フェーズB拡張: ホスト健康の可視化 — 直近1秒の送信量と、送信ループの
+    // 周期超過をtickに載せ、視聴者が「配信元が遅い」のか「経路が遅い」のか
+    // 切り分けられるようにする
+    const mediaBytesSentAccumRef = useRef(0);
+    const relayLoopLastRunRef = useRef(0);
+    const relayIntervalMsRef = useRef(33);
+    const hostLoadHighStreakRef = useRef(0);
     // M5 フェーズC: 上りRTT実測 (ping/pong) と降格済み中継の管理
     const upstreamRttRef = useRef<number | null>(null);
     const demotedRelaysRef = useRef<Set<string>>(new Set());
@@ -437,6 +444,10 @@ export function useWebRTC(options?: { signalingUrl?: string; turnConfig?: TurnCo
     // M5 E2E用の故障注入: 指定時刻まで着信メッセージを握りつぶし、親停滞を再現する
     const relaySuppressUntilRef = useRef(0);
     const suppressLoggedRef = useRef(false);
+    // M5 フェーズB拡張: 原因分類用 (tickの報告値と自分の受信量の差分)
+    const lastTickInfoRef = useRef<{ at: number; sentLastSec: number; loadHigh: boolean; highStreak: number } | null>(null);
+    const receivedBytesWindowRef = useRef(0);
+    const highLoadStreakRef = useRef(0);
     const relayTickTimerRef = useRef<number | null>(null);
     const lastKnownServerUrlRef = useRef<string | null>(null);
     const relayFrameSeqRef = useRef(0);
@@ -736,6 +747,7 @@ export function useWebRTC(options?: { signalingUrl?: string; turnConfig?: TurnCo
         if (relayLoopRef.current || !SUPPORTS_WEBRTC) return;
         const q = getRelayQualityPreset();
         const intervalMs = Math.round(1000 / q.fps);
+        relayIntervalMsRef.current = intervalMs;
         const stream = localStreamsRef.current.values().next().value || localStreamRef.current;
         const videoTrack = stream?.getVideoTracks?.()[0];
         if (!videoTrack) return; // 画面共有開始時に再度呼ばれる
@@ -755,11 +767,24 @@ export function useWebRTC(options?: { signalingUrl?: string; turnConfig?: TurnCo
             signalingRef.current?.sendRelay(peerId, 'share_state', { active: true });
         }
         relayTickTimerRef.current = window.setInterval(() => {
+            // 直近1秒の送信量と、送信ループの周期超過を載せる (視聴者が
+            // 「配信元が遅い/経路が遅い」を切り分けるため)
+            const sentLastSec = mediaBytesSentAccumRef.current;
+            mediaBytesSentAccumRef.current = 0;
+            const period = relayLoopLastRunRef.current > 0 ? Date.now() - relayLoopLastRunRef.current : 0;
+            const loadHigh = period > relayIntervalMsRef.current * 2;
+            if (loadHigh) hostLoadHighStreakRef.current++; else hostLoadHighStreakRef.current = 0;
             for (const peerId of relaySubscribersRef.current) {
-                signalingRef.current?.sendRelay(peerId, 'tick', { ts: Date.now() });
+                signalingRef.current?.sendRelay(peerId, 'tick', {
+                    ts: Date.now(),
+                    sentLastSec,
+                    loadHigh,
+                    highStreak: hostLoadHighStreakRef.current,
+                });
             }
         }, 1000);
         relayLoopRef.current = window.setInterval(() => {
+            relayLoopLastRunRef.current = Date.now(); // 送信周期の超過検出用 (tickが読む)
             const mseSubs = Array.from(relayCapsRef.current.entries()).filter(([, c]) => c.mse).map(([id]) => id);
             // 診断: ループ停滞の切り分け (60秒毎)
             {
@@ -794,6 +819,7 @@ export function useWebRTC(options?: { signalingUrl?: string; turnConfig?: TurnCo
                         onBox: (buf) => {
                             const d = arrayBufferToBase64(buf);
                             relayStatsRef.current.h264Chunks++;
+                            mediaBytesSentAccumRef.current += d.length;
                             // M3: チャンク毎に一意なseq + Ed25519署名 (改ざん/偽装/リプレイ対策)
                             relayChunkSeqRef.current++;
                             const seq = relayChunkSeqRef.current;
@@ -822,6 +848,7 @@ export function useWebRTC(options?: { signalingUrl?: string; turnConfig?: TurnCo
                 const dataUrl = canvas.toDataURL('image/jpeg', q.jpegQuality);
                 const b64 = dataUrl.slice(dataUrl.indexOf(',') + 1);
                 relayFrameSeqRef.current++;
+                mediaBytesSentAccumRef.current += b64.length;
                 relayStatsRef.current.frames++;
                 // M3: フレームにも署名
                 const frameSeq = relayFrameSeqRef.current;
@@ -903,6 +930,7 @@ export function useWebRTC(options?: { signalingUrl?: string; turnConfig?: TurnCo
                 relayStatsRef.current.audioChunks++;
                 void e.data.arrayBuffer().then(buf => {
                     const d = arrayBufferToBase64(buf);
+                    mediaBytesSentAccumRef.current += d.length;
                     for (const [peerId, c] of relayCapsRef.current) {
                         if (c.webmAudio) {
                             // M3: 音声チャンクにも署名
@@ -1962,6 +1990,12 @@ export function useWebRTC(options?: { signalingUrl?: string; turnConfig?: TurnCo
             if (type === 'tick') {
                 // M5§7: ホストの生存信号。中継は下流へパススルー
                 noteRelayActivity();
+                lastTickInfoRef.current = {
+                    at: Date.now(),
+                    sentLastSec: Number(p.sentLastSec) || 0,
+                    loadHigh: p.loadHigh === true,
+                    highStreak: Number(p.highStreak) || 0,
+                };
                 forwardToTreeChildren('tick', p);
                 return;
             }
@@ -1991,6 +2025,7 @@ export function useWebRTC(options?: { signalingUrl?: string; turnConfig?: TurnCo
                 // ホストはframeにもseq+Ed25519署名を付与済みなので検証コスト以外の変更なし
                 if (!verifyRelayChunk(p, 'frame')) return;
                 noteRelayActivity();
+                receivedBytesWindowRef.current += String(p.d || '').length;
                 // 検証済みフレームだけを子へパススルー (中継者)
                 forwardToTreeChildren('frame', p);
                 // 最新フレームを保持 (setStateは描画レートに合わせて間引く)
@@ -2035,6 +2070,7 @@ export function useWebRTC(options?: { signalingUrl?: string; turnConfig?: TurnCo
                 // ゲスト側: fMP4のbox (init/fragment) を順にappend
                 if (!verifyRelayChunk(p, 'video')) return;
                 noteRelayActivity();
+                receivedBytesWindowRef.current += String(p.d || '').length;
                 // M2: 中継者は検証済みペイロードを無改変で子へパススルー (再エンコードなし)
                 forwardToTreeChildren('h264', p);
                 relayStatsRef.current.h264Chunks++;
@@ -2051,6 +2087,7 @@ export function useWebRTC(options?: { signalingUrl?: string; turnConfig?: TurnCo
             if (type === 'audio') {
                 if (!verifyRelayChunk(p, 'audio')) return;
                 noteRelayActivity();
+                receivedBytesWindowRef.current += String(p.d || '').length;
                 forwardToTreeChildren('audio', p);
                 relayStatsRef.current.audioChunks++;
                 ensureRelayAudioSink();
@@ -3060,11 +3097,30 @@ export function useWebRTC(options?: { signalingUrl?: string; turnConfig?: TurnCo
             const now = Date.now();
             const r = checkWatchdog(relayWatchdogRef.current, now);
             relayWatchdogRef.current = r.state;
-            // フェーズB: バッジ用の健康レベル (変化したときだけsetState)
+            // フェーズB拡張: 原因分類 (配信元の高負荷か、経路の劣化か)。
+            // tick鮮度が3秒以上古い情報は使わない (停滞時は無条件にstalledが優先)
+            const tick = lastTickInfoRef.current;
+            let cause: LinkCause = null;
+            if (tick && now - tick.at < 3000) {
+                const received = receivedBytesWindowRef.current;
+                receivedBytesWindowRef.current = 0;
+                if (tick.loadHigh) highLoadStreakRef.current++; else highLoadStreakRef.current = 0;
+                cause = diagnoseLinkCause({
+                    tickLoadHigh: tick.loadHigh,
+                    highStreak: highLoadStreakRef.current,
+                    hostSentLastSec: tick.sentLastSec,
+                    receivedLastSec: received,
+                });
+            } else {
+                highLoadStreakRef.current = 0;
+            }
+            // フェーズB: バッジ用の健康レベル (変化したときだけsetState)。
+            // 配信元高負荷はストリームが流っていても黄で警告する
             const level = classifyLink(r.state, now);
-            setLinkHealth(prev => (prev.level === level && prev.via === connectedViaRef.current)
+            const shownLevel: LinkLevel = cause === 'host-load' && level === 'ok' ? 'degraded' : level;
+            setLinkHealth(prev => (prev.level === shownLevel && prev.via === connectedViaRef.current && prev.cause === cause)
                 ? prev
-                : { level, via: connectedViaRef.current });
+                : { level: shownLevel, via: connectedViaRef.current, cause });
             if (r.action === 'none') return;
             const parent = parentTargetIdRef.current;
             if (r.action === 'notify_parent_lost') {
