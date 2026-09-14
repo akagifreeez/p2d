@@ -78,6 +78,38 @@ export function pickParent(
 }
 
 /**
+ * スコア付きの親選択 (M5§7 フェーズC)。
+ * BFSで空きスロットの候補を集め、「浅い深さ」を最優先に、同一深さ内では
+ * score (小さいほど良い) の昇順で選ぶ。skip は候補からの完全除外
+ * (降格済み/上流停滞中の中継)。候補がなければ null。
+ *
+ * score の目安 (coordinateTreeで healthScore として構築):
+ *   0 = 根(ホスト) / 1 = RTT<150ms / 2 = RTT<400ms または計測なし / 3 = それ以上
+ */
+export function pickParentScored(
+    root: TreeNode,
+    maxDepth = MAX_DEPTH,
+    opts?: {
+        skip?: (node: TreeNode) => boolean;
+        score?: (node: TreeNode) => number;
+    },
+): TreeNode | null {
+    const candidates: TreeNode[] = [];
+    const queue: TreeNode[] = [root];
+    while (queue.length > 0) {
+        const node = queue.shift()!;
+        if (node.children.length < node.fanout && node.depth + 1 <= maxDepth) {
+            if (!opts?.skip?.(node)) candidates.push(node);
+        }
+        queue.push(...node.children);
+    }
+    if (candidates.length === 0) return null;
+    if (!opts?.score) return candidates[0];
+    // 深さを最優先し、同一深さ内で健康スコア昇順 (sortは安定=同点はBFS順)
+    return [...candidates].sort((a, b) => a.depth - b.depth || opts.score!(a) - opts.score!(b))[0];
+}
+
+/**
  * 新ノードを木に追加する。親は pickParent で決める (呼び出し側は事前に
  * pickParent で親を決め、その親の住所を新ノードへ案内する)。
  * 戻り値: 追加されたノード (親が見つからなければ null)

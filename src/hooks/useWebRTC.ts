@@ -25,9 +25,9 @@ import {
 } from '../lib/roster';
 import {
     createRoot as createTreeRoot, attach as treeAttach, promote as treePromote,
-    pickParent as pickTreeParent, findNode as findTreeNode, handleNodeLoss,
+    findNode as findTreeNode, handleNodeLoss,
     findPromoteCandidate as findTreePromoteCandidate, findDownlinkRelay,
-    detachNode,
+    detachNode, attachUnder, pickParentScored,
 } from '../lib/treeAssign';
 import {
     chooseSignalRoute, makeEnvelope, forwardEnvelope,
@@ -163,8 +163,8 @@ export interface UseWebRTCReturn {
     };
     /** M5 フェーズB: 視聴者側のリンク健康 (バッジ用) */
     linkHealth: { level: LinkLevel; via: 'direct' | 'relay' };
-    /** M5 フェーズC: 木の健康マップ (中継ごとの子数・上流無音時間) */
-    treeHealth: Map<string, { at: number; upstreamSilentMs: number; children: number }>;
+    /** M5 フェーズC: 木の健康マップ (中継ごとの子数・上流無音時間・RTT) */
+    treeHealth: Map<string, { at: number; upstreamSilentMs: number; children: number; rttMs?: number }>;
     /** M4: 署名鍵のフィンガープリント (QR帯域外照合用) */
     getRelayKeyFingerprint: () => string | null;
     /** issue#11: 招待 (;fp=) から受けた鍵指紋を設定し、受信鍵との照合を強制する */
@@ -427,9 +427,13 @@ export function useWebRTC(options?: { signalingUrl?: string; turnConfig?: TurnCo
     const [linkHealth, setLinkHealth] = useState<{ level: LinkLevel; via: 'direct' | 'relay' }>({ level: 'idle', via: 'direct' });
     const connectedViaRef = useRef<'direct' | 'relay'>('direct');
     // M5 フェーズC: 中継からのメトリクス (ホストが木の健康を把握する)
-    const treeHealthRef = useRef<Map<string, { at: number; upstreamSilentMs: number; children: number }>>(new Map());
-    const [treeHealth, setTreeHealth] = useState<Map<string, { at: number; upstreamSilentMs: number; children: number }>>(new Map());
+    const treeHealthRef = useRef<Map<string, { at: number; upstreamSilentMs: number; children: number; rttMs?: number }>>(new Map());
+    const [treeHealth, setTreeHealth] = useState<Map<string, { at: number; upstreamSilentMs: number; children: number; rttMs?: number }>>(new Map());
     const relayMetricsTimerRef = useRef<number | null>(null);
+    // M5 フェーズC: 上りRTT実測 (ping/pong) と降格済み中継の管理
+    const upstreamRttRef = useRef<number | null>(null);
+    const demotedRelaysRef = useRef<Set<string>>(new Set());
+    const rootServerUrlRef = useRef<string | null>(null);
     // M5 E2E用の故障注入: 指定時刻まで着信メッセージを握りつぶし、親停滞を再現する
     const relaySuppressUntilRef = useRef(0);
     const suppressLoggedRef = useRef(false);
@@ -1323,15 +1327,24 @@ export function useWebRTC(options?: { signalingUrl?: string; turnConfig?: TurnCo
         };
         if (findTreeNode(c.root, newSubId)) return;
 
-        // M5 フェーズC: 上流が停滞している中継には新しい子を割り当てない
+        // M5 フェーズC: 上流が停滞している中継には新しい子を割り当てない。
+        // さらに RTT実測があれば「浅い深さ × 健康スコア」で親を選ぶ
         const isUnhealthy = (node: { id: string; addr: unknown }) => {
             if (!node.addr) return false;
             const m = treeHealthRef.current.get(node.id);
-            return !!m && Date.now() - m.at < 20000 && m.upstreamSilentMs > 4000;
+            if (m && Date.now() - m.at < 20000 && m.upstreamSilentMs > 4000) return true;
+            return demotedRelaysRef.current.has(node.id);
         };
-        const parent = pickTreeParent(c.root, 3, isUnhealthy);
+        const healthScore = (node: { id: string; addr: unknown }): number => {
+            if (!node.addr) return 0; // 根
+            const m = treeHealthRef.current.get(node.id);
+            if (!m || Date.now() - m.at >= 20000) return 2.5; // 計測なし
+            const rtt = m.rttMs ?? 250;
+            return rtt < 150 ? 1 : rtt < 400 ? 2 : 3;
+        };
+        const parent = pickParentScored(c.root, 3, { skip: isUnhealthy, score: healthScore });
         if (parent) {
-            const node = treeAttach(c.root, { id: newSubId, addr: null, depth: 0, fanout: 0, children: [] }, 3, isUnhealthy);
+            const node = attachUnder(c.root, parent.id, { id: newSubId, addr: null, depth: 0, fanout: 0, children: [] });
             if (node && parent !== c.root && parent.addr) {
                 // 中継ノードの下へ配置 → 視聴者を中継のサーバーへ誘導
                 console.log(`[Tree] ${newSubId} を中継 ${parent.id} (${parent.addr.host}:${parent.addr.port}) へ割り当て`);
@@ -1452,6 +1465,11 @@ export function useWebRTC(options?: { signalingUrl?: string; turnConfig?: TurnCo
                         forwardToTreeChildren(t2, p2);
                         return;
                     }
+                    if (t2 === 'ping') {
+                        // M5 フェーズC: 子のRTT計測に応答
+                        tc.sendRelay(childId, 'pong', p2);
+                        return;
+                    }
                     if (t2 === 'tree:parent_lost') {
                         // M5§7: 子からの停滞報告 → originIdを付けて上流 (ホスト) へ転送
                         const up = parentTargetIdRef.current;
@@ -1487,7 +1505,10 @@ export function useWebRTC(options?: { signalingUrl?: string; turnConfig?: TurnCo
                     signalingRef.current?.sendRelay(up, 'tree:metrics', {
                         children: treeChildrenRef.current.size,
                         upstreamSilentMs: Date.now() - relayWatchdogRef.current.lastActivityAt,
+                        rttMs: upstreamRttRef.current ?? undefined,
                     });
+                    // RTT実測 (pong応答で upstreamRttRef を更新)
+                    signalingRef.current?.sendRelay(up, 'ping', { ts: Date.now() });
                 }, 5000);
             } catch (e) {
                 console.error('[Tree] 中継への昇格に失敗:', e);
@@ -1690,6 +1711,7 @@ export function useWebRTC(options?: { signalingUrl?: string; turnConfig?: TurnCo
             const endpoint = hostEndpointRef.current;
             if (isHost && port) {
                 migratedRef.current = true;
+                rootServerUrlRef.current = `ws://127.0.0.1:${port}`;
                 console.log('[WebRTC] 中央サーバー死亡 → 内蔵サーバーへ移行');
                 void switchSignalingRef.current(`ws://127.0.0.1:${port}`).catch((e) => {
                     console.error('[WebRTC] 移行失敗:', e);
@@ -1697,6 +1719,7 @@ export function useWebRTC(options?: { signalingUrl?: string; turnConfig?: TurnCo
                 });
             } else if (!isHost && endpoint) {
                 migratedRef.current = true;
+                rootServerUrlRef.current = `ws://${endpoint}`;
                 console.log('[WebRTC] 中央サーバー死亡 → ホスト内蔵サーバーへ移行');
                 void switchSignalingRef.current(`ws://${endpoint}`).catch((e) => {
                     console.error('[WebRTC] 移行失敗:', e);
@@ -1942,6 +1965,16 @@ export function useWebRTC(options?: { signalingUrl?: string; turnConfig?: TurnCo
                 forwardToTreeChildren('tick', p);
                 return;
             }
+            if (type === 'ping') {
+                // M5 フェーズC: RTT実測。受信したらそのままpongで返す (ホスト/中継共通)
+                signalingRef.current?.sendRelay(senderId, 'pong', p);
+                return;
+            }
+            if (type === 'pong') {
+                const sentAt = Number(p.ts) || 0;
+                if (sentAt > 0) upstreamRttRef.current = Date.now() - sentAt;
+                return;
+            }
             if (type === 'share_state') {
                 // M5§7: ホストの共有開始/停止。停止時は停滞監視を解除する
                 if (p.active) {
@@ -2076,9 +2109,9 @@ export function useWebRTC(options?: { signalingUrl?: string; turnConfig?: TurnCo
                     // M5§7: root直結への復帰指示。現在の接続先 (中央 or ホスト内蔵)
                     // へ再ダイヤルして fresh な部屋参加を作り直す
                     relayWatchdogRef.current = noteSwitch(relayWatchdogRef.current, Date.now());
-                    const url = lastKnownServerUrlRef.current;
+                    const url = rootServerUrlRef.current ?? lastKnownServerUrlRef.current;
                     if (url) {
-                        console.log(`[Tree] rejoin指示 — ${url} へ再ダイヤルします`);
+                        console.log(`[Tree] rejoin指示 — 根 (${url}) へ再ダイヤルします`);
                         void switchSignalingRef.current(url).catch((e) => {
                             console.error('[Tree] rejoin再ダイヤルに失敗:', e);
                         });
@@ -2120,6 +2153,7 @@ export function useWebRTC(options?: { signalingUrl?: string; turnConfig?: TurnCo
                             at: Date.now(),
                             upstreamSilentMs: Number(p.upstreamSilentMs) || 0,
                             children: Number(p.children) || 0,
+                            rttMs: Number(p.rttMs) || undefined,
                         });
                         setTreeHealth(new Map(treeHealthRef.current));
                     }
@@ -2218,6 +2252,7 @@ export function useWebRTC(options?: { signalingUrl?: string; turnConfig?: TurnCo
         // (Node/内蔵サーバーはクエリを無視するため互換)
         const url = roomCode ? `${targetSignalingUrl}?room=${roomCode}` : targetSignalingUrl;
         lastKnownServerUrlRef.current = url;
+        rootServerUrlRef.current = url; // 木の根 (ホストの部屋) のURL
         const signaling = new SignalingClient(url);
         signalingRef.current = signaling;
         wireSignalingRef.current(signaling);
@@ -2311,6 +2346,8 @@ export function useWebRTC(options?: { signalingUrl?: string; turnConfig?: TurnCo
             signalingRef.current = null;
         }
         setConnectionState('connecting');
+        rootServerUrlRef.current = wsUrl;
+        lastKnownServerUrlRef.current = wsUrl;
         const signaling = new SignalingClient(wsUrl);
         signalingRef.current = signaling;
         wireSignalingRef.current(signaling);
@@ -2393,6 +2430,9 @@ export function useWebRTC(options?: { signalingUrl?: string; turnConfig?: TurnCo
         }
         treeHealthRef.current.clear();
         setTreeHealth(new Map());
+        upstreamRttRef.current = null;
+        demotedRelaysRef.current.clear();
+        rootServerUrlRef.current = null;
         if (relayTickTimerRef.current) {
             clearInterval(relayTickTimerRef.current);
             relayTickTimerRef.current = null;
@@ -2983,6 +3023,34 @@ export function useWebRTC(options?: { signalingUrl?: string; turnConfig?: TurnCo
             broadcastData('speaking', { isSpeaking });
         }
     }, [isSpeaking, broadcastData]);
+
+    // M5 フェーズC: 降格 — 上流停滞中継の配下の子を健康な親へ移動する (ホスト, 5秒毎)
+    useEffect(() => {
+        const t = window.setInterval(() => {
+            if (!isHostRef.current) return;
+            const c = treeCoordinatorRef.current;
+            if (!c) return;
+            const now = Date.now();
+            for (const [relayId, m] of treeHealthRef.current) {
+                if (now - m.at >= 20000) continue; // 古い報告は無視 (死亡は各自のwatchdogが扱う)
+                const node = findTreeNode(c.root, relayId);
+                const unhealthy = m.upstreamSilentMs > 8000;
+                const demoted = demotedRelaysRef.current.has(relayId);
+                if (unhealthy && !demoted && node && node.children.length > 0) {
+                    demotedRelaysRef.current.add(relayId);
+                    console.warn(`[Tree] 中継 ${relayId.slice(0, 8)} を降格: 上流停滞のため配下 ${node.children.length}人を移動します`);
+                    for (const child of [...node.children]) {
+                        detachNode(c.root, child.id);
+                        coordinateTree(child.id, { reassignHost: true });
+                    }
+                } else if (!unhealthy && demoted) {
+                    demotedRelaysRef.current.delete(relayId);
+                    console.log(`[Tree] 中継 ${relayId.slice(0, 8)} の降格を解除 (上流回復)`);
+                }
+            }
+        }, 5000);
+        return () => window.clearInterval(t);
+    }, []);
 
     // M5§7: リレー受信の停滞ウォッチドッグ (1秒毎)。リレーモード専用
     // (meshには既存のconnectionQuality/再構築経路がある)。判定はrelayWatchdog.ts

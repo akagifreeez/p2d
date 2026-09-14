@@ -824,7 +824,7 @@ export function RoomView({ onLeave, signalingUrl, turnConfig, e2eConfig, onOpenS
                                             <div key={id} className="text-[10px] flex items-center gap-1.5 text-[var(--md-on-surface-variant)]">
                                                 <span className={`w-1.5 h-1.5 rounded-full ${dotColor}`} />
                                                 <span className="font-mono">{id.slice(0, 8)}</span>
-                                                <span>子{m.children}人・上流{Math.round(m.upstreamSilentMs / 1000)}秒無音{!fresh ? ' (未更新)' : ''}</span>
+                                                <span>子{m.children}人・上流{Math.round(m.upstreamSilentMs / 1000)}秒無音{m.rttMs !== undefined ? `・RTT ${m.rttMs}ms` : ''}{!fresh ? ' (未更新)' : ''}</span>
                                             </div>
                                         );
                                     })}

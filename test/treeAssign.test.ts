@@ -201,7 +201,7 @@ test('findDownlinkRelay: 直結ノードは自分自身、深い場所は深さ1
 });
 
 // === M5§7: 親停滞の再割り当て用 detachNode ===
-import { detachNode } from '../src/lib/treeAssign.js';
+import { detachNode, pickParentScored } from '../src/lib/treeAssign.js';
 
 test('detachNode: 深い位置の葉を取り除ける (根・中継は壊さない)', () => {
     const root = createRoot('host');
@@ -235,4 +235,36 @@ test('M5§7: pickParent/attach の skip で不健康な中継を親候補から�
     // 中継を不健康扱いする skip → 候補ゼロ (他に空きがない)
     const p1 = pickParent(root, 3, (n) => n.id === 'relay');
     assert.equal(p1, null);
+});
+
+test('M5§7: pickParentScored — 同一深さ内では健康スコア、深さは最優先', () => {
+    const root = createRoot('host');
+    // root直結を1枠だけ空けて満員にする (中継2台が直結に付く)
+    const r1 = attach(root, { id: 'relay1', addr: null, depth: 0, fanout: 0, children: [] });
+    assert.ok(r1);
+    promote(r1, { host: 'h', port: 1 });
+    const r2 = attach(root, { id: 'relay2', addr: null, depth: 0, fanout: 0, children: [] });
+    assert.ok(r2);
+    promote(r2, { host: 'h', port: 2 });
+    attachUnder(root, 'host', { id: 'g1', addr: null, depth: 0, fanout: 0, children: [] });
+    attachUnder(root, 'host', { id: 'g2', addr: null, depth: 0, fanout: 0, children: [] });
+    attachUnder(root, 'host', { id: 'g3', addr: null, depth: 0, fanout: 0, children: [] });
+
+    // 同一深さ(深さ1)で relay2 の方が健康 → relay2が選ばれる
+    const score = (n: { id: string }) => (n.id === 'relay1' ? 3 : n.id === 'relay2' ? 1 : 2);
+    assert.equal(pickParentScored(root, 3, { score })?.id, 'relay2');
+    // スコア逆転 → relay1
+    assert.equal(pickParentScored(root, 3, { score: (n) => (n.id === 'relay1' ? 1 : 3) })?.id, 'relay1');
+    // 両方不健康 (skip) → 候補ゼロ
+    assert.equal(pickParentScored(root, 3, { skip: (n) => n.id === 'relay1' || n.id === 'relay2' }), null);
+    // 深さ優先: 深さ1に空きがあれば、スコアの悪い深さ2より深さ1が選ばれる
+    const child1 = attachUnder(root, 'relay1', { id: 'c1', addr: null, depth: 0, fanout: 0, children: [] });
+    assert.ok(child1);
+    promote(child1, { host: 'h', port: 3 }); // fanout2 → c1配下に空き (深さ2)
+    const r1node = r1; // relay1はfanout2でc1を1人収容 → 残り1枠
+    const p = pickParentScored(root, 3, {
+        score: (n) => (n.id === 'c1' ? 1 : n.id === 'relay1' ? 3 : 9),
+    });
+    assert.equal(p?.id, 'relay1', '深さ1(relay1, score3)は深さ2(c1, score1)より優先');
+    void r1node;
 });
