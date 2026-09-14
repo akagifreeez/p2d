@@ -75,6 +75,29 @@ export function keyFingerprint(publicKeyB64: string): string {
     return Array.from(h.slice(0, 8)).map(b => b.toString(16).padStart(2, '0')).join('');
 }
 
+/**
+ * relay:key 受信ポリシー (issue#11)。
+ * - pin-first: 最初に受信した鍵を固定し、以後の差し替え要求は拒否する
+ *   (中継者・参加者は鍵を自分のものに付け替えて偽映像を正規化できない)
+ * - 指紋照合: 招待 (;fp=) の指紋があれば、一致しない鍵は最初から受理しない
+ *   (攻撃者がホストより先に偽鍵を送って固定する競合を帯域外で防ぐ)
+ */
+export function acceptKeyCandidate(
+    expectedFp: string | null,
+    pinnedPub: string | null,
+    candidatePub: string,
+): { accept: boolean; reason?: 'fingerprint-mismatch' | 'already-pinned' | 'same-as-pinned' } {
+    if (expectedFp && keyFingerprint(candidatePub) !== expectedFp) {
+        return { accept: false, reason: 'fingerprint-mismatch' };
+    }
+    if (pinnedPub) {
+        return candidatePub === pinnedPub
+            ? { accept: false, reason: 'same-as-pinned' }
+            : { accept: false, reason: 'already-pinned' };
+    }
+    return { accept: true };
+}
+
 /** チャンクのデータ部 (base64 → bytes) を取り出す */
 export function chunkDataFromB64(dB64: string): Uint8Array {
     return b64decode(dB64);

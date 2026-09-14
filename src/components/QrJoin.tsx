@@ -15,8 +15,9 @@ export function QrModal({ roomCode, inviteEndpoint, keyFingerprint, onClose }: {
     const [dataUrl, setDataUrl] = useState('');
     const [copied, setCopied] = useState('');
 
-    // 招待v2: 内蔵サーバーが動いている場合は住所を埋め込む (サーバーレス参加, M4)
-    const invitePayload = buildInvite(roomCode, inviteEndpoint);
+    // 招待v2: 内蔵サーバーが動いている場合は住所を埋め込む (サーバーレス参加, M4)。
+    // 招待v3 (issue#11): 署名鍵の指紋も同梱し、受け手が受信鍵を自動照合できるようにする
+    const invitePayload = buildInvite(roomCode, inviteEndpoint, keyFingerprint);
     const inviteText = `P2Dで画面共有に招待します!\n参加リンク: ${invitePayload}\n(P2Dインストール済みならクリックで自動参加 / コード: ${roomCode})`;
 
     useEffect(() => {

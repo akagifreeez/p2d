@@ -65,7 +65,7 @@ impl DiscordHandler for JoinHandler {
         use tauri::Manager;
         if let Some(state) = self.app.try_state::<JoinCodeState>() {
             if let Ok(mut g) = state.0.lock() {
-                *g = Some(JoinInvite { code: secret.clone(), endpoint: None });
+                *g = Some(JoinInvite { code: secret.clone(), endpoint: None, fingerprint: None });
             }
         }
         use tauri::Emitter;

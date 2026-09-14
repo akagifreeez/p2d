@@ -225,7 +225,18 @@ export function RoomView({ onLeave, signalingUrl, turnConfig, e2eConfig, onOpenS
         setRelayMode,
         getTreeInfo,
         getRelayKeyFingerprint,
+        // issue#11: 招待の鍵指紋を設定し受信鍵と照合する
+        setExpectedKeyFingerprint,
     } = useWebRTC({ signalingUrl, turnConfig, treeFanout: e2eConfig?.treeFanout ?? undefined });
+
+    /** 招待経路の共通参加: 鍵指紋があれば設定してから参加する (issue#11) */
+    const joinWithInvite = (invite: { code: string; endpoint: string | null; fingerprint: string | null }, name?: string) => {
+        setExpectedKeyFingerprint(invite.fingerprint);
+        if (invite.endpoint) {
+            return joinRoomAt(invite.code, `ws://${invite.endpoint}`, name);
+        }
+        return joinRoom(invite.code, name);
+    };
 
     // E2E自己テストランナー (P2D_E2E_ROLE 環境変数がある起動でのみ動作)
     const e2eDepsRef = useRef<E2eDeps | null>(null);
@@ -317,8 +328,10 @@ export function RoomView({ onLeave, signalingUrl, turnConfig, e2eConfig, onOpenS
         // 冷却起動 (アプリが閉じた状態でURLを開いた場合) は起動引数から復元
         void (async () => {
             try {
-                const invite = await invoke<{ code: string; endpoint: string | null } | null>('get_launch_invite');
+                const invite = await invoke<{ code: string; endpoint: string | null; fingerprint?: string | null } | null>('get_launch_invite');
                 if (invite?.code && !isConnected) {
+                    // 招待v3: 鍵指紋があれば受信鍵の照合に使う (issue#11)
+                    setExpectedKeyFingerprint(invite.fingerprint ?? null);
                     if (invite.endpoint) {
                         // 招待v2: ホストの内蔵サーバーへ直行 (シグナリングサーバー不使用)
                         joinRoomAt(invite.code, `ws://${invite.endpoint}`).catch(() => { /* 部屋が無い等 */ });
@@ -334,9 +347,10 @@ export function RoomView({ onLeave, signalingUrl, turnConfig, e2eConfig, onOpenS
         const unlisten = listen<string>('p2d-join-url', (e) => {
             if (!e.payload || isConnected) return;
             try {
-                // ペイロードはJSON文字列 {code, endpoint} (旧形式=素のコードにも対応)
-                const parsed = JSON.parse(e.payload) as { code?: string; endpoint?: string | null };
+                // ペイロードはJSON文字列 {code, endpoint, fingerprint}
+                const parsed = JSON.parse(e.payload) as { code?: string; endpoint?: string | null; fingerprint?: string | null };
                 if (parsed?.code) {
+                    setExpectedKeyFingerprint(parsed.fingerprint ?? null);
                     if (parsed.endpoint) {
                         joinRoomAt(parsed.code, `ws://${parsed.endpoint}`).catch(() => { /* 部屋が無い等 */ });
                     } else {
@@ -494,10 +508,9 @@ export function RoomView({ onLeave, signalingUrl, turnConfig, e2eConfig, onOpenS
                             <button
                                 onClick={() => {
                                     const invite = parseInvite(inputCode);
-                                    if (invite?.endpoint) {
-                                        joinRoomAt(invite.code, `ws://${invite.endpoint}`, displayName);
-                                    } else if (invite) {
-                                        joinRoom(invite.code, displayName);
+                                    if (invite) {
+                                        // ;fp= 付きの招待なら鍵照合を設定してから参加 (issue#11)
+                                        joinWithInvite(invite, displayName).catch(() => { /* 部屋が無い等 */ });
                                     }
                                 }}
                                 className="btn-secondary px-6"

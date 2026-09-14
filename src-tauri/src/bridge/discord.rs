@@ -8,12 +8,16 @@ use tauri::State;
 /// 参加招待の解析結果。
 /// 招待v2 (レンデブー最小化M4): `p2d://join/<CODE>@<host>:<port>` はホストの
 /// 内蔵サーバーへ直行する (シグナリングサーバー不使用)。endpointがNoneなら従来通り。
+/// fingerprint (issue#11): `;fp=<hex16>` で署名鍵の指紋を同梱。受信側は
+/// relay:key で受け取った公開鍵とこれを突合し、なりすまし鍵を拒否できる。
 #[derive(Serialize, Clone, Debug, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct JoinInvite {
     pub code: String,
     /// "host:port" 形式の内蔵サーバー住所 (v2のみ)
     pub endpoint: Option<String>,
+    /// 署名鍵のフィンガープリント (16hex、省略可)
+    pub fingerprint: Option<String>,
 }
 
 fn arg_opt(flag: &str, env_key: &str) -> Option<String> {
@@ -72,7 +76,17 @@ where
                     None
                 }
             });
-            return Some(JoinInvite { code, endpoint });
+            // 指紋 (issue#11): `;fp=<hex16>` を取り出す (endpoint解析の後ろに付く)
+            let fingerprint = rest
+                .split(";fp=")
+                .nth(1)
+                .map(|raw| {
+                    raw.chars()
+                        .take_while(|c| c.is_ascii_hexdigit())
+                        .collect::<String>()
+                })
+                .filter(|f| f.len() == 16);
+            return Some(JoinInvite { code, endpoint, fingerprint });
         }
     }
     None
@@ -132,11 +146,11 @@ mod tests {
     fn join_url_is_parsed() {
         assert_eq!(
             find_join_url(["p2d://join/ABC123"]),
-            Some(JoinInvite { code: "ABC123".into(), endpoint: None })
+            Some(JoinInvite { code: "ABC123".into(), endpoint: None, fingerprint: None })
         );
         assert_eq!(
             find_join_url(["--url", "p2d://join/CWH4K6?x=1"]),
-            Some(JoinInvite { code: "CWH4K6".into(), endpoint: None })
+            Some(JoinInvite { code: "CWH4K6".into(), endpoint: None, fingerprint: None })
         );
         assert_eq!(find_join_url(["p2d://join/ab"]), None);
         assert_eq!(find_join_url(["unrelated"]), None);
@@ -147,23 +161,51 @@ mod tests {
     fn invite_v2_with_endpoint_is_parsed() {
         assert_eq!(
             find_join_url(["p2d://join/ABC123@192.168.11.5:8090"]),
-            Some(JoinInvite { code: "ABC123".into(), endpoint: Some("192.168.11.5:8090".into()) })
+            Some(JoinInvite { code: "ABC123".into(), endpoint: Some("192.168.11.5:8090".into()), fingerprint: None })
         );
         assert_eq!(
             find_join_url(["p2d://join/ABC123@p2d-host.local:8090?src=qr"]),
             Some(JoinInvite {
                 code: "ABC123".into(),
-                endpoint: Some("p2d-host.local:8090".into())
+                endpoint: Some("p2d-host.local:8090".into()),
+                fingerprint: None
             })
         );
         // endpointが壊れている場合は従来形式としてコードだけ採用
         assert_eq!(
             find_join_url(["p2d://join/ABC123@:8090"]),
-            Some(JoinInvite { code: "ABC123".into(), endpoint: None })
+            Some(JoinInvite { code: "ABC123".into(), endpoint: None, fingerprint: None })
         );
         assert_eq!(
             find_join_url(["p2d://join/ABC123@host-only"]),
-            Some(JoinInvite { code: "ABC123".into(), endpoint: None })
+            Some(JoinInvite { code: "ABC123".into(), endpoint: None, fingerprint: None })
+        );
+    }
+
+    #[test]
+    fn issue11_fingerprint_is_parsed() {
+        // endpoint + fp
+        assert_eq!(
+            find_join_url(["p2d://join/ABC123@192.168.11.5:8090;fp=0123456789abcdef"]),
+            Some(JoinInvite {
+                code: "ABC123".into(),
+                endpoint: Some("192.168.11.5:8090".into()),
+                fingerprint: Some("0123456789abcdef".into())
+            })
+        );
+        // fp のみ
+        assert_eq!(
+            find_join_url(["p2d://join/ABC123;fp=ffffffffffffffff"]),
+            Some(JoinInvite {
+                code: "ABC123".into(),
+                endpoint: None,
+                fingerprint: Some("ffffffffffffffff".into())
+            })
+        );
+        // 長さ不足のfpは採用しない
+        assert_eq!(
+            find_join_url(["p2d://join/ABC123;fp=123"]),
+            Some(JoinInvite { code: "ABC123".into(), endpoint: None, fingerprint: None })
         );
     }
 }

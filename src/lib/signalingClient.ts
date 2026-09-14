@@ -11,6 +11,7 @@ export type MessageType =
     | 'room:leave'
     | 'room:created'
     | 'room:joined'
+    | 'room:host'
     | 'peer:joined'
     | 'peer:left'
     | 'peer:offer'
@@ -58,9 +59,12 @@ export interface TunnelEnvelope {
 export interface SignalingEvents {
     onConnected: () => void;
     onDisconnected: () => void;
-    onRoomCreated: (roomCode: string, roomId: string) => void;
-    // 更新: peersリストではなくParticipantInfo[]を受け取る
-    onRoomJoined: (roomId: string, roomCode: string, myId: string, participants: ParticipantInfo[], hostEndpoint?: string | null) => void;
+    // 更新: room:created 応答に hostToken (再権限トークン, issue#9) が載る
+    onRoomCreated: (roomCode: string, roomId: string, hostToken?: string) => void;
+    // 更新: room:joined 応答に hostId (issue#10) が載る
+    onRoomJoined: (roomId: string, roomCode: string, myId: string, participants: ParticipantInfo[], hostEndpoint?: string | null, hostId?: string | null) => void;
+    // room:host (issue#10): ホストの再接続でホスト接続IDが変わった通知
+    onHostChanged?: (hostId: string) => void;
     onPeerJoined: (peerId: string, peerName?: string) => void;
     onPeerLeft: (peerId: string) => void;
     onOffer: (senderId: string, sdp: RTCSessionDescriptionInit) => void;
@@ -81,6 +85,9 @@ export class SignalingClient {
     private reconnectDelay = 1000;
     // 移行 (内蔵サーバーへの切替) 時に古いクライアントの再接続を止めるためのフラグ
     private disposed = false;
+    // room:created 応答で受け取ったホスト再権限トークン (issue#9)。
+    // 同一接続が切れて再接続する際、createRoomへ自動で添付される
+    private hostToken: string | null = null;
 
     constructor(private serverUrl: string) { }
 
@@ -165,15 +172,23 @@ export class SignalingClient {
 
         switch (message.type) {
             case 'room:created': {
-                const payload = message.payload as { roomCode: string, roomId: string };
-                this.events.onRoomCreated?.(payload.roomCode, payload.roomId);
+                const payload = message.payload as { roomCode: string, roomId: string, hostToken?: string };
+                // 再権限トークンを覚えておく (再接続時のcreateに添付される, issue#9)
+                if (payload.hostToken) this.hostToken = payload.hostToken;
+                this.events.onRoomCreated?.(payload.roomCode, payload.roomId, payload.hostToken);
+                break;
+            }
+
+            case 'room:host': {
+                const payload = message.payload as { hostId: string };
+                if (payload.hostId) this.events.onHostChanged?.(payload.hostId);
                 break;
             }
 
             case 'room:joined': {
-                const payload = message.payload as { roomId: string; roomCode: string; myId: string; participants: ParticipantInfo[]; hostEndpoint?: string };
+                const payload = message.payload as { roomId: string; roomCode: string; myId: string; participants: ParticipantInfo[]; hostEndpoint?: string; hostId?: string };
                 if (payload.roomId) { // 空でない場合のみ
-                    this.events.onRoomJoined?.(payload.roomId, payload.roomCode, payload.myId, payload.participants, payload.hostEndpoint);
+                    this.events.onRoomJoined?.(payload.roomId, payload.roomCode, payload.myId, payload.participants, payload.hostEndpoint, payload.hostId);
                 }
                 break;
             }
@@ -240,11 +255,13 @@ export class SignalingClient {
 
     /**
      * ルームを作成 (レンデブー最小化 M2: ローカル生成コードと内蔵サーバー住所を電話帳へ登録)
+     * issue#9: 既存ルームへの再作成 (再接続/移行) では hostToken の提示が必須。
+     * 省略時はこのクライアントが記憶しているトークンを自動で使う
      */
-    createRoom(name?: string, roomCode?: string, hostEndpoint?: string): void {
+    createRoom(name?: string, roomCode?: string, hostEndpoint?: string, hostToken?: string): void {
         this.send({
             type: 'room:create',
-            payload: { name, roomCode, hostEndpoint },
+            payload: { name, roomCode, hostEndpoint, hostToken: hostToken ?? this.hostToken ?? undefined },
         });
     }
 

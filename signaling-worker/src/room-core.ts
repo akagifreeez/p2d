@@ -6,6 +6,12 @@
  *   room:create / room:join / room:leave / peer:offer|answer|ice /
  *   peer:tunnel / relay:* (同一ルーム所属検証付き転送)
  *
+ * 認可モデル (issue#9/#10):
+ *   - hostToken (ルーム毎に発行) を提示したcreateだけがホスト権 (電話帳更新/
+ *     再接続) を持つ。無認可のcreateはUNAUTHORIZEDで拒否され、部屋の状態は
+ *     一切変わらない
+ *   - room:join が hostEndpoint を書き換えることは決してない
+ *
  * DOモデルの意味論 (Nodeサーバーとの差分):
  *   - ルームはDO自身 (URLの ?room=コード で特定)。空でも存在し続ける
  *   - 先にホストがcreateしなくても最初のjoinで部屋として機能する
@@ -33,6 +39,10 @@ export interface OutMessage {
 export interface RoomCoreState {
     code: string;
     hostEndpoint?: string;
+    /** ホスト再権限トークン (issue#9)。初回createの応答で作成者へ1度だけ渡す */
+    hostToken?: string;
+    /** 現在のホスト接続ID (issue#10)。tree:*系・鍵配布の権威チェックに使われる */
+    hostId?: string;
     maxParticipants: number;
     /** 現在部屋にいるメンバー (接続が切れたら除去) */
     members: Map<string, Member>;
@@ -157,11 +167,14 @@ export function coreMessage(
 }
 
 /**
- * 部屋への参加。DOモデルでは部屋は常に存在するため:
- * - room:create: 常に成功 (member登録。既存なら冪等)。hostEndpointを更新
- * - room:join: 満員なら ROOM_FULL、それ以外は登録
- * - room:joinがルーム未作成で失敗する、というNodeサーバーとの差分はない
- *   (URLの ?room= が部屋の実体。phone bookはhostEndpoint配布のみに使用)
+ * 部屋への参加 (issue#9/#10の認可モデル)。
+ * DOモデルでは部屋は常に存在する (URLの ?room= が部屋の実体) ため:
+ * - room:create (未claim): 最初のcreateをホストとして受理。hostTokenを発行し
+ *   created応答で1度だけ返す (旧クライアント互換: token無しの初回createは許容)
+ * - room:create (claim済み): 正しいhostTokenの提示のみ受理 (ホスト再権限)。
+ *   hostEndpointの更新もこの経路だけ。不一致/無提示は UNAUTHORIZED で拒否し、
+ *   参加者リストには一切載らない
+ * - room:join: 満員なら ROOM_FULL。hostEndpointは決して更新しない (issue#10)
  */
 function handleCreateJoin(
     state: RoomCoreState,
@@ -172,9 +185,32 @@ function handleCreateJoin(
 ): OutMessage[] {
     const name = typeof payload.name === 'string' ? payload.name : undefined;
     const hostEndpoint = typeof payload.hostEndpoint === 'string' ? payload.hostEndpoint : undefined;
+    const hostToken = typeof payload.hostToken === 'string' ? payload.hostToken : undefined;
+
+    let isHostAction = false;
+    if (isCreate) {
+        if (!state.hostToken) {
+            // 初回claim: ルームのホスト権を最初のcreateに渡す
+            state.hostToken = newHostToken();
+            state.hostId = myId;
+            if (hostEndpoint) state.hostEndpoint = hostEndpoint;
+            isHostAction = true;
+        } else if (state.hostToken === hostToken) {
+            // ホスト再権限: hostIdを付け替え、電話帳の更新も許す
+            state.hostId = myId;
+            if (hostEndpoint) state.hostEndpoint = hostEndpoint;
+            isHostAction = true;
+        } else {
+            return [s2c(myId, {
+                type: 'error',
+                timestamp: ts,
+                payload: { code: 'UNAUTHORIZED', message: 'このルームの作成者ではありません' },
+            })];
+        }
+    }
 
     const alreadyMember = state.members.has(myId);
-    if (!alreadyMember && state.members.size >= state.maxParticipants) {
+    if (!alreadyMember && !isHostAction && state.members.size >= state.maxParticipants) {
         return [s2c(myId, {
             type: 'error',
             timestamp: ts,
@@ -185,9 +221,6 @@ function handleCreateJoin(
     if (!alreadyMember) {
         state.members.set(myId, { name, joinedAt: ts });
     }
-    if (hostEndpoint) {
-        state.hostEndpoint = hostEndpoint;
-    }
 
     const responses: OutMessage[] = [];
     if (isCreate) {
@@ -195,8 +228,24 @@ function handleCreateJoin(
             type: 'room:created',
             senderId: myId,
             timestamp: ts,
-            payload: { roomCode: state.code, roomId: state.code, hostEndpoint: state.hostEndpoint },
+            payload: {
+                roomCode: state.code, roomId: state.code,
+                hostEndpoint: state.hostEndpoint, hostToken: state.hostToken, hostId: state.hostId,
+            },
         }));
+        // issue#10: ホストの接続IDを全メンバーへ配る (reclaim時はIDが変わる。
+        // 初回create時はホストしかいないため実質no-op)
+        if (state.hostId) {
+            for (const id of state.members.keys()) {
+                if (id === myId) continue;
+                responses.push(s2c(id, {
+                    type: 'room:host',
+                    senderId: myId,
+                    timestamp: ts,
+                    payload: { hostId: state.hostId },
+                }));
+            }
+        }
     }
     responses.push(s2c(myId, {
         type: 'room:joined',
@@ -208,6 +257,7 @@ function handleCreateJoin(
             myId,
             participants: participantList(state, myId),
             hostEndpoint: state.hostEndpoint,
+            hostId: state.hostId,
         },
     }));
 
@@ -224,4 +274,9 @@ function handleCreateJoin(
         }
     }
     return responses;
+}
+
+/** ホスト再権限トークンの生成 (Workers/Node双方でcrypto.randomUUIDが使える) */
+function newHostToken(): string {
+    return crypto.randomUUID();
 }

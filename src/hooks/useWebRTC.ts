@@ -32,17 +32,20 @@ import {
     chooseSignalRoute, makeEnvelope, forwardEnvelope,
     type TunnelEnvelope, type SignalKind,
 } from '../lib/signalRouter';
-import { generateRelayKeyPair, signChunk, verifyChunk, chunkDataFromB64, keyFingerprint, type RelayKeyPair } from '../lib/relaySign';
+import { generateRelayKeyPair, signChunk, verifyChunk, chunkDataFromB64, keyFingerprint, acceptKeyCandidate, type RelayKeyPair } from '../lib/relaySign';
 
 // WebRTC APIの有無 (Ubuntu等のWebKitGTKはWebRTC無効ビルドで RTCPeerConnection が存在しない)
 export const SUPPORTS_WEBRTC = typeof RTCPeerConnection !== 'undefined';
 
 // 中央サーバーと同じ文字集合の6桁ルームコード (レンデブー最小化M2/M4:
-// ホストがローカル生成し、電話帳登録と内蔵サーバーの両方で同じコードを使う)
+// ホストがローカル生成し、電話帳登録と内蔵サーバーの両方で同じコードを使う)。
+// issue#9: コードは参加資格そのものなので乱数源はcrypto (Math.randomは予測可)
 function genLocalRoomCode(): string {
     const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+    const buf = new Uint32Array(6);
+    crypto.getRandomValues(buf);
     let code = '';
-    for (let i = 0; i < 6; i++) code += chars.charAt(Math.floor(Math.random() * chars.length));
+    for (let i = 0; i < 6; i++) code += chars.charAt(buf[i] % chars.length);
     return code;
 }
 
@@ -157,6 +160,8 @@ export interface UseWebRTCReturn {
     };
     /** M4: 署名鍵のフィンガープリント (QR帯域外照合用) */
     getRelayKeyFingerprint: () => string | null;
+    /** issue#11: 招待 (;fp=) から受けた鍵指紋を設定し、受信鍵との照合を強制する */
+    setExpectedKeyFingerprint: (fp: string | null) => void;
     myId: string | null;
 
     // 画面共有
@@ -325,9 +330,18 @@ export function useWebRTC(options?: { signalingUrl?: string; turnConfig?: TurnCo
     const hostEndpointRef = useRef<string | null>(null);
     const isHostRef = useRef(false);
     const migratedRef = useRef(false);
+    // issue#9: ホスト再権限トークン (room:created応答でサーバーから受領)。
+    // 移行でSignalingClientを作り直してもcreateに添付できるようrefで保持する
+    const hostTokenRef = useRef<string | null>(null);
+    // issue#10: ルームのホストの接続ID (room:joined / room:host で受領)。
+    // tree:promote/assign・鍵配布・許可状態の権威チェックに使う
+    const hostIdRef = useRef<string | null>(null);
     // M3: リレーチャンク署名 (ホスト=鍵ペア+署名 / ゲスト=公開鍵+検証)
     const relayKeysRef = useRef<RelayKeyPair | null>(null);
     const relayPubKeyRef = useRef<string | null>(null);
+    // issue#11: 招待 (p2d://join/...;fp=) から受けた鍵フィンガープリント。
+    // 設定時は受信した公開鍵の指紋と一致しない限り鍵を受理しない (帯域外照合)
+    const expectedKeyFpRef = useRef<string | null>(null);
     const relayChunkSeqRef = useRef(0);
     // 受信側: ストリーム毎に最後に検証したseqを追跡し、後戻りするチャンク
     // (リプレイ/再注入) を破棄する (M3: 署名はseqにバインド済み)
@@ -1072,8 +1086,10 @@ export function useWebRTC(options?: { signalingUrl?: string; turnConfig?: TurnCo
     };
 
     /**
-     * リレーチャンクの署名検証 (M3)。公開鍵を受信済みなら無署名/不正署名の
-     * チャンクは破棄する。鍵が届く前の初期チャンクは通す (WS順序で鍵が先行するのが正常系)。
+     * リレーチャンクの署名検証 (M3 / issue#11 fail-closed化)。公開鍵を受信する
+     * 前 のチャンクは正規ホスト産と証明できないため破棄する (ホストはsubscribe
+     * 受理と同時に relay:key を送るため、正常系で鍵が先行する)。鍵配布後の
+     * 無署名/不正署名/seq後戻り (リプレイ) もすべて破棄する。
      */
     const verifyRelayChunk = (p: Record<string, unknown>, streamKey: string): boolean => {
         const pub = relayPubKeyRef.current;
@@ -1086,15 +1102,17 @@ export function useWebRTC(options?: { signalingUrl?: string; turnConfig?: TurnCo
             console.warn(`[Relay] seq後戻り (${seq} <= ${lastSeq}) — リプレイとして破棄`);
             return false;
         }
-        if (!sig) {
-            if (pub) {
-                relayStatsRef.current.sigInvalid++;
-                console.warn('[Relay] 鍵配布済みなのに無署名チャンク — 破棄');
-                return false;
-            }
-            return true;
+        if (!pub) {
+            relayStatsRef.current.sigInvalid++;
+            console.warn('[Relay] 署名鍵を受信する前のチャンクを破棄 (fail-closed)');
+            return false;
         }
-        const ok = verifyChunk(pub!, seq, Number(p.ts) || 0, chunkDataFromB64(String(p.d || '')), sig);
+        if (!sig) {
+            relayStatsRef.current.sigInvalid++;
+            console.warn('[Relay] 鍵配布済みなのに無署名チャンク — 破棄');
+            return false;
+        }
+        const ok = verifyChunk(pub, seq, Number(p.ts) || 0, chunkDataFromB64(String(p.d || '')), sig);
         if (!ok) {
             relayStatsRef.current.sigInvalid++;
             console.warn('[Relay] 署名検証失敗 — チャンクを破棄 (改ざん/偽装の可能性)');
@@ -1153,6 +1171,13 @@ export function useWebRTC(options?: { signalingUrl?: string; turnConfig?: TurnCo
         const c = treeCoordinatorRef.current;
         const addr = p.addr as { host: string; port: number } | undefined;
         if (!c || !addr) return;
+        // issue#10: コーディネータが昇格を指示した (または木に居る) ノード以外からの
+        // relay_ready は受理しない。任意の参加者が任意のhost:portを「中継」として
+        // 登録させられるのを防ぐ
+        if (c.promotePending !== senderId && !findTreeNode(c.root, senderId)) {
+            console.warn(`[Tree] 指示していない参加者 ${senderId} のrelay_readyを破棄`);
+            return;
+        }
         const node = findTreeNode(c.root, senderId);
         if (node) treePromote(node, addr);
         console.log(`[Tree] 中継 ${senderId} が準備完了: ${addr.host}:${addr.port}`);
@@ -1467,12 +1492,13 @@ export function useWebRTC(options?: { signalingUrl?: string; turnConfig?: TurnCo
             if (roomCodeRef.current) {
                 if (isHostRef.current) {
                     // ホスト: 移行先 (内蔵サーバー) には部屋が存在しないので room:create で
-                    // 同じコードを再作成する (M2: createは既存コード一致時はjoinとして動く)
+                    // 同じコードを再作成する。既存ルームがある場合は再権限トークン
+                    // (issue#9) の提示が必須 — トークン無しのcreateはUNAUTHORIZEDで拒否される
                     console.log(`[WebRTC] 再接続(ホスト): 部屋 ${roomCodeRef.current} を移行先で再作成`);
                     const endpoint = embeddedPortRef.current
                         ? `${lanIpRef.current || '127.0.0.1'}:${embeddedPortRef.current}`
                         : (hostEndpointRef.current ?? undefined);
-                    signaling.createRoom(roomNameRef.current, roomCodeRef.current, endpoint);
+                    signaling.createRoom(roomNameRef.current, roomCodeRef.current, endpoint, hostTokenRef.current ?? undefined);
                 } else {
                     console.log(`[WebRTC] 再接続: 部屋 ${roomCodeRef.current} に再参加`);
                     signaling.joinRoom(roomCodeRef.current, roomNameRef.current);
@@ -1495,8 +1521,21 @@ export function useWebRTC(options?: { signalingUrl?: string; turnConfig?: TurnCo
             }
         });
 
+        // ルーム作成応答: 再権限トークンを保持して以後のcreate (再接続/移行) に備える (issue#9)
+        signaling.on('onRoomCreated', (_roomCode, _roomId, hostToken) => {
+            if (hostToken) hostTokenRef.current = hostToken;
+        });
+
+        // room:host (issue#10): ホストの再接続でホスト接続IDが変わった
+        signaling.on('onHostChanged', (hostId) => {
+            if (hostIdRef.current && hostIdRef.current !== hostId) {
+                console.log(`[WebRTC] ホストIDが更新されました: ${hostIdRef.current} -> ${hostId}`);
+            }
+            hostIdRef.current = hostId;
+        });
+
         // 自分の参加完了通知 (既存参加者リストが来る)
-        signaling.on('onRoomJoined', (_roomId, code, myClientId, existingParticipants, hostEndpoint) => {
+        signaling.on('onRoomJoined', (_roomId, code, myClientId, existingParticipants, hostEndpoint, hostId) => {
             const prevMyId = myIdRef.current;
             setRoomCode(code);
             setMyId(myClientId);
@@ -1504,6 +1543,7 @@ export function useWebRTC(options?: { signalingUrl?: string; turnConfig?: TurnCo
             myIdRef.current = myClientId;
             isConnectedRef.current = true;
             if (hostEndpoint) hostEndpointRef.current = hostEndpoint;
+            if (hostId) hostIdRef.current = hostId;
             // M1: 移行 (サーバー付け替え) でクライアントIDが変わったとき、旧IDに墓石を
             // 立てる。ゴシップで全体に配布され、名簿から旧IDが収束除去される
             if (migratedRef.current && prevMyId && prevMyId !== myClientId) {
@@ -1636,26 +1676,37 @@ export function useWebRTC(options?: { signalingUrl?: string; turnConfig?: TurnCo
 
         // WSリレー (WebRTC非対応エンジンのフォールバック経路)
         signaling.on('onRelayMessage', (senderId, type, payload) => {
-            // 署名鍵の配布は監査的検証の対象外 (公開鍵なので改ざんされても検証が失敗するだけ)
+            // 監査#1: 参加者リスト外のpeerからのリレーメッセージは破棄。
+            // relay:key も同様に参加者限定 (issue#11)
+            if (!participantsRef.current.has(senderId)) {
+                console.warn(`[Relay] 参加者リスト外のメッセージを破棄: ${senderId} (${type})`);
+                return;
+            }
             if (type === 'key') {
                 const p = (payload || {}) as Record<string, unknown>;
                 if (typeof p.pub === 'string') {
+                    // issue#11: 指紋照合 + pin-first。差し替え/なりすまし鍵は受理しない
+                    const verdict = acceptKeyCandidate(expectedKeyFpRef.current, relayPubKeyRef.current, p.pub);
+                    if (!verdict.accept) {
+                        console.warn(`[Relay] 公開鍵を受理しない (${verdict.reason}) — 破棄`);
+                        return;
+                    }
                     relayPubKeyRef.current = p.pub;
                     cachedKeyRef.current = p;
-                    console.log('[Relay] 署名検証用の公開鍵を受信');
+                    console.log('[Relay] 署名検証用の公開鍵を受信 (pin済み)');
                     // 中継者: 子へも配布
                     forwardToTreeChildren('key', p);
                 }
                 return;
             }
-            // 監査#1: 参加者リスト外のpeerからのリレーメッセージは破棄
-            if (!participantsRef.current.has(senderId)) {
-                console.warn(`[Relay] 参加者リスト外のメッセージを破棄: ${senderId} (${type})`);
-                return;
-            }
             const p = (payload || {}) as Record<string, unknown>;
             if (type === 'frame') {
-                // ゲスト側: 最新フレームを保持 (setStateは描画レートに合わせて間引く)
+                // ゲスト側: JPEGフォールバックも h264/audio と同じ検証を掛ける (issue#11)。
+                // ホストはframeにもseq+Ed25519署名を付与済みなので検証コスト以外の変更なし
+                if (!verifyRelayChunk(p, 'frame')) return;
+                // 検証済みフレームだけを子へパススルー (中継者)
+                forwardToTreeChildren('frame', p);
+                // 最新フレームを保持 (setStateは描画レートに合わせて間引く)
                 relayStatsRef.current.frames++;
                 relayStatsRef.current.bytes += typeof p.d === 'string' ? p.d.length : 0;
                 relayStatsRef.current.lastFrameAt = Date.now();
@@ -1737,7 +1788,13 @@ export function useWebRTC(options?: { signalingUrl?: string; turnConfig?: TurnCo
                 return;
             }
             if (type === 'tree:promote') {
-                // 中継者への昇格指示 (ホストのコーディネータ)
+                // 中継者への昇格指示 (ホストのコーディネータ)。
+                // issue#10: 非ホストからの指示に乗ると、任意の ws:// へ接続を
+                // 切り替えさせられる (中継昇格は自分の内蔵サーバー起動を伴う)
+                if (senderId !== hostIdRef.current) {
+                    console.warn(`[Tree] 非ホスト (${senderId}) からの昇格指示を破棄`);
+                    return;
+                }
                 handleTreePromote(senderId);
                 return;
             }
@@ -1746,7 +1803,12 @@ export function useWebRTC(options?: { signalingUrl?: string; turnConfig?: TurnCo
                 return;
             }
             if (type === 'tree:assign') {
-                // 割り当てられた中継 (の内蔵サーバー) へ付け替える
+                // 割り当てられた中継 (の内蔵サーバー) へ付け替える。
+                // issue#10: 接続先を書き換えられるのはホストの割り当てだけ
+                if (senderId !== hostIdRef.current) {
+                    console.warn(`[Tree] 非ホスト (${senderId}) からの割り当てを破棄 — 接続先は変更しない`);
+                    return;
+                }
                 const addr = p.addr as { host: string; port: number } | undefined;
                 if (addr?.host && addr.port) {
                     console.log(`[Tree] 中継 ${addr.host}:${addr.port} へ移動します`);
@@ -1762,16 +1824,25 @@ export function useWebRTC(options?: { signalingUrl?: string; turnConfig?: TurnCo
                 return;
             }
             if (type === 'tree:child_lost') {
-                // 中継者からの子の消失報告 → 木から解放し、空きスロットへ再割り当て
+                // 中継者からの子の消失報告 → 木から解放し、空きスロットへ再割り当て。
+                // issue#10: 報告者は「昇格済み (addrを持つ) の木の中継ノード」に限る。
+                // 任意の参加者からの偽報告で木を崩されるのを防ぐ
                 const c = treeCoordinatorRef.current;
                 const childId = p.childId as string;
-                if (c && childId) {
+                const reporter = c ? findTreeNode(c.root, senderId) : null;
+                if (c && childId && reporter && reporter.addr) {
                     handleNodeLoss(c.root, childId);
                     coordinateTree(senderId);
                 }
                 return;
             }
             if (type === 'control_allowed') {
+                // issue#10: 許可状態の配布はホスト (または配布を中継する自ノードの親)
+                // からのみ。任意の参加者が「操作許可」を偽装するのを防ぐ
+                if (senderId !== hostIdRef.current && senderId !== parentTargetIdRef.current) {
+                    console.warn(`[Relay] 非権威 (${senderId}) からのcontrol_allowedを破棄`);
+                    return;
+                }
                 setPeerControlAllowed(prev => new Map(prev).set(senderId, !!p.allowed));
                 // 中継者: 子へも配布 (ホストの許可状態を下流へ伝播)
                 cachedControlRef.current = p;
@@ -1870,13 +1941,13 @@ export function useWebRTC(options?: { signalingUrl?: string; turnConfig?: TurnCo
                 connect(localCode),
                 new Promise((_, rej) => setTimeout(() => rej(new Error('connect timeout')), 3000)),
             ]);
-            signalingRef.current?.createRoom(name, localCode, endpoint ?? undefined);
+            signalingRef.current?.createRoom(name, localCode, endpoint ?? undefined, hostTokenRef.current ?? undefined);
         } catch (e) {
             // M4: 中央サーバー無しで部屋を作る (LAN完全サーバーレス)
             console.warn('[WebRTC] 中央サーバーに接続できない → 内蔵サーバーのみで作成:', e);
             if (!embeddedPortRef.current) throw e;
             await switchSignalingRef.current(`ws://127.0.0.1:${embeddedPortRef.current}`);
-            signalingRef.current?.createRoom(name, localCode, endpoint ?? undefined);
+            signalingRef.current?.createRoom(name, localCode, endpoint ?? undefined, hostTokenRef.current ?? undefined);
         }
     }, [connect]);
 
@@ -1944,6 +2015,10 @@ export function useWebRTC(options?: { signalingUrl?: string; turnConfig?: TurnCo
         migratedRef.current = false;
         hostEndpointRef.current = null;
         embeddedPortRef.current = null;
+        // issue#9/#11: 認可・検証状態も退出と共にリセット
+        hostTokenRef.current = null;
+        hostIdRef.current = null;
+        expectedKeyFpRef.current = null;
         rosterRef.current = initRoster();
         relayKeysRef.current = null;
         relayPubKeyRef.current = null;
@@ -2570,6 +2645,8 @@ export function useWebRTC(options?: { signalingUrl?: string; turnConfig?: TurnCo
         }),
         /** M4: 署名鍵のフィンガープリント (QR帯域外照合用) */
         getRelayKeyFingerprint: () => relayKeysRef.current ? keyFingerprint(relayKeysRef.current.publicKeyB64) : null,
+        /** issue#11: 招待の鍵指紋を設定 (受信した公開鍵の照合に使う) */
+        setExpectedKeyFingerprint: (fp: string | null) => { expectedKeyFpRef.current = fp; },
         participants,
         myId,
 

@@ -127,3 +127,88 @@ test('未知のタイプはUNKNOWN_TYPEエラー', () => {
     const outs = coreMessage(core, 'c1', { type: 'totally:unknown' });
     assert.equal((outs[0].data as { payload: { code: string } }).payload.code, 'UNKNOWN_TYPE');
 });
+
+// === issue#9/#10: hostToken認可モデル ===
+
+test('issue#9: claim済みルームへの無認可createは拒否され、部屋の状態も変わらない', () => {
+    const core = newCore();
+    coreAck(core, 'host');
+    const created = coreMessage(core, 'host', {
+        type: 'room:create', payload: { name: 'Host', hostEndpoint: '192.168.1.5:8090' },
+    });
+    const token = (created[0].data as { payload: { hostToken?: string } }).payload.hostToken;
+    assert.ok(token, '初回createにはhostTokenが発行される');
+
+    // token無し/不一致のcreateはUNAUTHORIZED (メンバーにも電話帳にも載らない)
+    for (const payload of [
+        { name: 'Attacker' },
+        { name: 'Attacker', hostEndpoint: 'evil.example:1234' },
+        { name: 'Attacker', hostToken: 'wrong' },
+    ]) {
+        coreAck(core, 'attacker');
+        const outs = coreMessage(core, 'attacker', { type: 'room:create', payload });
+        assert.equal((outs[0].data as { type: string; payload: { code?: string } }).payload.code, 'UNAUTHORIZED');
+    }
+    assert.equal(core.members.size, 1);
+    assert.equal(core.hostEndpoint, '192.168.1.5:8090');
+    assert.equal(core.hostId, 'host');
+});
+
+test('issue#9: 正しいhostTokenでのcreateは再権限 (hostId更新+電話帳更新+room:host配布)', () => {
+    const core = newCore();
+    coreAck(core, 'host1');
+    const created = coreMessage(core, 'host1', { type: 'room:create', payload: { hostEndpoint: 'h1:1' } });
+    const token = (created[0].data as { payload: { hostToken?: string } }).payload.hostToken!;
+    coreAck(core, 'g1');
+    coreMessage(core, 'g1', { type: 'room:join', payload: {} });
+    coreDisconnect(core, 'host1');
+
+    // ホストが再接続 (別ID) してtokenを提示 → 在席のg1へroom:hostが配られる
+    coreAck(core, 'host2');
+    const outs = coreMessage(core, 'host2', {
+        type: 'room:create', payload: { hostToken: token, hostEndpoint: 'h2:2' },
+    });
+    const toG1 = outs.filter(o => o.to === 'g1').map(o => (o.data as { type: string }).type);
+    assert.deepEqual(toG1, ['room:host', 'peer:joined']);
+    const hostMsg = outs.find(o => o.to === 'g1' && (o.data as { type: string }).type === 'room:host');
+    assert.equal((hostMsg!.data as { payload: { hostId?: string } }).payload.hostId, 'host2');
+    assert.equal(core.hostId, 'host2');
+    assert.equal(core.hostEndpoint, 'h2:2', 'ホストだけが電話帳を更新できる');
+});
+
+test('issue#10: joinはhostEndpointを書き換えられない', () => {
+    const core = newCore();
+    coreAck(core, 'host');
+    coreMessage(core, 'host', { type: 'room:create', payload: { hostEndpoint: '192.168.1.5:8090' } });
+    coreAck(core, 'guest');
+    coreMessage(core, 'guest', {
+        type: 'room:join', payload: { roomCode: 'TEST12', hostEndpoint: 'evil.example:1234' },
+    });
+    assert.equal(core.hostEndpoint, '192.168.1.5:8090');
+});
+
+test('issue#9: reclaimしたホストは満員でも復帰できる', () => {
+    const core = newCore(2);
+    coreAck(core, 'host1');
+    const created = coreMessage(core, 'host1', { type: 'room:create', payload: {} });
+    const token = (created[0].data as { payload: { hostToken?: string } }).payload.hostToken!;
+    coreMessage(core, 'g1', { type: 'room:join', payload: {} });
+    coreDisconnect(core, 'host1');
+    // ホスト不在のまま2人目の招待者を入れて満員にする
+    coreMessage(core, 'g2', { type: 'room:join', payload: {} });
+
+    coreAck(core, 'host2');
+    const outs = coreMessage(core, 'host2', { type: 'room:create', payload: { hostToken: token } });
+    assert.ok(outs.some(o => o.to === 'host2' && (o.data as { type: string }).type === 'room:joined'));
+    assert.equal(core.members.size, 3, '上限2でもホストの復帰は阻害しない');
+});
+
+test('issue#10: room:joined / room:created にhostIdが載る', () => {
+    const core = newCore();
+    coreAck(core, 'host');
+    const created = coreMessage(core, 'host', { type: 'room:create', payload: {} });
+    assert.equal((created[1].data as { payload: { hostId?: string } }).payload.hostId, 'host');
+    coreAck(core, 'guest');
+    const joined = coreMessage(core, 'guest', { type: 'room:join', payload: {} });
+    assert.equal((joined[0].data as { payload: { hostId?: string } }).payload.hostId, 'host');
+});

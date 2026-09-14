@@ -4,11 +4,12 @@
 
 // メッセージタイプ
 export type MessageType =
-    | 'room:create'      // ルーム作成 (実質joinと同じ)
+    | 'room:create'      // ルーム作成 (既存ルームへはhostToken保有者のみ再権限として受理)
     | 'room:join'        // ルーム参加
     | 'room:leave'       // ルーム退出
     | 'room:created'     // ルーム作成完了 (createへの応答)
     | 'room:joined'      // ルーム参加完了 (joinへの応答)
+    | 'room:host'        // ホスト接続IDの通知 (issue#10: reclaim時に全員へ配布)
     | 'peer:joined'      // 他のピアが参加
     | 'peer:left'        // 他のピアが退出
     | 'peer:offer'       // SDP Offer
@@ -41,6 +42,7 @@ export interface RoomCreateMessage extends SignalingMessage {
         name?: string; // 作成者の名前
         roomCode?: string; // 指定があればそれを使う (サーバーレス参加とコードを揃えるため)
         hostEndpoint?: string; // ホスト内蔵WSサーバーの住所 (電話帳登録)
+        hostToken?: string; // 再権限トークン (issue#9: 既存ルームへのcreateはこれ必須)
     };
 }
 
@@ -50,6 +52,8 @@ export interface RoomCreatedMessage extends SignalingMessage {
     payload: {
         roomCode: string;
         roomId: string;
+        hostToken?: string; // ホストだけが受け取る再権限トークン (再接続時のcreateに提示)
+        hostId?: string; // ホストの接続ID (issue#10: tree:*/鍵配布の権威チェック用)
     };
 }
 
@@ -72,6 +76,15 @@ export interface RoomJoinedMessage extends SignalingMessage {
         myId: string;
         participants: ParticipantInfo[]; // 既存参加者リスト (自分以外)
         hostEndpoint?: string; // 電話帳: ホスト内蔵サーバーの住所 (M2)
+        hostId?: string; // ホストの接続ID (issue#10)
+    };
+}
+
+// ホスト接続ID通知 (issue#10: ホストのreclaimでIDが変わったことを全員へ)
+export interface RoomHostMessage extends SignalingMessage {
+    type: 'room:host';
+    payload: {
+        hostId: string;
     };
 }
 
@@ -126,8 +139,13 @@ export interface Room {
     createdAt: number;
     // レンデブー最小化 (M2): ホスト内蔵WSサーバーの住所 (host:port)。
     // サーバーは「電話帳」としてこれを参加者に配布するだけで、以後の
-    // シグナリング/メディアには関与しない
+    // シグナリング/メディアには関与しない。
+    // 更新はホストのcreate/reclaim時のみ (issue#10: joinでは書き換え不可)
     hostEndpoint?: string;
+    // issue#9: ホスト再権限トークン。created応答で作成者へ1度だけ渡す
+    hostToken: string;
+    // issue#10: ホストの接続ID。tree:*/鍵配布の権威チェックに使われる
+    hostId: string;
 }
 
 // 参加者情報

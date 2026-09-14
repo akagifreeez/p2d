@@ -187,3 +187,84 @@ test('上限超過のjoinはROOM_FULLエラーになる (#6)', async (t) => {
         [c1, c2, c3].forEach(c => c.close());
     }
 });
+
+// === issue#9/#10: hostToken認可モデルの実サーバー検証 ===
+
+test('既存ルームへの無認可 room:create は拒否され、参加者リスト・peer:joined・電話帳に載らない (#9)', async (t) => {
+    const started = startServer();
+    t.after(() => started.proc.kill());
+    await waitListening(started.port);
+    const url = `ws://127.0.0.1:${started.port}`;
+    const host = new TestClient(url);
+    const guest = new TestClient(url);
+    const stranger = new TestClient(url);
+    await Promise.all([host.connect(), guest.connect(), stranger.connect()]);
+
+    try {
+        host.send('room:create', { roomCode: 'AUTH99', hostEndpoint: '10.0.0.1:8090' });
+        const created = await host.waitFor(m => m.type === 'room:created');
+        assert.equal(created.payload?.roomCode, 'AUTH99');
+        assert.ok(created.payload?.hostToken, 'created応答にhostTokenが載る');
+        assert.equal(created.payload?.hostId, host.myId);
+
+        guest.send('room:join', { roomCode: 'AUTH99' });
+        const joined = await guest.waitJoined();
+        assert.equal(joined.payload?.hostId, host.myId);
+
+        // ホストの既存コードでの無認可create → UNAUTHORIZED (トークン無しでは
+        // 再権限できない。 telephone帳 (hostEndpoint) の書き換えも起こらない)
+        stranger.send('room:create', { roomCode: 'AUTH99', hostEndpoint: 'evil.example:1234' });
+        const err = await stranger.waitFor(m => m.type === 'error');
+        assert.equal(err.payload?.code, 'UNAUTHORIZED');
+
+        // strangerは参加者に載らず、guestにもpeer:joinedが届かない
+        await guest.expectSilence(m => m.type === 'peer:joined' && m.payload?.peerId === stranger.myId);
+        stranger.send('room:join', { roomCode: 'AUTH99' });
+        const sj = await stranger.waitFor(m => m.type === 'room:joined' && m.payload?.roomId !== '');
+        const parts = (sj.payload?.participants as { id: string }[]).map(p => p.id);
+        assert.ok(!parts.includes(stranger.myId));
+        // 電話帳は書き換わっていない
+        assert.equal(sj.payload?.hostEndpoint, '10.0.0.1:8090');
+    } finally {
+        [host, guest, stranger].forEach(c => c.close());
+    }
+});
+
+test('正しいhostTokenでの room:create はホスト再権限として受理される (#9/#10)', async (t) => {
+    const started = startServer();
+    t.after(() => started.proc.kill());
+    await waitListening(started.port);
+    const url = `ws://127.0.0.1:${started.port}`;
+    const host = new TestClient(url);
+    const guest = new TestClient(url);
+    await Promise.all([host.connect(), guest.connect()]);
+
+    try {
+        host.send('room:create', { roomCode: 'RECL01', hostEndpoint: '10.0.0.1:8090' });
+        const created = await host.waitFor(m => m.type === 'room:created');
+        const token = String(created.payload?.hostToken);
+        guest.send('room:join', { roomCode: 'RECL01' });
+        await guest.waitJoined();
+
+        // ホストのWSが切れる (切断後もゲストは部屋に残留)
+        const oldHostId = host.myId;
+        host.close();
+        await new Promise(r => setTimeout(r, 300));
+
+        // 別IDで再接続し、token提示で再権限
+        const host2 = new TestClient(url);
+        await host2.connect();
+        host2.send('room:create', { roomCode: 'RECL01', hostToken: token, hostEndpoint: '10.0.0.9:8090' });
+        const created2 = await host2.waitFor(m => m.type === 'room:created');
+        assert.equal(created2.payload?.hostId, host2.myId);
+        assert.equal(created2.payload?.hostToken, token);
+
+        // 在席のguestへは room:host で新しいホストIDが配られる
+        const hostChanged = await guest.waitFor(m => m.type === 'room:host');
+        assert.equal(hostChanged.payload?.hostId, host2.myId);
+        assert.notEqual(host2.myId, oldHostId);
+        host2.close();
+    } finally {
+        guest.close();
+    }
+});

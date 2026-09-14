@@ -168,11 +168,58 @@ function canForward(senderId: string, targetId: string): boolean {
 
 /**
  * ルーム作成ハンドラ
+ * issue#9/#10: 既存ルームコードへの room:create は正しいhostTokenの保有者
+ * (= ホスト) のみ受理。無認可のcreateは参加者にも電話帳にも載らない。
  */
 function handleRoomCreate(clientId: string, ws: WebSocket, message: RoomCreateMessage): void {
     const name = message.payload?.name;
+    const requestedCode = message.payload?.roomCode;
+    const hostEndpoint = message.payload?.hostEndpoint;
+
+    // 既存ルームへのcreate → ホスト再権限のみ
+    if (requestedCode && roomManager.getRoomByCode(requestedCode)) {
+        const result = roomManager.reclaimRoom(
+            requestedCode, clientId, name, message.payload?.hostToken, hostEndpoint,
+        );
+        if (!result.ok) {
+            sendError(ws, 'UNAUTHORIZED', 'このルームの作成者ではありません');
+            return;
+        }
+        const { room, oldRoom } = result;
+        notifyOldRoomLeft(oldRoom, clientId);
+        broadcastHostChanged(room, clientId);
+
+        sendMessage(ws, {
+            type: 'room:created',
+            roomId: room.id,
+            senderId: clientId,
+            timestamp: Date.now(),
+            payload: {
+                roomCode: room.code,
+                roomId: room.id,
+                hostToken: room.hostToken,
+                hostId: room.hostId,
+            },
+        });
+        sendMessage(ws, {
+            type: 'room:joined',
+            roomId: room.id,
+            senderId: clientId,
+            timestamp: Date.now(),
+            payload: {
+                roomId: room.id,
+                roomCode: room.code,
+                myId: clientId,
+                participants: participantListOf(room, clientId),
+                hostEndpoint: room.hostEndpoint,
+                hostId: room.hostId,
+            },
+        });
+        return;
+    }
+
     const { room, oldRoom } = roomManager.createRoom(
-        clientId, name, message.payload?.roomCode, message.payload?.hostEndpoint,
+        clientId, name, requestedCode, hostEndpoint,
     );
     notifyOldRoomLeft(oldRoom, clientId);
 
@@ -185,6 +232,8 @@ function handleRoomCreate(clientId: string, ws: WebSocket, message: RoomCreateMe
             roomCode: room.code,
             roomId: room.id,
             hostEndpoint: room.hostEndpoint,
+            hostToken: room.hostToken,
+            hostId: room.hostId,
         },
     });
 
@@ -200,7 +249,37 @@ function handleRoomCreate(clientId: string, ws: WebSocket, message: RoomCreateMe
             roomCode: room.code,
             myId: clientId,
             participants: [], // 作成直後は自分だけなので空
+            hostId: room.hostId,
         },
+    });
+}
+
+/** ルームの参加者リスト (exceptIdを除く) */
+function participantListOf(room: Room, exceptId: string): ParticipantInfo[] {
+    const list: ParticipantInfo[] = [];
+    room.participants.forEach((info, id) => {
+        if (id !== exceptId) list.push(info);
+    });
+    return list;
+}
+
+/**
+ * ホスト接続IDの変更をメンバーへ配布 (issue#10)。
+ * クライアントは tree:*系・鍵配布の権威チェックにこのhostIdを使う。
+ */
+function broadcastHostChanged(room: Room, exceptHostId: string): void {
+    room.participants.forEach((_, peerId) => {
+        if (peerId === exceptHostId) return;
+        const peerWs = clients.get(peerId);
+        if (peerWs) {
+            sendMessage(peerWs, {
+                type: 'room:host',
+                roomId: room.id,
+                senderId: exceptHostId,
+                timestamp: Date.now(),
+                payload: { hostId: room.hostId },
+            });
+        }
     });
 }
 
@@ -229,12 +308,7 @@ function handleRoomJoin(clientId: string, ws: WebSocket, message: RoomJoinMessag
     notifyOldRoomLeft(oldRoom, clientId);
 
     // 1. 新しい参加者に「既存の参加者リスト」を送る
-    const participants: ParticipantInfo[] = [];
-    room.participants.forEach((info, id) => {
-        if (id !== clientId) { // 自分以外
-            participants.push(info);
-        }
-    });
+    const participants = participantListOf(room, clientId);
 
     sendMessage(ws, {
         type: 'room:joined',
@@ -247,6 +321,7 @@ function handleRoomJoin(clientId: string, ws: WebSocket, message: RoomJoinMessag
             myId: clientId,
             participants: participants,
             hostEndpoint: room.hostEndpoint,
+            hostId: room.hostId,
         },
     });
 

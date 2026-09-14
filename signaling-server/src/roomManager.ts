@@ -19,6 +19,11 @@ export type JoinRoomResult =
     | { ok: true; room: Room; oldRoom: Room | null }
     | { ok: false; reason: 'NOT_FOUND' | 'FULL' };
 
+// reclaimRoomの結果 (issue#9: 既存ルームへのcreateはホスト再権限のみ)
+export type ReclaimRoomResult =
+    | { ok: true; room: Room; oldRoom: Room | null }
+    | { ok: false; reason: 'BAD_TOKEN' };
+
 // ルーム管理クラス
 export class RoomManager {
     // ルームID -> ルーム情報
@@ -85,6 +90,10 @@ export class RoomManager {
             participants: new Map([[creatorId, creator]]),
             createdAt: Date.now(),
             hostEndpoint,
+            // issue#9: ホスト再権限トークン。created応答で作成者へ1度だけ渡し、
+            // 再接続時のcreateで提示させる。トークン無しの既存ルームへのcreateは拒否
+            hostToken: crypto.randomUUID(),
+            hostId: creatorId,
         };
 
         this.rooms.set(roomId, room);
@@ -134,6 +143,43 @@ export class RoomManager {
 
         console.log(`[RoomManager] 参加: ${clientId} -> ルーム ${room.code}, 現在人数: ${room.participants.size}`);
 
+        return { ok: true, room, oldRoom };
+    }
+
+    /**
+     * 既存ルームへのホスト再権限 (issue#9/#10)。
+     * 正しいhostTokenの提示のみ受理し、作成者をメンバーへ復帰させる (満員でも
+     * ホストは弾かない=ホストの再接続を招待者の参加で塞がれないため)。
+     * hostEndpointの更新はこの経路だけで起こる (joinでは決して更新しない)。
+     * 失敗時 (トークン不一致) は現在の所属を一切変更しない原子的操作。
+     */
+    reclaimRoom(
+        code: string,
+        clientId: string,
+        clientName?: string,
+        hostToken?: string,
+        hostEndpoint?: string,
+    ): ReclaimRoomResult {
+        const room = this.getRoomByCode(code);
+        if (!room || !hostToken || room.hostToken !== hostToken) {
+            console.warn(`[RoomManager] 不正なhostTokenによるcreate要求: ${code} from ${clientId}`);
+            return { ok: false, reason: 'BAD_TOKEN' };
+        }
+
+        // 移動元があれば先に退室 (createRoom/joinRoomと同じ規約)
+        const oldRoom = this.removeFromCurrentRoom(clientId).room;
+
+        if (!room.participants.has(clientId)) {
+            const info: ParticipantInfo = { id: clientId, name: clientName, joinedAt: Date.now() };
+            room.participants.set(clientId, info);
+            this.clientToRoom.set(clientId, room.id);
+        }
+        if (hostEndpoint) {
+            room.hostEndpoint = hostEndpoint;
+        }
+        room.hostId = clientId;
+
+        console.log(`[RoomManager] ホスト再権限: ${clientId} -> ルーム ${room.code}`);
         return { ok: true, room, oldRoom };
     }
 
