@@ -163,6 +163,10 @@ export interface UseWebRTCReturn {
     };
     /** M5 フェーズB: 視聴者側のリンク健康 (バッジ用) */
     linkHealth: { level: LinkLevel; via: 'direct' | 'relay'; cause?: 'host-load' | 'route' | null };
+    /** M5: 自動再接続が打ち切られ、手動再参加が必要 */
+    rejoinRequired: boolean;
+    /** M5: 打ち切り後の手動再参加 */
+    rejoinAfterGiveUp: () => Promise<void>;
     /** M5 フェーズC: 木の健康マップ (中継ごとの子数・上流無音時間・RTT) */
     treeHealth: Map<string, { at: number; upstreamSilentMs: number; children: number; rttMs?: number }>;
     /** M4: 署名鍵のフィンガープリント (QR帯域外照合用) */
@@ -425,6 +429,8 @@ export function useWebRTC(options?: { signalingUrl?: string; turnConfig?: TurnCo
     const relayWatchdogRef = useRef<WatchdogState>(initWatchdogState(Date.now()));
     // M5 フェーズB: 視聴者側のリンク健康バッジ用 (mesh/配信木で共通の見え方)
     const [linkHealth, setLinkHealth] = useState<{ level: LinkLevel; via: 'direct' | 'relay'; cause?: LinkCause }>({ level: 'idle', via: 'direct' });
+    // M5: 自動再接続打ち切り後の手動再参加が必要な状態
+    const [rejoinRequired, setRejoinRequired] = useState(false);
     const connectedViaRef = useRef<'direct' | 'relay'>('direct');
     // M5 フェーズC: 中継からのメトリクス (ホストが木の健康を把握する)
     const treeHealthRef = useRef<Map<string, { at: number; upstreamSilentMs: number; children: number; rttMs?: number }>>(new Map());
@@ -1762,6 +1768,7 @@ export function useWebRTC(options?: { signalingUrl?: string; turnConfig?: TurnCo
     const wireSignaling = (signaling: SignalingClient) => {
         signaling.on('onConnected', () => {
             setConnectionState('connected');
+            setRejoinRequired(false); // 自動再接続が復帰した
             // 再接続: 入室中だった部屋に自動で再参加する (サーバー側の入室状態は
             // WS切断で失われているため。これが無いとICE再起動のofferが届かない)
             if (roomCodeRef.current) {
@@ -1794,6 +1801,12 @@ export function useWebRTC(options?: { signalingUrl?: string; turnConfig?: TurnCo
             if (code === 'ROOM_FULL') {
                 setError('ルームが満員です (参加者数の上限に達しています)');
             }
+        });
+
+        // M5: 自動再接続の打ち切り → 手動再参加を促す
+        signaling.on('onRetryGaveUp', (reason) => {
+            console.warn(`[Signaling] 自動再接続を打ち切り (${reason})`);
+            setRejoinRequired(true);
         });
 
         // ルーム作成応答: 再権限トークンを保持して以後のcreate (再接続/移行) に備える (issue#9)
@@ -2317,6 +2330,18 @@ export function useWebRTC(options?: { signalingUrl?: string; turnConfig?: TurnCo
         // 再参加は wireSignaling の onConnected 内 (roomCodeRef) で行われる
     };
     switchSignalingRef.current = switchSignaling;
+
+    /** M5: 自動再接続打ち切り後の手動再参加。根の部屋URLへ再接続し、自動で部屋に戻る */
+    const rejoinAfterGiveUp = useCallback(async () => {
+        const url = rootServerUrlRef.current ?? lastKnownServerUrlRef.current;
+        if (!url) {
+            console.warn('[Signaling] 再参加先のURLが不明 (部屋を退出済み)');
+            return;
+        }
+        console.log(`[Signaling] 手動再参加: ${url}`);
+        setRejoinRequired(false);
+        await switchSignalingRef.current(url);
+    }, []);
     /**
      * ルーム作成・参加
      */
@@ -2324,6 +2349,7 @@ export function useWebRTC(options?: { signalingUrl?: string; turnConfig?: TurnCo
         isHostRef.current = true;
         treeRoleRef.current = 'host';
         migratedRef.current = false;
+        setRejoinRequired(false);
         selfJoinedAtRef.current = Date.now();
         // M2: ホスト内蔵サーバーを起動 (中央サーバー死亡後の再合流・サーバーレス参加の入口)
         try {
@@ -2376,6 +2402,7 @@ export function useWebRTC(options?: { signalingUrl?: string; turnConfig?: TurnCo
     const joinRoomAt = useCallback(async (code: string, wsUrl: string, name?: string) => {
         isHostRef.current = false;
         migratedRef.current = false;
+        setRejoinRequired(false);
         selfJoinedAtRef.current = Date.now();
         roomNameRef.current = name;
         if (signalingRef.current) {
@@ -2459,6 +2486,7 @@ export function useWebRTC(options?: { signalingUrl?: string; turnConfig?: TurnCo
         setPeerControlAllowed(new Map());
         controlIdRef.current = null;
         controlIdFrozenRef.current = false;
+        setRejoinRequired(false);
         // M5§7: ウォッチドッグも初期化
         relayWatchdogRef.current = initWatchdogState(Date.now());
         if (relayMetricsTimerRef.current) {
@@ -3180,6 +3208,10 @@ export function useWebRTC(options?: { signalingUrl?: string; turnConfig?: TurnCo
         isRelayMode,
         /** M5 フェーズB: 視聴者側のリンク健康 (バッジ用。mesh/配信木共通) */
         linkHealth,
+        /** M5: 自動再接続が打ち切られ、手動再参加が必要 */
+        rejoinRequired,
+        /** M5: 打ち切り後の手動再参加 (根の部屋へ再接続して自動で戻る) */
+        rejoinAfterGiveUp,
         relayFrame,
         relayVideoUrl,
         relayAudioUrl,

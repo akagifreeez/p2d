@@ -73,6 +73,8 @@ export interface SignalingEvents {
     // peer:tunnel 受信 (senderId=転送者, payload=封筒 {originalSender, kind, targetId, payload, hops})
     onTunneledMessage?: (senderId: string, envelope: TunnelEnvelope) => void;
     onError: (code: string, message: string) => void;
+    /** M5: 自動再接続を打ち切った (手動再参加が必要)。reason: 15分経過 / 部屋が存在しない */
+    onRetryGaveUp?: (reason: 'timeout' | 'room-not-found') => void;
     // WSリレー: relay:* をすべて1つのハンドラへ集約 (type は 'relay:' を除去したもの)
     onRelayMessage?: (senderId: string, type: string, payload: unknown) => void;
 }
@@ -81,8 +83,18 @@ export class SignalingClient {
     private ws: WebSocket | null = null;
     private events: Partial<SignalingEvents> = {};
     private reconnectAttempts = 0;
-    private maxReconnectAttempts = 10;
     private reconnectDelay = 1000;
+    // M5: 段階的再接続 — 0〜2分は積極的 (1〜5秒)、2〜15分は緩やか (20〜30秒)、
+    // 15分で打ち切り。サーバーが「部屋がない」(ROOM_NOT_FOUND) と明示した場合は
+    // 早めに諦める。いずれもジッター付きで全員の同時再接続 (ストーム) を崩す
+    private retryStartedAt = 0;
+    private roomNotFoundCount = 0;
+    private gaveUp = false;
+
+    /** 自動再接続を打ち切ったか (true = 手動再参加が必要) */
+    get isRetryGaveUp(): boolean {
+        return this.gaveUp;
+    }
     // 移行 (内蔵サーバーへの切替) 時に古いクライアントの再接続を止めるためのフラグ
     private disposed = false;
     // room:created 応答で受け取ったホスト再権限トークン (issue#9)。
@@ -109,6 +121,9 @@ export class SignalingClient {
                 this.ws.onopen = () => {
                     console.log('[Signaling] 接続完了');
                     this.reconnectAttempts = 0;
+                    this.retryStartedAt = 0;
+                    this.roomNotFoundCount = 0;
+                    this.gaveUp = false;
                     this.events.onConnected?.();
                     resolve();
                 };
@@ -234,6 +249,8 @@ export class SignalingClient {
 
             case 'error': {
                 const payload = message.payload as { code: string; message: string };
+                // M5: 部屋が存在しない明示的な応答は再接続の早期打ち切り判定に使う
+                if (payload.code === 'ROOM_NOT_FOUND') this.roomNotFoundCount++;
                 this.events.onError?.(payload.code, payload.message);
                 break;
             }
@@ -340,19 +357,39 @@ export class SignalingClient {
     }
 
     /**
-     * 再接続を試行
+     * 再接続を試行 (M5: 段階的。打ち切りは onRetryGaveUp で通知)
      */
     private attemptReconnect(): void {
-        if (this.disposed) return;
-        if (this.reconnectAttempts >= this.maxReconnectAttempts) {
-            console.log('[Signaling] 再接続上限に達しました');
+        if (this.disposed || this.gaveUp) return;
+        const now = Date.now();
+        if (this.retryStartedAt === 0) this.retryStartedAt = now;
+        const elapsed = now - this.retryStartedAt;
+
+        // サーバーが部屋の不在を明示している場合は、ホストが戻る可能性より
+        // 「セッションが終わった」可能性が高いので早めに諦める
+        if (this.roomNotFoundCount >= 3) {
+            this.gaveUp = true;
+            console.log('[Signaling] 部屋が見つからないため自動再接続を停止 (手動で再参加してください)');
+            this.events.onRetryGaveUp?.('room-not-found');
+            return;
+        }
+        if (elapsed >= 15 * 60_000) {
+            this.gaveUp = true;
+            console.log('[Signaling] 自動再接続を打ち切り (15分経過)。手動で再参加してください');
+            this.events.onRetryGaveUp?.('timeout');
             return;
         }
 
-        this.reconnectAttempts++;
-        const delay = this.reconnectDelay * this.reconnectAttempts;
+        let delay: number;
+        if (elapsed < 2 * 60_000) {
+            this.reconnectAttempts++;
+            delay = Math.min(this.reconnectDelay * this.reconnectAttempts, 5000);
+        } else {
+            delay = 20_000;
+        }
+        delay = Math.round(delay * (0.9 + Math.random() * 0.3)); // ±ジッター
 
-        console.log(`[Signaling] ${delay}ms後に再接続を試行 (${this.reconnectAttempts}/${this.maxReconnectAttempts})`);
+        console.log(`[Signaling] ${delay}ms後に再接続を試行 (経過${Math.round(elapsed / 1000)}秒)`);
 
         setTimeout(() => {
             this.connect().catch((error) => {

@@ -267,6 +267,9 @@ export function RoomView({ onLeave, signalingUrl, turnConfig, e2eConfig, onOpenS
         // M5 フェーズB/C: リンク健康バッジ + 木の健康マップ
         linkHealth,
         treeHealth,
+        // M5: 自動再接続打ち切り後の手動再参加
+        rejoinRequired,
+        rejoinAfterGiveUp,
         grantRemoteControl,
         revokeRemoteControl,
         controlGrants,
@@ -547,9 +550,23 @@ export function RoomView({ onLeave, signalingUrl, turnConfig, e2eConfig, onOpenS
     }, [isConnected, roomCode]);
 
     // --- 未接続時 (ランチャー) ---
+    // M5: 部屋に居た状態で切れた場合、再接続状況/再参加ボタンをランチャーに出す
+    const wasInRoom = !isConnected && !!roomCode;
     if (!isConnected) {
         return (
             <div className="min-h-screen flex flex-col relative overflow-hidden">
+                {wasInRoom && (rejoinRequired ? (
+                    <div className="bg-[var(--md-error)]/12 border-b border-[var(--md-error)]/40 text-[var(--md-error)] text-xs px-4 py-3 flex items-center gap-3 shrink-0" role="alert">
+                        <span className="shrink-0">⚠</span>
+                        <span className="flex-1">接続が切断されました (自動再接続を打ち切り)。同じ部屋に再参加できます。</span>
+                        <button onClick={() => { void rejoinAfterGiveUp(); }} className="btn-secondary px-4 py-1.5 text-xs shrink-0">再参加</button>
+                    </div>
+                ) : (
+                    <div className="bg-[var(--md-surface-high)] border-b border-[var(--md-outline-variant)]/60 text-[var(--md-on-surface-variant)] text-xs px-4 py-3 flex items-center gap-3 shrink-0" role="status">
+                        <span className="w-1.5 h-1.5 rounded-full bg-[var(--md-primary)] animate-pulse shrink-0" />
+                        <span>接続が切れたため再接続を試みています... (15分後に自動試行を停止します)</span>
+                    </div>
+                ))}
                 {/* アプリバー */}
                 <header className="h-16 px-4 flex items-center justify-between shrink-0">
                     <div className="flex items-center gap-3 px-2">
