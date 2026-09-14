@@ -13,6 +13,7 @@ import { ChatPanel } from './ChatPanel';
 import { MonitorPicker } from './MonitorPicker';
 import { QrModal, QrScannerModal } from './QrJoin';
 import { parseInvite } from '../lib/invite';
+import { plaintextUrlWarning } from '../lib/securityUrl';
 import { normalizeKeyName } from '../lib/dataChannel';
 import { addRecentRoom, getRecentRooms, RecentRoom } from '../lib/history';
 import { clearPresence, getStoredDiscordClientId, resolveDiscordClientId, setStoredDiscordClientId, updatePresence } from '../lib/discord';
@@ -561,8 +562,20 @@ export function RoomView({ onLeave, signalingUrl, turnConfig, e2eConfig, onOpenS
     }
 
     // --- 接続済み (ルーム画面) ---
+    // issue#3: 公開網へ平文接続している設定のとき、常時警告を出す (設定モーダルを
+    // 開かなくても気付けるように。LAN内 (ローカル/プライベート網) は対象外)
+    const insecureUrls = [plaintextUrlWarning(signalingUrl || ''), plaintextUrlWarning(turnConfig?.url || '')]
+        .filter((w): w is string => !!w);
     return (
         <div className="fixed inset-0 w-full h-full flex flex-col bg-[var(--md-surface)] overflow-hidden z-50">
+            {insecureUrls.length > 0 && (
+                <div className="bg-[var(--md-error)]/12 border-b border-[var(--md-error)]/40 text-[var(--md-error)] text-xs px-4 py-2 flex items-start gap-2 shrink-0" role="alert">
+                    <span className="shrink-0">⚠</span>
+                    <div>
+                        {insecureUrls.map((w, i) => <div key={i}>{w}</div>)}
+                    </div>
+                </div>
+            )}
             {/* Top App Bar */}
             <div className="h-16 px-4 flex items-center justify-between border-b border-[var(--md-outline-variant)]/60 bg-[var(--md-surface-low)] shrink-0 z-20">
                 <div className="flex items-center gap-4">

@@ -3,6 +3,7 @@ import { invoke } from '@tauri-apps/api/core';
 import { RoomView } from './components/RoomView';
 import { useWindowPosition } from './hooks/useWindowPosition';
 import type { E2eConfig } from './lib/e2eRunner';
+import { plaintextUrlWarning } from './lib/securityUrl';
 
 function App() {
     // ウィンドウ位置管理 (起動時復元・終了時保存・Ctrl+Shift+←/→でモニター間移動)
@@ -67,23 +68,9 @@ function App() {
         credential: turnCredential || undefined,
     } : undefined;
 
-    // 監査#3: ローカル/プライベート網以外への暗号化なし ws:// 接続を警告する
-    const insecureSignalingWarning = (() => {
-        try {
-            const u = new URL(signalingUrl.trim());
-            if (u.protocol !== 'ws:') return null;
-            // IPv6はブラケット付きで返る ([::1]) ので剥がしてから判定
-            const h = u.hostname.replace(/^\[/, '').replace(/\]$/, '');
-            const isLocalOrPrivate = h === 'localhost' || h === '::1' || h.endsWith('.local') ||
-                /^127\./.test(h) || /^10\./.test(h) || /^192\.168\./.test(h) ||
-                /^172\.(1[6-9]|2\d|3[01])\./.test(h) ||
-                /^100\.(6[4-9]|[7-9]\d|1[01]\d|12[0-7])\./.test(h); // CGNAT (Tailscale等のVPN網)
-            return isLocalOrPrivate ? null :
-                'このアドレスは暗号化されない ws:// です。公開環境ではリバースプロキシ等でTLS終端した wss:// を使用してください。';
-        } catch {
-            return null;
-        }
-    })();
+    // issue#3: ローカル/プライベート網以外への暗号化なし接続 (ws:// / turn://) を警告する
+    const insecureSignalingWarning = plaintextUrlWarning(signalingUrl);
+    const insecureTurnWarning = plaintextUrlWarning(turnUrl);
 
     return (
         <div className="min-h-screen bg-[var(--md-surface)] text-[var(--md-on-surface)] relative">
@@ -153,6 +140,12 @@ function App() {
                                         placeholder="Credential"
                                     />
                                 </div>
+                                {insecureTurnWarning && (
+                                    <p className="mt-2 text-xs text-[var(--md-error)] flex items-start gap-1.5">
+                                        <span className="shrink-0">⚠</span>
+                                        <span>{insecureTurnWarning}</span>
+                                    </p>
+                                )}
                                 {turnUrl && (
                                     <div className="mt-2 text-xs text-[var(--md-primary)] flex items-center gap-1.5">
                                         <span className="w-1.5 h-1.5 bg-[var(--md-primary)] rounded-full"></span>

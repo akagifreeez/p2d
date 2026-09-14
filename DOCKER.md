@@ -26,9 +26,9 @@ docker-compose logs -f
 
 | Service   | Port        | 用途                     |
 | --------- | ----------- | ------------------------ |
-| signaling | 8080        | WebSocket シグナリング   |
+| signaling | 8080        | WebSocket シグナリング (公開構成では localhostバインド+ Caddyでwss終端) |
 | turn      | 3478        | TURN/STUN (UDP/TCP)      |
-| turn      | 5349        | TURNS (TLS over TCP/UDP) |
+| turn      | 5349        | TURNS (TLS over TCP / DTLS over UDP。TLSオーバーレイ時) |
 | turn      | 49152-49200 | Relay ポート (UDP)       |
 
 TURNイメージは `coturn/coturn:4.18.0` に固定されています (latestは使わない)。
@@ -46,10 +46,10 @@ TURNイメージは `coturn/coturn:4.18.0` に固定されています (latest�
 警告を表示します (監査#3)。インターネットに公開する場合は必ず次の「公開環境での TLS」
 を使ってください。
 
-## 公開環境での TLS (監査#3)
+## 公開環境での TLS (監査#3 / issue#3)
 
 インターネットに公開する場合はTLSオーバーレイを使用し、クライアントには
-`wss://` と `turns://` のみを案内してください:
+`wss://` と `turns://` のみを案内してください (2026-09-14に証明書付きで疎通確認済み):
 
 ```bash
 cp .env.example .env
@@ -59,6 +59,7 @@ mkdir -p turn/certs
 # 証明書を配置 (Let's Encrypt の fullchain.pem / privkey.pem をコピー)
 #   turn/certs/turn.crt  <- fullchain.pem
 #   turn/certs/turn.key  <- privkey.pem
+# ※ turn/certs/ は .gitignore 済み (自己署名テスト証明書の混入防止)
 
 docker compose -f docker-compose.yml -f docker-compose.tls.yml up -d
 ```
@@ -67,21 +68,52 @@ docker compose -f docker-compose.yml -f docker-compose.tls.yml up -d
 
 - **シグナリング**: Caddy が 80/443 でTLS終端し `wss://<CADDY_DOMAIN>` を
   signaling:8080 へ中継。8080の直接公開は解除 (localhostバインドのみ)。
-- **TURN**: `--cert` / `--pkey` 付きで起動し `turns:<CADDY_DOMAIN>:5349` が有効化。
-  TLS 1.0/1.1 は無効化、マルチキャストピアも無効化。
+- **TURN**: `--cert` / `--pkey` 付きで起動し `turns:<CADDY_DOMAIN>:5349` (TCP/TLS と
+  UDP/DTLS) が有効化。**最低バージョンは TLS 1.3 / DTLS 1.2**
+  (`--no-tlsv1_2`。coturn 4.18.0 には `--no-tlsv1` / `--no-tlsv1_1` が存在せず、
+  指定すると起動に失敗するため 2026-09-14 に修正)。マルチキャストピアも無効化。
 
 クライアント設定:
 
 - **Signaling Server URL**: `wss://p2d.example.com`
-- **TURN Server URL**: `turns:p2d.example.com:5349`
+- **TURN Server URL**: `turns:p2d.example.com:5349` (`?transport=tcp` はTLS、`udp` はDTLS)
 
-疎通確認:
+疎通確認 (自己署名でも同様に確認できる):
 
 ```bash
-# wss: ブラウザで https://<CADDY_DOMAIN> にアクセスして証明書を確認
-# turns: coturn のログでTLSハンドシェイクを確認
+# TURNS: 証明書を検証しつつTLSハンドシェイク (Verify return code: 0 (ok) が出れば疎通)
+echo | openssl s_client -connect <SERVER>:5349 -servername p2d.example.com \
+  -CAfile turn/certs/turn.crt -verify_return_error
+
+# wss: 検証クライアント or ブラウザで証明書を確認
+#   node なら Caddyの内部CA (localhost構成時) を pin して wss で接続し
+#   room:create → room:created の往復を確認できる
 docker compose -f docker-compose.yml -f docker-compose.tls.yml logs turn | grep -i tls
+#   "TLS 1.3 supported" / "DTLS 1.2 supported" / "Certificate file found" を確認
 ```
+
+2026-09-14 の実走確認 (CADDY_DOMAIN=localhost の内部CA構成 + 自己署名TURN証明書):
+
+- Caddy: `wss://localhost` で room:create/room:join/relay転送の往復 5/5 pass
+  (クライアントは Caddy ルートCA を pin して証明書検証)
+- coturn: `openssl s_client -connect :5349` で TLSv1.3 ハンドシェイク、
+  `Verify return code: 0 (ok)`。DTLSリスナーも起動を確認
+
+## シグナリングのネイティブTLS (リバースプロキシなし)
+
+Caddy を使わず Node サーバー自身でTLSを終端することもできる
+(`signaling-server/src/index.ts`、issue#3):
+
+```bash
+P2D_TLS_CERT=/etc/letsencrypt/live/p2d.example.com/fullchain.pem \
+P2D_TLS_KEY=/etc/letsencrypt/live/p2d.example.com/privkey.pem \
+PORT=8443 npm start
+# クライアントは wss://p2d.example.com:8443
+```
+
+どちらの構成でも、クライアントがローカル/プライベート網以外で `ws://` / `turn://`
+を設定している場合は設定画面と接続中の画面の両方に警告が表示される
+(`src/lib/securityUrl.ts`)。
 
 > 将来改善候補: 静的 `--user` の代わりに coturn の REST API
 > (shared-secret + 時限資格情報) を導入すると、資格情報の漏洩リスクをさらに減らせます。
@@ -112,7 +144,8 @@ sudo ufw allow 49152:49200/udp  # Relay
 # TLSオーバーレイ構成では追加で
 sudo ufw allow 80/tcp     # ACME (http-01)
 sudo ufw allow 443/tcp    # wss
-sudo ufw allow 5349/tcp   # TURNS
+sudo ufw allow 5349/tcp   # TURNS (TLS)
+sudo ufw allow 5349/udp   # TURNS (DTLS)
 ```
 
 ## コマンド

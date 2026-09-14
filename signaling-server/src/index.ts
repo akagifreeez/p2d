@@ -5,6 +5,8 @@
  */
 
 import { WebSocketServer, WebSocket } from 'ws';
+import fs from 'node:fs';
+import https from 'node:https';
 import { RoomManager } from './roomManager.js';
 import type {
     SignalingMessage,
@@ -20,21 +22,35 @@ import type {
 // サーバー設定
 const PORT = parseInt(process.env.PORT || '8080', 10);
 const HOST = process.env.HOST || '0.0.0.0';
+// issue#3: ネイティブTLS (Caddy等のリバースプロキシを使わない構成用)。
+// 両方の環境変数が揃ったら https サーバーの上で WebSocket を受け、wss:// になる
+const TLS_CERT = process.env.P2D_TLS_CERT || '';
+const TLS_KEY = process.env.P2D_TLS_KEY || '';
+const useTls = !!(TLS_CERT && TLS_KEY);
 
 // クライアント管理
 const clients = new Map<string, WebSocket>();
 const roomManager = new RoomManager();
 
 // WebSocketサーバー作成
-// maxPayload: シグナリング/リレーチャンク (base64 H264ボックス) は数百KB程度。
-// 既定の100MBのままにすると巨大フレームによるメモリ枯渇DoSを受けるため上限を設ける
-const wss = new WebSocketServer({
-    port: PORT,
-    host: HOST,
-    maxPayload: 4 * 1024 * 1024, // 4MB
-});
+// issue#3: P2D_TLS_CERT / P2D_TLS_KEY が揃ったら https の上で WebSocket を受け、
+// wss:// になる (リバースプロキシなしでTLSを終端する構成用)。
+// 未設定なら従来どおり ws:// で listen (LAN用・Caddyで終端する構成でもwsのまま)
+const wsOptions = { maxPayload: 4 * 1024 * 1024 } as const;
 
-console.log(`🚀 P2D シグナリングサーバー起動: ws://${HOST}:${PORT}`);
+const wss: WebSocketServer = useTls
+    ? (() => {
+        const server = https.createServer({
+            cert: fs.readFileSync(TLS_CERT),
+            key: fs.readFileSync(TLS_KEY),
+        });
+        const w = new WebSocketServer({ ...wsOptions, server });
+        server.listen(PORT, HOST);
+        return w;
+    })()
+    : new WebSocketServer({ ...wsOptions, port: PORT, host: HOST });
+
+console.log(`🚀 P2D シグナリングサーバー起動: ${useTls ? 'wss' : 'ws'}://${HOST}:${PORT}${useTls ? ' (TLS: P2D_TLS_CERT/P2D_TLS_KEY)' : ''}`);
 
 // クライアント接続時
 wss.on('connection', (ws: WebSocket) => {

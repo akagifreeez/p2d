@@ -51,3 +51,7 @@ signaling-server/dist/
 *.temp
 error.log
 signaling-worker/.wrangler/
+
+# TLS自己テスト用の証明書置き場 (issue#3 疎通確認)
+turn/certs/
+caddy/data/

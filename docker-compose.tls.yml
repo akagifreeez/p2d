@@ -37,8 +37,12 @@ services:
       - --external-ip=${TURN_EXTERNAL_IP}
       - --cert=/etc/coturn/certs/turn.crt
       - --pkey=/etc/coturn/certs/turn.key
-      - --no-tlsv1
-      - --no-tlsv1_1
+      # coturn 4.18.0 には --no-tlsv1 / --no-tlsv1_1 が存在しない (指定すると
+      # 起動に失敗する)。このイメージでの最低バージョン指定は --no-tlsv1_2 =
+      # 「TLS 1.3 / DTLS 1.2 を最低版とする」。古い平文系プロトコルを遮断する
+      - --no-tlsv1_2
+      # turns://...?transport=udp (DTLS) も受ける (同じ証明書を使う)
+      - --dtls
       - --no-multicast-peers
       - --verbose
 
